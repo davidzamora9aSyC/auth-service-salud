@@ -1,0 +1,61 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum AccountRole {
+  PATIENT
+  DOCTOR
+}
+
+enum AccountStatus {
+  ACTIVE
+  LOCKED
+}
+
+enum TwoFactorMethod {
+  TOTP
+}
+
+model Account {
+  id                     String                @id @default(uuid())
+  email                  String                @unique
+  passwordHash           String
+  salt                   String
+  role                   AccountRole
+  subjectId              String?
+  status                 AccountStatus         @default(ACTIVE)
+  twoFactorEnabled       Boolean               @default(false)
+  twoFactorSecret        String?
+  pendingTwoFactorSecret String?
+  createdAt              DateTime              @default(now())
+  updatedAt              DateTime              @updatedAt
+
+  refreshTokens          RefreshToken[]
+  twoFactorChallenges    TwoFactorChallenge[]
+
+  @@index([subjectId, role])
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  account   Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId String
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+model TwoFactorChallenge {
+  id        String           @id
+  account   Account          @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId String
+  method    TwoFactorMethod
+  expiresAt DateTime
+  resolved  Boolean          @default(false)
+  createdAt DateTime         @default(now())
+}

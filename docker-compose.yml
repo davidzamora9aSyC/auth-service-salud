@@ -1,0 +1,26 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: meusalud_auth
+      POSTGRES_USER: meusalud_auth
+      POSTGRES_PASSWORD: meusalud_auth
+    ports:
+      - "5435:5432"
+    volumes:
+      - meusalud-auth-db:/var/lib/postgresql/data
+
+  auth-service:
+    build: .
+    env_file:
+      - .env
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./secrets:/keys:ro
+    depends_on:
+      - db
+
+volumes:
+  meusalud-auth-db:
