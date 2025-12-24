@@ -28,9 +28,23 @@ ACCESS_TOKEN_TTL=900
 REFRESH_TOKEN_TTL=604800
 LOGIN_CHALLENGE_TTL=300
 MFA_ISSUER=MeuSalud
+NOTIFICATIONS_SERVICE_URL=http://communication-service:3006
+WELCOME_WHATSAPP_TEMPLATE_KEY=MEUSALUD_WELCOME
+NOTIFICATIONS_TIMEOUT_MS=5000
 ```
 
-Coloca el par RSA en `auth-service/secrets` o monta la ruta deseada y referencia el archivo privado mediante `JWT_PRIVATE_KEY_PATH`.
+- Coloca el par RSA en `auth-service/secrets` o monta la ruta deseada y referencia el archivo privado mediante `JWT_PRIVATE_KEY_PATH`.
+- Si vas a correr el servicio fuera de Docker, apunta `NOTIFICATIONS_SERVICE_URL` a `http://localhost:3006`. Dentro de `docker compose` utilizamos `communication-service` como host.
+
+## Notificaciones por WhatsApp
+
+Este repositorio ahora incluye el microservicio `communication-service`, encargado de hablar con Meta WhatsApp Cloud API. Para tener el flujo completo en local:
+
+1. Copia `communication-service/.env.example` a `communication-service/.env` y define tus credenciales reales de Meta (el `docker-compose.yml` usa `communication-service/.env.compose` como base; puedes editarlo o sobreescribir las variables a la hora de ejecutar).
+2. Ejecuta `docker compose up --build` dentro de `auth-service`. Además de PostgreSQL y el propio `auth-service`, se levantará `communication-service` en `http://localhost:3006`.
+3. El endpoint `POST /api/auth/register` guardará la cuenta y pedirá al servicio de comunicaciones que envíe un mensaje de bienvenida vía WhatsApp utilizando la plantilla `MEUSALUD_WELCOME`.
+
+Si no configuras las credenciales de Meta, el registro seguirá funcionando y sólo verás un log informando que el canal de WhatsApp no está disponible.
 
 ## Comandos útiles
 

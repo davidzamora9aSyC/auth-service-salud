@@ -24,6 +24,7 @@ enum TwoFactorMethod {
 model Account {
   id                     String                @id @default(uuid())
   email                  String                @unique
+  phoneNumber            String?               @unique
   passwordHash           String
   salt                   String
   role                   AccountRole
@@ -37,6 +38,7 @@ model Account {
 
   refreshTokens          RefreshToken[]
   twoFactorChallenges    TwoFactorChallenge[]
+  passwordRecoveries     PasswordRecovery[]
 
   @@index([subjectId, role])
 }
@@ -58,4 +60,20 @@ model TwoFactorChallenge {
   expiresAt DateTime
   resolved  Boolean          @default(false)
   createdAt DateTime         @default(now())
+}
+
+model PasswordRecovery {
+  id              String   @id @default(uuid())
+  account         Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId       String
+  codeHash        String
+  resetTokenHash  String?
+  expiresAt       DateTime
+  resetExpiresAt  DateTime?
+  verifiedAt      DateTime?
+  consumedAt      DateTime?
+  attempts        Int      @default(0)
+  createdAt       DateTime @default(now())
+
+  @@index([accountId])
 }

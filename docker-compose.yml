@@ -21,6 +21,19 @@ services:
       - ./secrets:/keys:ro
     depends_on:
       - db
+      - communication-service
+
+  communication-service:
+    build:
+      context: ../communication-service
+    env_file:
+      - ../communication-service/.env.compose
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=notification
+    ports:
+      - "3006:3006"
+    depends_on:
+      - db
 
 volumes:
   meusalud-auth-db:
