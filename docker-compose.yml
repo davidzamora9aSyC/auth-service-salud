@@ -103,5 +103,21 @@ services:
     depends_on:
       - db
 
+  meusaludgateway:
+    build:
+      context: ../meusaludgateway
+    env_file:
+      - ../meusaludgateway/.env
+    ports:
+      - "3020:3020"
+    depends_on:
+      - auth-service
+      - users-service
+      - doctors-service
+      - appointments-service
+      - services-service
+      - availability-service
+      - communication-service
+
 volumes:
   meusalud-auth-db:
