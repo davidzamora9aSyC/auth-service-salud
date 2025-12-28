@@ -103,6 +103,16 @@ services:
     depends_on:
       - db
 
+  meili:
+    image: getmeili/meilisearch:v1.10
+    restart: unless-stopped
+    environment:
+      MEILI_NO_ANALYTICS: "true"
+    ports:
+      - "7700:7700"
+    volumes:
+      - meili_data:/meili_data
+
   meusaludgateway:
     build:
       context: ../meusaludgateway
@@ -119,5 +129,16 @@ services:
       - availability-service
       - communication-service
 
+  search-service:
+    build:
+      context: ../search-service
+    env_file:
+      - ../search-service/.env
+    ports:
+      - "3017:3017"
+    depends_on:
+      - meili
+
 volumes:
   meusalud-auth-db:
+  meili_data:
