@@ -139,6 +139,23 @@ services:
     depends_on:
       - meili
 
+  subscriptions-service:
+    build:
+      context: ../subscriptions-service
+    env_file:
+      - ../subscriptions-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=subscriptions
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5672/
+      RABBITMQ_EXCHANGE_PAYMENTS: payments.events
+      RABBITMQ_EXCHANGE_SUBSCRIPTIONS: subscriptions.events
+      RABBITMQ_QUEUE_PAYMENTS: subs.q.payments
+      SUBSCRIPTIONS_INTERNAL_API_KEY: ""
+    ports:
+      - "3013:3013"
+    depends_on:
+      - db
+
 volumes:
   meusalud-auth-db:
   meili_data:
