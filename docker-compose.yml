@@ -43,6 +43,8 @@ services:
     environment:
       DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=users
       RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5672/
+      RABBITMQ_EXCHANGE_IMAGES: images.events
+      RABBITMQ_QUEUE_IMAGES: users.q.images
     ports:
       - "3008:3008"
     depends_on:
@@ -56,6 +58,8 @@ services:
     environment:
       DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=doctors
       RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5672/
+      RABBITMQ_EXCHANGE_IMAGES: images.events
+      RABBITMQ_QUEUE_IMAGES: doctors.q.images
     ports:
       - "3009:3009"
     depends_on:
@@ -128,6 +132,9 @@ services:
       - services-service
       - availability-service
       - communication-service
+      - consents-service
+      - analytics-service
+      - images-service
 
   search-service:
     build:
@@ -172,6 +179,71 @@ services:
     depends_on:
       - db
 
+  analytics-service:
+    build:
+      context: ../analytics-service
+    env_file:
+      - ../analytics-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=analytics
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5672/
+      RABBITMQ_EXCHANGE_APPOINTMENTS: appointments.events
+      RABBITMQ_EXCHANGE_SERVICES: services.events
+      RABBITMQ_EXCHANGE_DOCTORS: doctors.events
+      RABBITMQ_QUEUE_ANALYTICS: analytics.q.events
+    ports:
+      - "3015:3015"
+    depends_on:
+      - db
+
+  images-service:
+    build:
+      context: ../images-service
+    env_file:
+      - ../images-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=images
+      S3_BUCKET_PRIVATE: images-private
+      S3_REGION: us-east-1
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: minio
+      S3_SECRET_KEY: minio12345
+      S3_FORCE_PATH_STYLE: "true"
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5672/
+      RABBITMQ_EXCHANGE_IMAGES: images.events
+    ports:
+      - "3019:3019"
+    depends_on:
+      - db
+      - minio
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio12345
+    volumes:
+      - minio_data:/data
+
+  consents-service:
+    build:
+      context: ../consents-service
+    env_file:
+      - ../consents-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=consents
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5672/
+      RABBITMQ_EXCHANGE_CONSENTS: consents.events
+    ports:
+      - "3018:3018"
+    depends_on:
+      - db
+
 volumes:
   meusalud-auth-db:
   meili_data:
+  minio_data:
