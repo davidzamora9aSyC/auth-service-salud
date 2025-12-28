@@ -48,5 +48,18 @@ services:
     depends_on:
       - db
 
+  doctors-service:
+    build:
+      context: ../doctors-service
+    env_file:
+      - ../doctors-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=doctors
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5672/
+    ports:
+      - "3009:3009"
+    depends_on:
+      - db
+
 volumes:
   meusalud-auth-db:
