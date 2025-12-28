@@ -77,3 +77,36 @@ model PasswordRecovery {
 
   @@index([accountId])
 }
+
+model OAuthClient {
+  id                String   @id @default(uuid())
+  clientId          String   @unique
+  name              String
+  secretHash        String?
+  redirectUris      String[]
+  allowedScopes     String[]
+  allowedGrantTypes String[]
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  authorizationCodes OAuthAuthorizationCode[]
+}
+
+model OAuthAuthorizationCode {
+  id                  String   @id @default(uuid())
+  codeHash            String   @unique
+  client              OAuthClient @relation(fields: [clientId], references: [clientId], onDelete: Cascade)
+  clientId            String
+  account             Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId           String
+  redirectUri         String
+  scope               String
+  codeChallenge       String
+  codeChallengeMethod String
+  expiresAt           DateTime
+  consumedAt          DateTime?
+  createdAt           DateTime @default(now())
+
+  @@index([clientId])
+  @@index([accountId])
+}
