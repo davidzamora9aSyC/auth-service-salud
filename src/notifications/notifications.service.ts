@@ -4,11 +4,11 @@ import { ConfigService } from '@nestjs/config';
 import { firstValueFrom } from 'rxjs';
 
 type WhatsappPayload = {
-  to: string;
-  body?: string;
-  templateKey?: string;
+  to_e164: string;
+  template_code: string;
+  language?: string;
   variables?: Record<string, string>;
-  metadata?: Record<string, unknown>;
+  idempotency_key?: string;
 };
 
 @Injectable()
@@ -28,29 +28,20 @@ export class NotificationsService {
       this.logger.warn('NOTIFICATIONS_SERVICE_URL no está configurado');
       return;
     }
-    const endpoint = `${baseUrl.replace(/\/$/, '')}/whatsapp/messages`;
+    const endpoint = `${baseUrl.replace(/\/$/, '')}/internal/whatsapp/send-template`;
     const templateKey =
       this.config.get<string>('WELCOME_WHATSAPP_TEMPLATE_KEY') ??
       'MEUSALUD_WELCOME';
     const fallbackName =
       input.email.split('@')[0]?.trim() || 'Profesional MeuSalud';
     const payload: WhatsappPayload = {
-      to: input.phoneNumber,
-      metadata: {
-        reason: 'REGISTRATION_WELCOME',
+      to_e164: input.phoneNumber,
+      template_code: templateKey,
+      variables: {
+        name: fallbackName,
         email: input.email,
       },
     };
-
-    if (templateKey) {
-      payload.templateKey = templateKey as WhatsappPayload['templateKey'];
-      payload.variables = {
-        name: fallbackName,
-        email: input.email,
-      };
-    } else {
-      payload.body = `Hola ${fallbackName}, gracias por registrarte en MeuSalud. Tu usuario es ${input.email}. Cuando quieras activar el segundo factor visita el portal en Configuración > Seguridad.`;
-    }
 
     try {
       await firstValueFrom(
@@ -74,6 +65,7 @@ export class NotificationsService {
     name: string;
     code: string;
     link: string;
+    ttlSeconds?: number;
   }) {
     const baseUrl =
       this.config.get<string>('NOTIFICATIONS_SERVICE_URL') ??
@@ -82,21 +74,19 @@ export class NotificationsService {
       this.logger.warn('NOTIFICATIONS_SERVICE_URL no está configurado');
       return;
     }
-    const endpoint = `${baseUrl.replace(/\/$/, '')}/whatsapp/messages`;
+    const endpoint = `${baseUrl.replace(/\/$/, '')}/internal/whatsapp/send-template`;
     const templateKey =
       this.config.get<string>('PASSWORD_RESET_TEMPLATE_KEY') ??
       'PASSWORD_RESET';
 
     const payload: WhatsappPayload = {
-      to: input.phoneNumber,
-      templateKey: templateKey as WhatsappPayload['templateKey'],
+      to_e164: input.phoneNumber,
+      template_code: templateKey,
       variables: {
         name: input.name,
         code: input.code,
         link: input.link,
-      },
-      metadata: {
-        reason: 'PASSWORD_RECOVERY',
+        ttl: String(input.ttlSeconds ?? ''),
       },
     };
 

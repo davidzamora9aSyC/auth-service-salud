@@ -39,6 +39,7 @@ model Account {
   refreshTokens          RefreshToken[]
   twoFactorChallenges    TwoFactorChallenge[]
   passwordRecoveries     PasswordRecovery[]
+  oauthAuthorizationCodes OAuthAuthorizationCode[]
 
   @@index([subjectId, role])
 }

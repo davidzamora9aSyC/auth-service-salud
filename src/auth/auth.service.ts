@@ -301,6 +301,7 @@ export class AuthService {
       name,
       code,
       link: this.recoveryLinkBase,
+      ttlSeconds: this.recoveryCodeTtl,
     });
 
     return {
