@@ -1,0 +1,68 @@
+{
+  "vhosts": [
+    { "name": "/" }
+  ],
+  "exchanges": [
+    { "name": "appointments.events", "vhost": "/", "type": "topic", "durable": true, "auto_delete": false, "internal": false, "arguments": {} },
+    { "name": "doctors.events", "vhost": "/", "type": "topic", "durable": true, "auto_delete": false, "internal": false, "arguments": {} },
+    { "name": "patients.events", "vhost": "/", "type": "topic", "durable": true, "auto_delete": false, "internal": false, "arguments": {} },
+    { "name": "services.events", "vhost": "/", "type": "topic", "durable": true, "auto_delete": false, "internal": false, "arguments": {} },
+    { "name": "payments.events", "vhost": "/", "type": "topic", "durable": true, "auto_delete": false, "internal": false, "arguments": {} },
+    { "name": "subscriptions.events", "vhost": "/", "type": "topic", "durable": true, "auto_delete": false, "internal": false, "arguments": {} },
+    { "name": "consents.events", "vhost": "/", "type": "topic", "durable": true, "auto_delete": false, "internal": false, "arguments": {} },
+    { "name": "deadletter", "vhost": "/", "type": "direct", "durable": true, "auto_delete": false, "internal": false, "arguments": {} }
+  ],
+  "queues": [
+    { "name": "comms.q.appointments", "vhost": "/", "durable": true, "auto_delete": false, "arguments": { "x-dead-letter-exchange": "deadletter", "x-dead-letter-routing-key": "comms.q.appointments.dlq" } },
+    { "name": "comms.q.appointments.dlq", "vhost": "/", "durable": true, "auto_delete": false, "arguments": {} },
+
+    { "name": "analytics.q.appointments", "vhost": "/", "durable": true, "auto_delete": false, "arguments": { "x-dead-letter-exchange": "deadletter", "x-dead-letter-routing-key": "analytics.q.appointments.dlq" } },
+    { "name": "analytics.q.appointments.dlq", "vhost": "/", "durable": true, "auto_delete": false, "arguments": {} },
+
+    { "name": "search.q.catalog", "vhost": "/", "durable": true, "auto_delete": false, "arguments": { "x-dead-letter-exchange": "deadletter", "x-dead-letter-routing-key": "search.q.catalog.dlq" } },
+    { "name": "search.q.catalog.dlq", "vhost": "/", "durable": true, "auto_delete": false, "arguments": {} },
+
+    { "name": "subs.q.payments", "vhost": "/", "durable": true, "auto_delete": false, "arguments": { "x-dead-letter-exchange": "deadletter", "x-dead-letter-routing-key": "subs.q.payments.dlq" } },
+    { "name": "subs.q.payments.dlq", "vhost": "/", "durable": true, "auto_delete": false, "arguments": {} },
+
+    { "name": "users.q.consents", "vhost": "/", "durable": true, "auto_delete": false, "arguments": { "x-dead-letter-exchange": "deadletter", "x-dead-letter-routing-key": "users.q.consents.dlq" } },
+    { "name": "users.q.consents.dlq", "vhost": "/", "durable": true, "auto_delete": false, "arguments": {} },
+
+    { "name": "doctors.q.consents", "vhost": "/", "durable": true, "auto_delete": false, "arguments": { "x-dead-letter-exchange": "deadletter", "x-dead-letter-routing-key": "doctors.q.consents.dlq" } },
+    { "name": "doctors.q.consents.dlq", "vhost": "/", "durable": true, "auto_delete": false, "arguments": {} },
+
+    { "name": "appointments.q.consents", "vhost": "/", "durable": true, "auto_delete": false, "arguments": { "x-dead-letter-exchange": "deadletter", "x-dead-letter-routing-key": "appointments.q.consents.dlq" } },
+    { "name": "appointments.q.consents.dlq", "vhost": "/", "durable": true, "auto_delete": false, "arguments": {} }
+  ],
+  "bindings": [
+    { "source": "appointments.events", "vhost": "/", "destination": "comms.q.appointments", "destination_type": "queue", "routing_key": "appointments.created", "arguments": {} },
+    { "source": "appointments.events", "vhost": "/", "destination": "comms.q.appointments", "destination_type": "queue", "routing_key": "appointments.cancelled", "arguments": {} },
+    { "source": "appointments.events", "vhost": "/", "destination": "comms.q.appointments", "destination_type": "queue", "routing_key": "appointments.rescheduled", "arguments": {} },
+    { "source": "appointments.events", "vhost": "/", "destination": "comms.q.appointments", "destination_type": "queue", "routing_key": "appointments.attendance_marked", "arguments": {} },
+
+    { "source": "appointments.events", "vhost": "/", "destination": "analytics.q.appointments", "destination_type": "queue", "routing_key": "appointments.*", "arguments": {} },
+    { "source": "services.events", "vhost": "/", "destination": "analytics.q.appointments", "destination_type": "queue", "routing_key": "services.*", "arguments": {} },
+    { "source": "doctors.events", "vhost": "/", "destination": "analytics.q.appointments", "destination_type": "queue", "routing_key": "doctors.*", "arguments": {} },
+
+    { "source": "doctors.events", "vhost": "/", "destination": "search.q.catalog", "destination_type": "queue", "routing_key": "doctors.*", "arguments": {} },
+    { "source": "services.events", "vhost": "/", "destination": "search.q.catalog", "destination_type": "queue", "routing_key": "services.*", "arguments": {} },
+    { "source": "patients.events", "vhost": "/", "destination": "search.q.catalog", "destination_type": "queue", "routing_key": "patients.*", "arguments": {} },
+
+    { "source": "payments.events", "vhost": "/", "destination": "subs.q.payments", "destination_type": "queue", "routing_key": "payments.*", "arguments": {} },
+
+    { "source": "consents.events", "vhost": "/", "destination": "users.q.consents", "destination_type": "queue", "routing_key": "consents.revoked", "arguments": {} },
+    { "source": "consents.events", "vhost": "/", "destination": "users.q.consents", "destination_type": "queue", "routing_key": "consents.deletion_requested", "arguments": {} },
+    { "source": "consents.events", "vhost": "/", "destination": "doctors.q.consents", "destination_type": "queue", "routing_key": "consents.revoked", "arguments": {} },
+    { "source": "consents.events", "vhost": "/", "destination": "doctors.q.consents", "destination_type": "queue", "routing_key": "consents.deletion_requested", "arguments": {} },
+    { "source": "consents.events", "vhost": "/", "destination": "appointments.q.consents", "destination_type": "queue", "routing_key": "consents.revoked", "arguments": {} },
+    { "source": "consents.events", "vhost": "/", "destination": "appointments.q.consents", "destination_type": "queue", "routing_key": "consents.deletion_requested", "arguments": {} },
+
+    { "source": "deadletter", "vhost": "/", "destination": "comms.q.appointments.dlq", "destination_type": "queue", "routing_key": "comms.q.appointments.dlq", "arguments": {} },
+    { "source": "deadletter", "vhost": "/", "destination": "analytics.q.appointments.dlq", "destination_type": "queue", "routing_key": "analytics.q.appointments.dlq", "arguments": {} },
+    { "source": "deadletter", "vhost": "/", "destination": "search.q.catalog.dlq", "destination_type": "queue", "routing_key": "search.q.catalog.dlq", "arguments": {} },
+    { "source": "deadletter", "vhost": "/", "destination": "subs.q.payments.dlq", "destination_type": "queue", "routing_key": "subs.q.payments.dlq", "arguments": {} },
+    { "source": "deadletter", "vhost": "/", "destination": "users.q.consents.dlq", "destination_type": "queue", "routing_key": "users.q.consents.dlq", "arguments": {} },
+    { "source": "deadletter", "vhost": "/", "destination": "doctors.q.consents.dlq", "destination_type": "queue", "routing_key": "doctors.q.consents.dlq", "arguments": {} },
+    { "source": "deadletter", "vhost": "/", "destination": "appointments.q.consents.dlq", "destination_type": "queue", "routing_key": "appointments.q.consents.dlq", "arguments": {} }
+  ]
+}

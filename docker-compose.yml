@@ -23,6 +23,26 @@ services:
       - db
       - communication-service
 
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    container_name: dev_rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: app
+      RABBITMQ_DEFAULT_PASS: app_pass_123
+      RABBITMQ_DEFAULT_VHOST: /
+      RABBITMQ_LOAD_DEFINITIONS: /etc/rabbitmq/definitions.json
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+      - ./rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   communication-service:
     build:
       context: ../communication-service
@@ -37,3 +57,4 @@ services:
 
 volumes:
   meusalud-auth-db:
+  rabbitmq_data:
