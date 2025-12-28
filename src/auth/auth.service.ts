@@ -8,7 +8,7 @@ import {
 } from '@nestjs/common';
 import { Account, AccountRole, AccountStatus, TwoFactorMethod } from '@prisma/client';
 import { readFileSync } from 'node:fs';
-import { createHash, randomBytes, randomInt } from 'node:crypto';
+import { createHash, createPublicKey, randomBytes, randomInt } from 'node:crypto';
 import * as argon2 from 'argon2';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
@@ -16,7 +16,7 @@ import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { VerifyTwoFactorDto } from './dto/verify-two-factor.dto';
 import { authenticator } from 'otplib';
-import { decode, sign, SignOptions } from 'jsonwebtoken';
+import { decode, sign, SignOptions, verify } from 'jsonwebtoken';
 import { nanoid } from 'nanoid';
 import { TwoFactorSetupDto } from './dto/two-factor-setup.dto';
 import { TwoFactorCodeDto } from './dto/two-factor-code.dto';
@@ -24,11 +24,14 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { RecoveryStartDto } from './dto/recovery-start.dto';
 import { RecoveryVerifyDto } from './dto/recovery-verify.dto';
 import { RecoveryCompleteDto } from './dto/recovery-complete.dto';
+import { OAuthAuthorizeDto } from './dto/oauth-authorize.dto';
+import { OAuthTokenDto } from './dto/oauth-token.dto';
 
 @Injectable()
 export class AuthService {
   private readonly logger = new Logger(AuthService.name);
   private readonly privateKey: Buffer;
+  private readonly publicKey: ReturnType<typeof createPublicKey>;
   private readonly accessTtl: number;
   private readonly refreshTtl: number;
   private readonly challengeTtl: number;
@@ -36,6 +39,8 @@ export class AuthService {
   private readonly recoveryResetTtl: number;
   private readonly recoveryMaxAttempts: number;
   private readonly recoveryLinkBase: string;
+  private readonly oauthCodeTtl: number;
+  private readonly oauthClientTtl: number;
   private readonly googleClientId?: string;
   private readonly googleClientSecret?: string;
   private readonly googleRedirectUri?: string;
@@ -65,6 +70,7 @@ export class AuthService {
       throw new Error('JWT_PRIVATE_KEY_PATH is not configured');
     }
     this.privateKey = readFileSync(privateKeyPath);
+    this.publicKey = createPublicKey(this.privateKey);
     this.accessTtl = parseInt(
       this.config.get<string>('ACCESS_TOKEN_TTL', '900'),
       10,
@@ -92,6 +98,14 @@ export class AuthService {
     this.recoveryLinkBase =
       this.config.get<string>('RECOVERY_LINK_BASE') ??
       'http://localhost:3007/recover';
+    this.oauthCodeTtl = parseInt(
+      this.config.get<string>('OAUTH_CODE_TTL', '300'),
+      10,
+    );
+    this.oauthClientTtl = parseInt(
+      this.config.get<string>('OAUTH_CLIENT_TTL', `${this.accessTtl}`),
+      10,
+    );
     this.googleClientId = this.config.get<string>('GOOGLE_CLIENT_ID');
     this.googleClientSecret = this.config.get<string>('GOOGLE_CLIENT_SECRET');
     this.googleRedirectUri = this.config.get<string>('GOOGLE_REDIRECT_URI');
@@ -376,6 +390,73 @@ export class AuthService {
     ]);
 
     return { success: true };
+  }
+
+  async authorizeOAuth(dto: OAuthAuthorizeDto, authorization?: string) {
+    const token = this.extractBearerToken(authorization);
+    if (!token) {
+      throw new UnauthorizedException('Missing access token');
+    }
+    const payload = verify(token, this.publicKey, {
+      algorithms: ['RS256'],
+    }) as { sub?: string };
+    if (!payload?.sub) {
+      throw new UnauthorizedException('Invalid access token');
+    }
+    const account = await this.prisma.account.findUnique({
+      where: { id: payload.sub },
+    });
+    if (!account || account.status !== AccountStatus.ACTIVE) {
+      throw new UnauthorizedException('Account disabled');
+    }
+
+    const client = await this.prisma.oAuthClient.findUnique({
+      where: { clientId: dto.client_id },
+    });
+    if (!client || !client.allowedGrantTypes.includes('authorization_code')) {
+      throw new UnauthorizedException('OAuth client inválido');
+    }
+    if (!client.redirectUris.includes(dto.redirect_uri)) {
+      throw new UnauthorizedException('Redirect URI no permitido');
+    }
+    if (dto.code_challenge_method !== 'S256') {
+      throw new BadRequestException('Unsupported code_challenge_method');
+    }
+
+    const scope = this.resolveScopes(dto.scope, client.allowedScopes);
+    const code = nanoid(48);
+    const codeHash = this.hashToken(code);
+    const expiresAt = new Date(Date.now() + this.oauthCodeTtl * 1000);
+
+    await this.prisma.oAuthAuthorizationCode.create({
+      data: {
+        codeHash,
+        clientId: client.clientId,
+        accountId: account.id,
+        redirectUri: dto.redirect_uri,
+        scope,
+        codeChallenge: dto.code_challenge,
+        codeChallengeMethod: dto.code_challenge_method,
+        expiresAt,
+      },
+    });
+
+    const redirectUrl = new URL(dto.redirect_uri);
+    redirectUrl.searchParams.set('code', code);
+    if (dto.state) {
+      redirectUrl.searchParams.set('state', dto.state);
+    }
+    return redirectUrl.toString();
+  }
+
+  async exchangeOAuthToken(dto: OAuthTokenDto) {
+    if (dto.grant_type === 'authorization_code') {
+      return this.exchangeAuthorizationCode(dto);
+    }
+    if (dto.grant_type === 'client_credentials') {
+      return this.exchangeClientCredentials(dto);
+    }
+    throw new BadRequestException('Unsupported grant_type');
   }
 
   getGoogleOAuthUrl(roleInput: string, redirect?: string) {
@@ -672,12 +753,15 @@ export class AuthService {
     return { twoFactorEnabled: false };
   }
 
-  private async issueTokens(account: Account) {
-    const payload = {
+  private async issueTokens(account: Account, scope?: string) {
+    const payload: Record<string, unknown> = {
       sub: account.id,
       role: account.role,
       subjectId: account.subjectId,
     };
+    if (scope) {
+      payload.scope = scope;
+    }
     const signOptions: SignOptions = {
       algorithm: 'RS256',
       expiresIn: this.accessTtl,
@@ -708,6 +792,102 @@ export class AuthService {
     };
   }
 
+  private async exchangeAuthorizationCode(dto: OAuthTokenDto) {
+    if (!dto.code || !dto.redirect_uri || !dto.code_verifier) {
+      throw new BadRequestException('Missing OAuth authorization_code parameters');
+    }
+    const client = await this.prisma.oAuthClient.findUnique({
+      where: { clientId: dto.client_id },
+    });
+    if (!client || !client.allowedGrantTypes.includes('authorization_code')) {
+      throw new UnauthorizedException('OAuth client inválido');
+    }
+    if (!client.redirectUris.includes(dto.redirect_uri)) {
+      throw new UnauthorizedException('Redirect URI no permitido');
+    }
+    if (client.secretHash && !dto.client_secret) {
+      throw new UnauthorizedException('Missing client_secret');
+    }
+    if (client.secretHash && dto.client_secret) {
+      const secretOk = await argon2.verify(client.secretHash, dto.client_secret);
+      if (!secretOk) {
+        throw new UnauthorizedException('Invalid client_secret');
+      }
+    }
+
+    const codeHash = this.hashToken(dto.code);
+    const stored = await this.prisma.oAuthAuthorizationCode.findUnique({
+      where: { codeHash },
+      include: { account: true },
+    });
+    if (!stored || stored.clientId !== client.clientId || stored.redirectUri !== dto.redirect_uri) {
+      throw new UnauthorizedException('Invalid authorization code');
+    }
+    if (stored.expiresAt < new Date() || stored.consumedAt) {
+      throw new UnauthorizedException('Authorization code expired');
+    }
+    if (stored.codeChallengeMethod !== 'S256') {
+      throw new UnauthorizedException('Unsupported code challenge');
+    }
+    const challenge = this.buildPkceChallenge(dto.code_verifier);
+    if (challenge !== stored.codeChallenge) {
+      throw new UnauthorizedException('Invalid code_verifier');
+    }
+
+    await this.prisma.oAuthAuthorizationCode.update({
+      where: { codeHash },
+      data: { consumedAt: new Date() },
+    });
+
+    const tokens = await this.issueTokens(stored.account, stored.scope);
+    return {
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+      token_type: 'Bearer',
+      expiresIn: tokens.accessTokenExpiresIn,
+      scope: stored.scope,
+    };
+  }
+
+  private async exchangeClientCredentials(dto: OAuthTokenDto) {
+    if (!dto.client_secret) {
+      throw new BadRequestException('Missing client_secret');
+    }
+    const client = await this.prisma.oAuthClient.findUnique({
+      where: { clientId: dto.client_id },
+    });
+    if (!client || !client.allowedGrantTypes.includes('client_credentials')) {
+      throw new UnauthorizedException('OAuth client inválido');
+    }
+    if (!client.secretHash) {
+      throw new UnauthorizedException('Client credentials disabled');
+    }
+    const secretOk = await argon2.verify(client.secretHash, dto.client_secret);
+    if (!secretOk) {
+      throw new UnauthorizedException('Invalid client_secret');
+    }
+    const scope = this.resolveScopes(dto.scope, client.allowedScopes);
+    const accessToken = sign(
+      {
+        sub: client.clientId,
+        scope,
+        clientId: client.clientId,
+      },
+      this.privateKey,
+      {
+        algorithm: 'RS256',
+        expiresIn: this.oauthClientTtl,
+        keyid: 'meusalud-auth',
+      },
+    );
+    return {
+      accessToken,
+      token_type: 'Bearer',
+      expiresIn: this.oauthClientTtl,
+      scope,
+    };
+  }
+
   private hashToken(token: string) {
     return createHash('sha256').update(token).digest('hex');
   }
@@ -735,6 +915,35 @@ export class AuthService {
       return { redirect: url.toString(), payload: null };
     }
     throw new UnauthorizedException(message);
+  }
+
+  private extractBearerToken(authorization?: string) {
+    if (!authorization) return undefined;
+    const [scheme, token] = authorization.split(' ');
+    if (scheme?.toLowerCase() !== 'bearer') return undefined;
+    return token;
+  }
+
+  private resolveScopes(requested: string | undefined, allowed: string[]) {
+    if (!requested || !requested.trim()) {
+      return allowed.join(' ');
+    }
+    const requestedScopes = requested.split(' ').map((scope) => scope.trim()).filter(Boolean);
+    const allowedSet = new Set(allowed);
+    const invalid = requestedScopes.find((scope) => !allowedSet.has(scope));
+    if (invalid) {
+      throw new UnauthorizedException('Scope no permitido');
+    }
+    return requestedScopes.join(' ');
+  }
+
+  private buildPkceChallenge(verifier: string) {
+    return createHash('sha256')
+      .update(verifier)
+      .digest('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
   }
 
   private createAppleClientSecret() {
