@@ -156,6 +156,22 @@ services:
     depends_on:
       - db
 
+  payments-service:
+    build:
+      context: ../payments-service
+    env_file:
+      - ../payments-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=payments
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5672/
+      RABBITMQ_EXCHANGE_PAYMENTS: payments.events
+      SUBSCRIPTIONS_BASE_URL: http://subscriptions-service:3013/subscriptionsms
+      WOMPI_ENV: sandbox
+    ports:
+      - "3014:3014"
+    depends_on:
+      - db
+
 volumes:
   meusalud-auth-db:
   meili_data:
