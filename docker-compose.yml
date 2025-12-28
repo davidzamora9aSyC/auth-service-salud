@@ -69,6 +69,8 @@ services:
     environment:
       DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=appointments
       RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5672/
+      SERVICES_SERVICE_URL: http://services-service:3011/servicesms
+      AVAILABILITY_SERVICE_URL: http://availability-service:3012/availabilityms
     ports:
       - "3010:3010"
     depends_on:
@@ -84,6 +86,20 @@ services:
       RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5672/
     ports:
       - "3011:3011"
+    depends_on:
+      - db
+
+  availability-service:
+    build:
+      context: ../availability-service
+    env_file:
+      - ../availability-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=availability
+      SERVICES_BASE_URL: http://services-service:3011/servicesms
+      APPOINTMENTS_BASE_URL: http://appointments-service:3010/appointmentsms
+    ports:
+      - "3012:3012"
     depends_on:
       - db
 
