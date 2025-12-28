@@ -19,7 +19,7 @@ async function bootstrap() {
       },
     }),
   );
-  app.setGlobalPrefix('api');
+  app.setGlobalPrefix('authms');
   const port = parseInt(process.env.PORT ?? '3000', 10);
   await app.listen(port);
 }
