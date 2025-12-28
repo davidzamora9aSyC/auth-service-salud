@@ -23,7 +23,7 @@ export class NotificationsService {
   async sendRegistrationWhatsapp(input: { phoneNumber: string; email: string }) {
     const baseUrl =
       this.config.get<string>('NOTIFICATIONS_SERVICE_URL') ??
-      'http://communication-service:3006';
+      'http://communication-service:3006/communicationms';
     if (!baseUrl) {
       this.logger.warn('NOTIFICATIONS_SERVICE_URL no está configurado');
       return;
@@ -69,7 +69,7 @@ export class NotificationsService {
   }) {
     const baseUrl =
       this.config.get<string>('NOTIFICATIONS_SERVICE_URL') ??
-      'http://communication-service:3006';
+      'http://communication-service:3006/communicationms';
     if (!baseUrl) {
       this.logger.warn('NOTIFICATIONS_SERVICE_URL no está configurado');
       return;
