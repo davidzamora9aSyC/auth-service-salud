@@ -1,6 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { createHash, createPublicKey } from 'node:crypto';
+import { createPublicKey } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 
 @Injectable()
@@ -17,9 +17,8 @@ export class JwksService {
     const pem = readFileSync(publicKeyPath ?? privateKeyPath!);
     const publicKey = createPublicKey(pem);
     const jwk = publicKey.export({ format: 'jwk' }) as JsonWebKey;
-    const kid = createHash('sha256')
-      .update(`${jwk.kty}.${jwk.n}.${jwk.e}`)
-      .digest('base64url');
+    const configuredKid = this.config.get<string>('JWT_KEY_ID');
+    const kid = configuredKid ?? 'meusalud-auth';
 
     this.jwks = {
       keys: [
