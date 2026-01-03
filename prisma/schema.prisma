@@ -21,6 +21,11 @@ enum TwoFactorMethod {
   TOTP
 }
 
+enum OnboardingStatus {
+  PENDING
+  COMPLETE
+}
+
 model Account {
   id                     String                @id @default(uuid())
   email                  String                @unique
@@ -29,6 +34,8 @@ model Account {
   salt                   String
   role                   AccountRole
   subjectId              String?
+  doctorId               String?               @unique
+  onboardingStatus       OnboardingStatus      @default(COMPLETE)
   status                 AccountStatus         @default(ACTIVE)
   twoFactorEnabled       Boolean               @default(false)
   twoFactorSecret        String?

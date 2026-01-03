@@ -6,9 +6,9 @@ import {
   ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
-import { Account, AccountRole, AccountStatus, TwoFactorMethod } from '@prisma/client';
+import { Account, AccountRole, AccountStatus, OnboardingStatus, Prisma, TwoFactorMethod } from '@prisma/client';
 import { readFileSync } from 'node:fs';
-import { createHash, createPublicKey, randomBytes, randomInt } from 'node:crypto';
+import { createHash, createPublicKey, randomBytes, randomInt, randomUUID } from 'node:crypto';
 import * as argon2 from 'argon2';
 import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
@@ -26,6 +26,7 @@ import { RecoveryVerifyDto } from './dto/recovery-verify.dto';
 import { RecoveryCompleteDto } from './dto/recovery-complete.dto';
 import { OAuthAuthorizeDto } from './dto/oauth-authorize.dto';
 import { OAuthTokenDto } from './dto/oauth-token.dto';
+import { RabbitmqService } from './rabbitmq.service';
 
 @Injectable()
 export class AuthService {
@@ -64,6 +65,7 @@ export class AuthService {
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
     private readonly notifications: NotificationsService,
+    private readonly rabbitmq: RabbitmqService,
   ) {
     const privateKeyPath = this.config.get<string>('JWT_PRIVATE_KEY_PATH');
     if (!privateKeyPath) {
@@ -151,39 +153,69 @@ export class AuthService {
       where: { email: normalizedEmail },
     });
     if (existing) {
-      throw new ConflictException('Email already registered');
+      throw new ConflictException('El email ya esta registrado');
     }
     const existingPhone = await this.prisma.account.findUnique({
       where: { phoneNumber: normalizedPhone },
     });
     if (existingPhone) {
-      throw new ConflictException('Phone already registered');
+      throw new ConflictException('El numero de telefono ya esta registrado');
     }
     const salt = randomBytes(24).toString('hex');
     const passwordHash = await argon2.hash(dto.password + salt, {
       type: argon2.argon2id,
     });
-    const account = await this.prisma.account.create({
-      data: {
-        email: normalizedEmail,
-        passwordHash,
-        salt,
-        role: dto.role,
-        subjectId: dto.subjectId ?? null,
-        phoneNumber: normalizedPhone,
-      },
-    });
+    const doctorId =
+      dto.role === AccountRole.DOCTOR ? randomUUID() : null;
+    const onboardingStatus =
+      dto.role === AccountRole.DOCTOR
+        ? OnboardingStatus.PENDING
+        : OnboardingStatus.COMPLETE;
+    let account: Account;
+    try {
+      account = await this.prisma.account.create({
+        data: {
+          email: normalizedEmail,
+          passwordHash,
+          salt,
+          role: dto.role,
+          subjectId: dto.subjectId ?? null,
+          phoneNumber: normalizedPhone,
+          doctorId,
+          onboardingStatus,
+        },
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        const targets = Array.isArray(error.meta?.target) ? error.meta.target : [];
+        if (targets.includes('email')) {
+          throw new ConflictException('El email ya esta registrado');
+        }
+        if (targets.includes('phoneNumber')) {
+          throw new ConflictException('El numero de telefono ya esta registrado');
+        }
+        throw new ConflictException('La cuenta ya existe');
+      }
+      throw error;
+    }
     await this.notifications.sendRegistrationWhatsapp({
       phoneNumber: normalizedPhone,
       email: account.email,
     });
-    return {
-      id: account.id,
-      email: account.email,
-      phoneNumber: account.phoneNumber,
-      role: account.role,
-      twoFactorEnabled: account.twoFactorEnabled,
-    };
+    if (account.role === AccountRole.DOCTOR && account.doctorId) {
+      await this.rabbitmq.publishAuthEvent({
+        type: 'AuthUserRegistered',
+        routingKey: 'auth.user_registered',
+        data: {
+          authUserId: account.id,
+          role: account.role,
+          doctorId: account.doctorId,
+          email: account.email,
+          phoneNumber: account.phoneNumber ?? undefined,
+        },
+      });
+    }
+    return this.issueTokens(account);
   }
 
   async login(dto: LoginDto) {
@@ -561,6 +593,12 @@ export class AuthService {
       const passwordHash = await argon2.hash(randomBytes(32).toString('hex') + salt, {
         type: argon2.argon2id,
       });
+      const doctorId =
+        entry.role === AccountRole.DOCTOR ? randomUUID() : null;
+      const onboardingStatus =
+        entry.role === AccountRole.DOCTOR
+          ? OnboardingStatus.PENDING
+          : OnboardingStatus.COMPLETE;
       account = await this.prisma.account.create({
         data: {
           email: normalizedEmail,
@@ -569,8 +607,23 @@ export class AuthService {
           role: entry.role,
           subjectId: profile.sub ?? null,
           phoneNumber: null,
+          doctorId,
+          onboardingStatus,
         },
       });
+      if (account.role === AccountRole.DOCTOR && account.doctorId) {
+        await this.rabbitmq.publishAuthEvent({
+          type: 'AuthUserRegistered',
+          routingKey: 'auth.user_registered',
+          data: {
+            authUserId: account.id,
+            role: account.role,
+            doctorId: account.doctorId,
+            email: account.email,
+            phoneNumber: account.phoneNumber ?? undefined,
+          },
+        });
+      }
     }
 
     const tokens = await this.issueTokens(account);
@@ -669,6 +722,12 @@ export class AuthService {
       const passwordHash = await argon2.hash(randomBytes(32).toString('hex') + salt, {
         type: argon2.argon2id,
       });
+      const doctorId =
+        entry.role === AccountRole.DOCTOR ? randomUUID() : null;
+      const onboardingStatus =
+        entry.role === AccountRole.DOCTOR
+          ? OnboardingStatus.PENDING
+          : OnboardingStatus.COMPLETE;
       account = await this.prisma.account.create({
         data: {
           email: normalizedEmail,
@@ -677,8 +736,23 @@ export class AuthService {
           role: entry.role,
           subjectId: decoded.sub ?? null,
           phoneNumber: null,
+          doctorId,
+          onboardingStatus,
         },
       });
+      if (account.role === AccountRole.DOCTOR && account.doctorId) {
+        await this.rabbitmq.publishAuthEvent({
+          type: 'AuthUserRegistered',
+          routingKey: 'auth.user_registered',
+          data: {
+            authUserId: account.id,
+            role: account.role,
+            doctorId: account.doctorId,
+            email: account.email,
+            phoneNumber: account.phoneNumber ?? undefined,
+          },
+        });
+      }
     }
 
     const tokens = await this.issueTokens(account);
@@ -760,6 +834,15 @@ export class AuthService {
       role: account.role,
       subjectId: account.subjectId,
     };
+    if (account.role === AccountRole.DOCTOR) {
+      if (account.doctorId) {
+        payload.doctorId = account.doctorId;
+      }
+      payload.onboardingRequired =
+        account.onboardingStatus !== OnboardingStatus.COMPLETE;
+    } else {
+      payload.onboardingRequired = false;
+    }
     if (scope) {
       payload.scope = scope;
     }
@@ -789,6 +872,8 @@ export class AuthService {
         email: account.email,
         role: account.role,
         subjectId: account.subjectId,
+        doctorId: account.doctorId,
+        onboardingStatus: account.onboardingStatus,
       },
     };
   }
