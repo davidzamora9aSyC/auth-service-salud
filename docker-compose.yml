@@ -15,6 +15,7 @@ services:
     build: .
     env_file:
       - .env
+      - .env.local
     ports:
       - "3000:3000"
     volumes:
@@ -42,7 +43,7 @@ services:
       - ../users-service/.env
     environment:
       DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=users
-      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5672/
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
       RABBITMQ_EXCHANGE_IMAGES: images.events
       RABBITMQ_QUEUE_IMAGES: users.q.images
     ports:
@@ -57,7 +58,7 @@ services:
       - ../doctors-service/.env
     environment:
       DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=doctors
-      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5672/
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
       RABBITMQ_EXCHANGE_IMAGES: images.events
       RABBITMQ_QUEUE_IMAGES: doctors.q.images
     ports:
@@ -72,7 +73,7 @@ services:
       - ../appointments-service/.env
     environment:
       DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=appointments
-      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5672/
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
       SERVICES_SERVICE_URL: http://services-service:3011/servicesms
       AVAILABILITY_SERVICE_URL: http://availability-service:3012/availabilityms
     ports:
@@ -87,7 +88,7 @@ services:
       - ../services-service/.env
     environment:
       DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=services
-      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5672/
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
     ports:
       - "3011:3011"
     depends_on:
@@ -153,7 +154,7 @@ services:
       - ../subscriptions-service/.env
     environment:
       DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=subscriptions
-      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5672/
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
       RABBITMQ_EXCHANGE_PAYMENTS: payments.events
       RABBITMQ_EXCHANGE_SUBSCRIPTIONS: subscriptions.events
       RABBITMQ_QUEUE_PAYMENTS: subs.q.payments
@@ -170,7 +171,7 @@ services:
       - ../payments-service/.env
     environment:
       DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=payments
-      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5672/
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
       RABBITMQ_EXCHANGE_PAYMENTS: payments.events
       SUBSCRIPTIONS_BASE_URL: http://subscriptions-service:3013/subscriptionsms
       WOMPI_ENV: sandbox
@@ -186,7 +187,7 @@ services:
       - ../analytics-service/.env
     environment:
       DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=analytics
-      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5672/
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
       RABBITMQ_EXCHANGE_APPOINTMENTS: appointments.events
       RABBITMQ_EXCHANGE_SERVICES: services.events
       RABBITMQ_EXCHANGE_DOCTORS: doctors.events
@@ -209,7 +210,7 @@ services:
       S3_ACCESS_KEY: minio
       S3_SECRET_KEY: minio12345
       S3_FORCE_PATH_STYLE: "true"
-      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5672/
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
       RABBITMQ_EXCHANGE_IMAGES: images.events
     ports:
       - "3019:3019"
@@ -236,7 +237,7 @@ services:
       - ../consents-service/.env
     environment:
       DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=consents
-      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5672/
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
       RABBITMQ_EXCHANGE_CONSENTS: consents.events
     ports:
       - "3018:3018"
