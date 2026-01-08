@@ -6,7 +6,16 @@ import {
   ServiceUnavailableException,
   UnauthorizedException,
 } from '@nestjs/common';
-import { Account, AccountRole, AccountStatus, OnboardingStatus, Prisma, TwoFactorMethod } from '@prisma/client';
+import {
+  Account,
+  AccountRole,
+  AccountStatus,
+  CollaboratorStatus,
+  InviteStatus,
+  OnboardingStatus,
+  Prisma,
+  TwoFactorMethod,
+} from '@prisma/client';
 import { readFileSync } from 'node:fs';
 import { createHash, createPublicKey, randomBytes, randomInt, randomUUID } from 'node:crypto';
 import * as argon2 from 'argon2';
@@ -14,6 +23,7 @@ import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../prisma/prisma.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
+import { RegisterCollaboratorDto } from './dto/register-collaborator.dto';
 import { VerifyTwoFactorDto } from './dto/verify-two-factor.dto';
 import { authenticator } from 'otplib';
 import { decode, sign, SignOptions, verify } from 'jsonwebtoken';
@@ -147,6 +157,9 @@ export class AuthService {
   }
 
   async register(dto: RegisterDto) {
+    if (dto.role === AccountRole.COLLABORATOR) {
+      throw new BadRequestException('Use el flujo de invitacion de colaborador');
+    }
     const normalizedEmail = dto.email.trim().toLowerCase();
     const normalizedPhone = this.normalizePhoneNumber(dto.phoneNumber);
     const existing = await this.prisma.account.findUnique({
@@ -221,7 +234,10 @@ export class AuthService {
   async login(dto: LoginDto) {
     const normalizedEmail = dto.email.trim().toLowerCase();
     const account = await this.prisma.account.findFirst({
-      where: { email: normalizedEmail, role: dto.role },
+      where: {
+        email: normalizedEmail,
+        role: dto.role ?? undefined,
+      },
     });
     if (
       !account ||
@@ -245,6 +261,98 @@ export class AuthService {
       requiresTwoFactor: false,
       ...tokens,
     };
+  }
+
+  async registerCollaborator(dto: RegisterCollaboratorDto) {
+    const normalizedEmail = dto.email.trim().toLowerCase();
+    const normalizedPhone = dto.phoneNumber
+      ? this.normalizePhoneNumber(dto.phoneNumber)
+      : null;
+    const tokenHash = this.hashToken(dto.inviteToken);
+    const invite = await this.prisma.collaboratorInvite.findUnique({
+      where: { tokenHash },
+      include: {
+        permissions: { include: { permission: true } },
+        agendas: true,
+      },
+    });
+    if (!invite || invite.status !== InviteStatus.PENDING) {
+      throw new BadRequestException('Invitacion invalida');
+    }
+    if (invite.expiresAt < new Date()) {
+      await this.prisma.collaboratorInvite.update({
+        where: { id: invite.id },
+        data: { status: InviteStatus.EXPIRED },
+      });
+      throw new BadRequestException('Invitacion expirada');
+    }
+    if (invite.email !== normalizedEmail) {
+      throw new BadRequestException('El email no coincide con la invitacion');
+    }
+    if (invite.phoneNumber && normalizedPhone && invite.phoneNumber !== normalizedPhone) {
+      throw new BadRequestException('El telefono no coincide con la invitacion');
+    }
+
+    const existing = await this.prisma.account.findUnique({
+      where: { email: normalizedEmail },
+    });
+    if (existing) {
+      throw new ConflictException('El email ya esta registrado');
+    }
+
+    const salt = randomBytes(24).toString('hex');
+    const passwordHash = await argon2.hash(dto.password + salt, {
+      type: argon2.argon2id,
+    });
+
+    const account = await this.prisma.$transaction(async (tx) => {
+      const createdAccount = await tx.account.create({
+        data: {
+          email: normalizedEmail,
+          passwordHash,
+          salt,
+          role: AccountRole.COLLABORATOR,
+          subjectId: null,
+          phoneNumber: normalizedPhone,
+          onboardingStatus: OnboardingStatus.COMPLETE,
+        },
+      });
+      const collaborator = await tx.collaborator.create({
+        data: {
+          accountId: createdAccount.id,
+          doctorId: invite.doctorId,
+          firstName: dto.firstName,
+          lastName: dto.lastName,
+        },
+      });
+      const permissionIds = invite.permissions.map(
+        (entry) => entry.permissionId,
+      );
+      if (permissionIds.length > 0) {
+        await tx.collaboratorPermission.createMany({
+          data: permissionIds.map((permissionId) => ({
+            collaboratorId: collaborator.id,
+            permissionId,
+          })),
+        });
+      }
+      const agendaIds = invite.agendas.map((agenda) => agenda.agendaId);
+      if (agendaIds.length > 0) {
+        await tx.collaboratorAgenda.createMany({
+          data: agendaIds.map((agendaId) => ({
+            collaboratorId: collaborator.id,
+            agendaId,
+          })),
+        });
+      }
+      await tx.collaboratorInvite.update({
+        where: { id: invite.id },
+        data: { status: InviteStatus.ACCEPTED },
+      });
+      return createdAccount;
+    });
+
+    return this.issueTokens(account);
   }
 
   async verifyTwoFactor(dto: VerifyTwoFactorDto) {
@@ -840,6 +948,26 @@ export class AuthService {
       }
       payload.onboardingRequired =
         account.onboardingStatus !== OnboardingStatus.COMPLETE;
+    } else if (account.role === AccountRole.COLLABORATOR) {
+      const collaborator = await this.prisma.collaborator.findUnique({
+        where: { accountId: account.id },
+        include: {
+          permissions: { include: { permission: true } },
+          agendas: true,
+        },
+      });
+      if (!collaborator || collaborator.status !== CollaboratorStatus.ACTIVE) {
+        throw new UnauthorizedException('Account disabled');
+      }
+      payload.doctorId = collaborator.doctorId;
+      payload.collaboratorId = collaborator.id;
+      payload.permissions = collaborator.permissions.map(
+        (entry) => entry.permission.key,
+      );
+      payload.agendaIds = collaborator.agendas.map(
+        (agenda) => agenda.agendaId,
+      );
+      payload.onboardingRequired = false;
     } else {
       payload.onboardingRequired = false;
     }

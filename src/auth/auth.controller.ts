@@ -3,6 +3,7 @@ import { Response } from 'express';
 import { AuthService } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
+import { RegisterCollaboratorDto } from './dto/register-collaborator.dto';
 import { VerifyTwoFactorDto } from './dto/verify-two-factor.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { TwoFactorSetupDto } from './dto/two-factor-setup.dto';
@@ -18,6 +19,11 @@ export class AuthController {
   @Post('register')
   register(@Body() dto: RegisterDto) {
     return this.authService.register(dto);
+  }
+
+  @Post('register/collaborator')
+  registerCollaborator(@Body() dto: RegisterCollaboratorDto) {
+    return this.authService.registerCollaborator(dto);
   }
 
   @Post('login')

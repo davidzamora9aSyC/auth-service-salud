@@ -10,6 +10,7 @@ datasource db {
 enum AccountRole {
   PATIENT
   DOCTOR
+  COLLABORATOR
 }
 
 enum AccountStatus {
@@ -24,6 +25,18 @@ enum TwoFactorMethod {
 enum OnboardingStatus {
   PENDING
   COMPLETE
+}
+
+enum InviteStatus {
+  PENDING
+  ACCEPTED
+  REVOKED
+  EXPIRED
+}
+
+enum CollaboratorStatus {
+  ACTIVE
+  DISABLED
 }
 
 model Account {
@@ -47,8 +60,99 @@ model Account {
   twoFactorChallenges    TwoFactorChallenge[]
   passwordRecoveries     PasswordRecovery[]
   oauthAuthorizationCodes OAuthAuthorizationCode[]
+  collaborator           Collaborator?
 
   @@index([subjectId, role])
+}
+
+model Permission {
+  id          String   @id @default(uuid())
+  key         String   @unique
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  collaboratorPermissions CollaboratorPermission[]
+  invitePermissions       CollaboratorInvitePermission[]
+}
+
+model Collaborator {
+  id        String             @id @default(uuid())
+  account   Account            @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId String             @unique
+  doctorId  String
+  firstName String
+  lastName  String
+  status    CollaboratorStatus @default(ACTIVE)
+  createdAt DateTime           @default(now())
+  updatedAt DateTime           @updatedAt
+
+  permissions CollaboratorPermission[]
+  agendas     CollaboratorAgenda[]
+
+  @@index([doctorId])
+}
+
+model CollaboratorPermission {
+  collaborator   Collaborator @relation(fields: [collaboratorId], references: [id], onDelete: Cascade)
+  collaboratorId String
+  permission     Permission   @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+  permissionId   String
+  createdAt      DateTime     @default(now())
+
+  @@id([collaboratorId, permissionId])
+  @@index([permissionId])
+}
+
+model CollaboratorAgenda {
+  collaborator   Collaborator @relation(fields: [collaboratorId], references: [id], onDelete: Cascade)
+  collaboratorId String
+  agendaId       String
+  createdAt      DateTime     @default(now())
+
+  @@id([collaboratorId, agendaId])
+  @@index([agendaId])
+}
+
+model CollaboratorInvite {
+  id               String       @id @default(uuid())
+  doctorId         String
+  email            String
+  phoneNumber      String?
+  tokenHash        String       @unique
+  expiresAt        DateTime
+  status           InviteStatus @default(PENDING)
+  inviterAccountId String?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  permissions CollaboratorInvitePermission[]
+  agendas     CollaboratorInviteAgenda[]
+
+  @@index([doctorId])
+  @@index([email])
+}
+
+model CollaboratorInvitePermission {
+  invite       CollaboratorInvite @relation(fields: [inviteId], references: [id], onDelete: Cascade)
+  inviteId     String
+  permission   Permission         @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+  permissionId String
+  createdAt    DateTime           @default(now())
+
+  @@id([inviteId, permissionId])
+  @@index([permissionId])
+}
+
+model CollaboratorInviteAgenda {
+  invite    CollaboratorInvite @relation(fields: [inviteId], references: [id], onDelete: Cascade)
+  inviteId  String
+  agendaId  String
+  createdAt DateTime           @default(now())
+
+  @@id([inviteId, agendaId])
+  @@index([agendaId])
 }
 
 model RefreshToken {
