@@ -66,6 +66,23 @@ services:
     depends_on:
       - db
 
+  reminders-service:
+    build:
+      context: ../reminders-service
+    env_file:
+      - ../reminders-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=reminders
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
+      RABBITMQ_EXCHANGE_REMINDERS: reminders.events
+      RABBITMQ_QUEUE_REMINDERS_STATUS: reminders.q.status
+      DOCTORS_INTERNAL_BASE_URL: http://doctors-service:3009/doctorsms
+    ports:
+      - "3021:3021"
+    depends_on:
+      - db
+      - doctors-service
+
   appointments-service:
     build:
       context: ../appointments-service
@@ -133,6 +150,7 @@ services:
       - services-service
       - availability-service
       - communication-service
+      - reminders-service
       - consents-service
       - analytics-service
       - images-service
