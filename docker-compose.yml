@@ -93,6 +93,7 @@ services:
       RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
       SERVICES_SERVICE_URL: http://services-service:3011/servicesms
       AVAILABILITY_SERVICE_URL: http://availability-service:3012/availabilityms
+      USERS_INTERNAL_BASE_URL: http://users-service:3008/usersms
     ports:
       - "3010:3010"
     depends_on:
