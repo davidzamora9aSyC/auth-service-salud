@@ -125,6 +125,18 @@ services:
     depends_on:
       - db
 
+  templates-service:
+    build:
+      context: ../templates-service
+    env_file:
+      - ../templates-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=templates
+    ports:
+      - "3022:3022"
+    depends_on:
+      - db
+
   meili:
     image: getmeili/meilisearch:v1.10
     restart: unless-stopped
@@ -149,6 +161,7 @@ services:
       - appointments-service
       - services-service
       - availability-service
+      - templates-service
       - communication-service
       - reminders-service
       - consents-service
