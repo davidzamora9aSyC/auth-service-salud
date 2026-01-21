@@ -94,6 +94,7 @@ services:
       SERVICES_SERVICE_URL: http://services-service:3011/servicesms
       AVAILABILITY_SERVICE_URL: http://availability-service:3012/availabilityms
       USERS_INTERNAL_BASE_URL: http://users-service:3008/usersms
+      IMAGES_INTERNAL_BASE_URL: http://images-service:3019/imagesms
     ports:
       - "3010:3010"
     depends_on:
@@ -239,6 +240,7 @@ services:
       S3_BUCKET_PRIVATE: images-private
       S3_REGION: us-east-1
       S3_ENDPOINT: http://minio:9000
+      S3_PUBLIC_ENDPOINT: http://localhost:9000
       S3_ACCESS_KEY: minio
       S3_SECRET_KEY: minio12345
       S3_FORCE_PATH_STYLE: "true"
