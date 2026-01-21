@@ -154,6 +154,8 @@ services:
       context: ../meusaludgateway
     env_file:
       - ../meusaludgateway/.env
+    environment:
+      CORS_ALLOWED_ORIGINS: http://localhost:3000,http://localhost:3001,http://localhost:5173,http://localhost:3007,https://front-meu-salud.vercel.app
     ports:
       - "3020:3020"
     depends_on:
