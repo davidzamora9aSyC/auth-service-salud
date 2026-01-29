@@ -112,6 +112,7 @@ services:
       RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
       RABBITMQ_EXCHANGE_REVIEWS: reviews.events
       APPOINTMENTS_INTERNAL_BASE_URL: http://appointments-service:3010/appointmentsms
+      USERS_INTERNAL_BASE_URL: http://users-service:3008/usersms
     ports:
       - "3023:3023"
     depends_on:
@@ -128,6 +129,8 @@ services:
       RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
       RABBITMQ_EXCHANGE_MESSAGES: messages.events
       APPOINTMENTS_INTERNAL_BASE_URL: http://appointments-service:3010/appointmentsms
+      USERS_INTERNAL_BASE_URL: http://users-service:3008/usersms
+      DOCTORS_INTERNAL_BASE_URL: http://doctors-service:3009/doctorsms
     ports:
       - "3024:3024"
     depends_on:
