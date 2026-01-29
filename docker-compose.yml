@@ -61,6 +61,8 @@ services:
       RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
       RABBITMQ_EXCHANGE_IMAGES: images.events
       RABBITMQ_QUEUE_IMAGES: doctors.q.images
+      RABBITMQ_EXCHANGE_REVIEWS: reviews.events
+      RABBITMQ_QUEUE_REVIEWS: doctors.q.reviews
     ports:
       - "3009:3009"
     depends_on:
@@ -99,6 +101,38 @@ services:
       - "3010:3010"
     depends_on:
       - db
+
+  reviews-service:
+    build:
+      context: ../reviews-service
+    env_file:
+      - ../reviews-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=reviews
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
+      RABBITMQ_EXCHANGE_REVIEWS: reviews.events
+      APPOINTMENTS_INTERNAL_BASE_URL: http://appointments-service:3010/appointmentsms
+    ports:
+      - "3023:3023"
+    depends_on:
+      - db
+      - appointments-service
+
+  messages-service:
+    build:
+      context: ../messages-service
+    env_file:
+      - ../messages-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=messages
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
+      RABBITMQ_EXCHANGE_MESSAGES: messages.events
+      APPOINTMENTS_INTERNAL_BASE_URL: http://appointments-service:3010/appointmentsms
+    ports:
+      - "3024:3024"
+    depends_on:
+      - db
+      - appointments-service
 
   services-service:
     build:
@@ -163,6 +197,8 @@ services:
       - users-service
       - doctors-service
       - appointments-service
+      - reviews-service
+      - messages-service
       - services-service
       - availability-service
       - templates-service
@@ -226,6 +262,7 @@ services:
       RABBITMQ_EXCHANGE_APPOINTMENTS: appointments.events
       RABBITMQ_EXCHANGE_SERVICES: services.events
       RABBITMQ_EXCHANGE_DOCTORS: doctors.events
+      RABBITMQ_EXCHANGE_REVIEWS: reviews.events
       RABBITMQ_QUEUE_ANALYTICS: analytics.q.events
     ports:
       - "3015:3015"
