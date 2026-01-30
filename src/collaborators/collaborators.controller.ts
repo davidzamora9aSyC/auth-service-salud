@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, Query } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Delete, Get, Headers, Param, Patch, Post, Query } from '@nestjs/common';
 import { CollaboratorsService } from './collaborators.service';
 import { CreateCollaboratorInviteDto } from './dto/create-collaborator-invite.dto';
 import { UpdateCollaboratorDto } from './dto/update-collaborator.dto';
@@ -8,8 +8,20 @@ export class CollaboratorsController {
   constructor(private readonly collaboratorsService: CollaboratorsService) {}
 
   @Post('invites')
-  createInvite(@Body() dto: CreateCollaboratorInviteDto) {
-    return this.collaboratorsService.createInvite(dto);
+  async createInvite(
+    @Body() dto: CreateCollaboratorInviteDto,
+    @Headers('x-subject-id') subjectId?: string,
+    @Headers('x-auth-user-id') authUserId?: string,
+  ) {
+    const doctorId = await this.collaboratorsService.resolveDoctorId({
+      doctorId: dto.doctorId,
+      subjectId,
+      authUserId,
+    });
+    return this.collaboratorsService.createInvite({
+      ...dto,
+      doctorId,
+    });
   }
 
   @Get('invites/:token')
@@ -18,8 +30,17 @@ export class CollaboratorsController {
   }
 
   @Get()
-  listCollaborators(@Query('doctorId') doctorId: string) {
-    return this.collaboratorsService.listCollaborators(doctorId);
+  async listCollaborators(
+    @Query('doctorId') doctorId: string | undefined,
+    @Headers('x-subject-id') subjectId?: string,
+    @Headers('x-auth-user-id') authUserId?: string,
+  ) {
+    const resolvedDoctorId = await this.collaboratorsService.resolveDoctorId({
+      doctorId,
+      subjectId,
+      authUserId,
+    });
+    return this.collaboratorsService.listCollaborators(resolvedDoctorId);
   }
 
   @Patch(':collaboratorId')

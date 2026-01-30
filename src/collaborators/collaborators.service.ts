@@ -22,6 +22,10 @@ export class CollaboratorsService implements OnModuleInit {
   }
 
   async createInvite(dto: CreateCollaboratorInviteDto) {
+    const doctorId = dto.doctorId;
+    if (!doctorId) {
+      throw new BadRequestException('doctorId es requerido');
+    }
     const normalizedEmail = dto.email.trim().toLowerCase();
     const normalizedPhone = dto.phoneNumber
       ? this.normalizePhoneNumber(dto.phoneNumber)
@@ -36,7 +40,7 @@ export class CollaboratorsService implements OnModuleInit {
 
     const invite = await this.prisma.collaboratorInvite.create({
       data: {
-        doctorId: dto.doctorId,
+        doctorId,
         email: normalizedEmail,
         phoneNumber: normalizedPhone,
         tokenHash,
@@ -170,6 +174,30 @@ export class CollaboratorsService implements OnModuleInit {
       where: { id },
       data: { status: CollaboratorStatus.DISABLED },
     });
+  }
+
+  async resolveDoctorId(params: {
+    doctorId?: string;
+    subjectId?: string;
+    authUserId?: string;
+  }) {
+    if (params.doctorId) {
+      return params.doctorId;
+    }
+    if (params.subjectId) {
+      return params.subjectId;
+    }
+    if (params.authUserId) {
+      const account = await this.prisma.account.findUnique({
+        where: { id: params.authUserId },
+        select: { doctorId: true, subjectId: true },
+      });
+      const resolved = account?.doctorId ?? account?.subjectId ?? undefined;
+      if (resolved) {
+        return resolved;
+      }
+    }
+    throw new BadRequestException('x-subject-id es requerido');
   }
 
   private async findInviteByToken(token: string) {

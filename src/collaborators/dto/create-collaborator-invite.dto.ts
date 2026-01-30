@@ -1,8 +1,9 @@
 import { IsArray, IsEmail, IsInt, IsOptional, IsString, IsUUID, Min } from 'class-validator';
 
 export class CreateCollaboratorInviteDto {
+  @IsOptional()
   @IsUUID()
-  doctorId!: string;
+  doctorId?: string;
 
   @IsEmail()
   email!: string;
