@@ -69,6 +69,7 @@ export class AuthService {
   private readonly appleSuccessRedirect?: string;
   private readonly appleErrorRedirect?: string;
   private readonly applePrivateKey?: string;
+  private readonly usersBaseUrl: string;
   private readonly appleStateStore = new Map<string, { role: AccountRole; redirect?: string; createdAt: number }>();
 
   constructor(
@@ -147,6 +148,9 @@ export class AuthService {
       this.config.get<string>('APPLE_OAUTH_SUCCESS_REDIRECT');
     this.appleErrorRedirect =
       this.config.get<string>('APPLE_OAUTH_ERROR_REDIRECT');
+    this.usersBaseUrl =
+      this.config.get<string>('USERS_BASE_URL') ??
+      'http://users-service:3008/usersms';
     const appleKeyPath = this.config.get<string>('APPLE_PRIVATE_KEY_PATH');
     if (appleKeyPath) {
       this.applePrivateKey = readFileSync(appleKeyPath, 'utf-8');
@@ -210,6 +214,24 @@ export class AuthService {
         throw new ConflictException('La cuenta ya existe');
       }
       throw error;
+    }
+    if (account.role === AccountRole.PATIENT) {
+      const firstName = dto.firstName?.trim();
+      const lastName = dto.lastName?.trim();
+      if (!firstName || !lastName) {
+        await this.prisma.account.delete({ where: { id: account.id } });
+        throw new BadRequestException('Nombre y apellido son requeridos');
+      }
+      try {
+        const patientId = await this.createPatientForAccount(account, firstName, lastName);
+        account = await this.prisma.account.update({
+          where: { id: account.id },
+          data: { subjectId: patientId },
+        });
+      } catch (error) {
+        await this.prisma.account.delete({ where: { id: account.id } }).catch(() => undefined);
+        throw error;
+      }
     }
     await this.notifications.sendRegistrationWhatsapp({
       phoneNumber: normalizedPhone,
@@ -969,6 +991,9 @@ export class AuthService {
       );
       payload.onboardingRequired = false;
     } else {
+      if (account.role === AccountRole.PATIENT && account.subjectId) {
+        payload.patientId = account.subjectId;
+      }
       payload.onboardingRequired = false;
     }
     if (scope) {
@@ -1183,6 +1208,41 @@ export class AuthService {
 
   private generateRecoveryCode() {
     return randomInt(0, 1000000).toString().padStart(6, '0');
+  }
+
+  private async createPatientForAccount(account: Account, firstName: string, lastName: string) {
+    const fullName = `${firstName} ${lastName}`.trim();
+    const response = await fetch(`${this.usersBaseUrl.replace(/\/$/, '')}/patients`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-role': 'SYSTEM',
+        'x-auth-user-id': account.id,
+      },
+      body: JSON.stringify({
+        authUserId: account.id,
+        firstName,
+        lastName,
+        fullName,
+        contact: {
+          email: account.email,
+          phoneE164: account.phoneNumber ?? undefined,
+          isPrimary: true,
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      this.logger.error(`No se pudo crear paciente (status ${response.status}): ${body}`);
+      throw new ServiceUnavailableException('No se pudo crear el paciente');
+    }
+
+    const data = (await response.json()) as { id?: string };
+    if (!data?.id) {
+      throw new ServiceUnavailableException('Respuesta invalida al crear paciente');
+    }
+    return data.id;
   }
 
   private normalizePhoneNumber(value: string) {

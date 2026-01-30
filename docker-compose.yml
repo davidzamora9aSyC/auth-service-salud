@@ -79,6 +79,7 @@ services:
       RABBITMQ_EXCHANGE_REMINDERS: reminders.events
       RABBITMQ_QUEUE_REMINDERS_STATUS: reminders.q.status
       DOCTORS_INTERNAL_BASE_URL: http://doctors-service:3009/doctorsms
+      USERS_INTERNAL_BASE_URL: http://users-service:3008/usersms
     ports:
       - "3021:3021"
     depends_on:
@@ -97,6 +98,7 @@ services:
       AVAILABILITY_SERVICE_URL: http://availability-service:3012/availabilityms
       USERS_INTERNAL_BASE_URL: http://users-service:3008/usersms
       IMAGES_INTERNAL_BASE_URL: http://images-service:3019/imagesms
+      REMINDERS_INTERNAL_BASE_URL: http://reminders-service:3021/remindersms
     ports:
       - "3010:3010"
     depends_on:
