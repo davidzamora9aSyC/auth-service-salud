@@ -222,6 +222,7 @@ services:
       - "3017:3017"
     depends_on:
       - meili
+      - meusaludgateway
 
   subscriptions-service:
     build:
