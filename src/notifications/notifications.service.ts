@@ -11,6 +11,15 @@ type WhatsappPayload = {
   idempotency_key?: string;
 };
 
+type EmailPayload = {
+  to: string;
+  templateKey: string;
+  subject: string;
+  text: string;
+  html: string;
+  metadata?: Record<string, unknown>;
+};
+
 @Injectable()
 export class NotificationsService {
   private readonly logger = new Logger(NotificationsService.name);
@@ -102,6 +111,66 @@ export class NotificationsService {
         error instanceof Error ? error.message : 'Error desconocido';
       this.logger.error(
         `Falló el envío del WhatsApp de recuperación a ${input.phoneNumber}: ${message}`,
+        error as Error,
+      );
+    }
+  }
+
+  async sendPasswordRecoveryEmail(input: {
+    email: string;
+    name: string;
+    code: string;
+    link: string;
+    ttlSeconds?: number;
+  }) {
+    const baseUrl =
+      this.config.get<string>('NOTIFICATIONS_SERVICE_URL') ??
+      'http://communication-service:3006/communicationms';
+    if (!baseUrl) {
+      this.logger.warn('NOTIFICATIONS_SERVICE_URL no está configurado');
+      return;
+    }
+    const endpoint = `${baseUrl.replace(/\/$/, '')}/email/messages`;
+    const expiresMinutes = Math.max(
+      1,
+      Math.ceil((input.ttlSeconds ?? 600) / 60),
+    );
+    const subject = 'Código de recuperación de contraseña';
+    const text = [
+      `Hola ${input.name},`,
+      `Tu código de recuperación es: ${input.code}`,
+      `Este código vence en ${expiresMinutes} minuto(s).`,
+      `También puedes abrir: ${input.link}`,
+    ].join('\n');
+    const html = [
+      `<p>Hola ${input.name},</p>`,
+      `<p>Tu código de recuperación es: <strong>${input.code}</strong></p>`,
+      `<p>Este código vence en <strong>${expiresMinutes} minuto(s)</strong>.</p>`,
+      `<p>También puedes abrir este enlace: <a href="${input.link}">${input.link}</a></p>`,
+    ].join('');
+    const payload: EmailPayload = {
+      to: input.email,
+      templateKey: 'PASSWORD_RESET',
+      subject,
+      text,
+      html,
+      metadata: {
+        flow: 'password-recovery',
+      },
+    };
+
+    try {
+      await firstValueFrom(
+        this.http.post(endpoint, payload, {
+          timeout:
+            this.config.get<number>('NOTIFICATIONS_TIMEOUT_MS') ?? 5000,
+        }),
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Error desconocido';
+      this.logger.error(
+        `Falló el envío del correo de recuperación a ${input.email}: ${message}`,
         error as Error,
       );
     }

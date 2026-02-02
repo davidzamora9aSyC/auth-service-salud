@@ -438,8 +438,8 @@ export class AuthService {
         ].filter(Boolean) as Array<{ email?: string; phoneNumber?: string }>,
       },
     });
-    if (!account || !account.phoneNumber) {
-      throw new BadRequestException('No hay cuenta con WhatsApp disponible');
+    if (!account) {
+      throw new BadRequestException('No hay cuenta para los datos suministrados');
     }
 
     await this.prisma.passwordRecovery.deleteMany({
@@ -458,13 +458,26 @@ export class AuthService {
     });
 
     const name = account.email.split('@')[0]?.trim() || 'Paciente MeuSalud';
-    await this.notifications.sendPasswordRecoveryWhatsapp({
-      phoneNumber: account.phoneNumber,
-      name,
-      code,
-      link: this.recoveryLinkBase,
-      ttlSeconds: this.recoveryCodeTtl,
-    });
+
+    if (normalizedEmail) {
+      await this.notifications.sendPasswordRecoveryEmail({
+        email: account.email,
+        name,
+        code,
+        link: this.recoveryLinkBase,
+        ttlSeconds: this.recoveryCodeTtl,
+      });
+    } else if (account.phoneNumber) {
+      await this.notifications.sendPasswordRecoveryWhatsapp({
+        phoneNumber: account.phoneNumber,
+        name,
+        code,
+        link: this.recoveryLinkBase,
+        ttlSeconds: this.recoveryCodeTtl,
+      });
+    } else {
+      throw new BadRequestException('No hay cuenta con WhatsApp disponible');
+    }
 
     return {
       recoveryId: recovery.id,
