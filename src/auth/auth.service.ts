@@ -255,7 +255,7 @@ export class AuthService {
 
   async login(dto: LoginDto) {
     const normalizedEmail = dto.email.trim().toLowerCase();
-    const account = await this.prisma.account.findFirst({
+    let account = await this.prisma.account.findFirst({
       where: {
         email: normalizedEmail,
         role: dto.role ?? undefined,
@@ -270,6 +270,7 @@ export class AuthService {
     if (account.status !== AccountStatus.ACTIVE) {
       throw new UnauthorizedException('Account disabled');
     }
+    account = await this.ensurePatientSubjectId(account);
     if (account.twoFactorEnabled && account.twoFactorSecret) {
       const challenge = await this.createTwoFactorChallenge(account.id);
       return {
@@ -1256,6 +1257,66 @@ export class AuthService {
       throw new ServiceUnavailableException('Respuesta invalida al crear paciente');
     }
     return data.id;
+  }
+
+  private inferPatientNameFromEmail(email: string) {
+    const raw = email.split('@')[0] ?? '';
+    const normalized = raw.replace(/[._-]+/g, ' ').trim();
+    const chunks = normalized.split(/\s+/).filter(Boolean);
+    const first = (chunks[0] ?? 'Paciente').slice(0, 40);
+    const rest = chunks.slice(1).join(' ').slice(0, 60);
+    return {
+      firstName: this.capitalizeName(first),
+      lastName: this.capitalizeName(rest || 'MeuSalud'),
+    };
+  }
+
+  private capitalizeName(value: string) {
+    return value
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((chunk) => chunk.charAt(0).toUpperCase() + chunk.slice(1))
+      .join(' ');
+  }
+
+  private async findPatientIdByAuthUserId(authUserId: string) {
+    const response = await fetch(
+      `${this.usersBaseUrl.replace(/\/$/, '')}/patients/internal/by-auth-user/${encodeURIComponent(authUserId)}`,
+      {
+        headers: {
+          'x-role': 'SYSTEM',
+        },
+      },
+    );
+
+    if (!response.ok) {
+      const body = await response.text();
+      this.logger.error(`No se pudo consultar paciente por authUserId (status ${response.status}): ${body}`);
+      throw new ServiceUnavailableException('No se pudo validar el perfil de paciente');
+    }
+
+    const data = (await response.json()) as { patientId?: string | null };
+    return data?.patientId ?? null;
+  }
+
+  private async ensurePatientSubjectId(account: Account) {
+    if (account.role !== AccountRole.PATIENT) {
+      return account;
+    }
+    if (account.subjectId) {
+      return account;
+    }
+
+    let patientId = await this.findPatientIdByAuthUserId(account.id);
+    if (!patientId) {
+      const inferredName = this.inferPatientNameFromEmail(account.email);
+      patientId = await this.createPatientForAccount(account, inferredName.firstName, inferredName.lastName);
+    }
+
+    return this.prisma.account.update({
+      where: { id: account.id },
+      data: { subjectId: patientId },
+    });
   }
 
   private normalizePhoneNumber(value: string) {
