@@ -70,6 +70,7 @@ export class AuthService {
   private readonly appleErrorRedirect?: string;
   private readonly applePrivateKey?: string;
   private readonly usersBaseUrl: string;
+  private readonly clinicsInternalBaseUrl: string;
   private readonly appleStateStore = new Map<string, { role: AccountRole; redirect?: string; createdAt: number }>();
 
   constructor(
@@ -151,6 +152,9 @@ export class AuthService {
     this.usersBaseUrl =
       this.config.get<string>('USERS_BASE_URL') ??
       'http://users-service:3008/usersms';
+    this.clinicsInternalBaseUrl =
+      this.config.get<string>('CLINICS_INTERNAL_BASE_URL') ??
+      'http://clinics-service:3025/clinicsms';
     const appleKeyPath = this.config.get<string>('APPLE_PRIVATE_KEY_PATH');
     if (appleKeyPath) {
       this.applePrivateKey = readFileSync(appleKeyPath, 'utf-8');
@@ -163,6 +167,10 @@ export class AuthService {
   async register(dto: RegisterDto) {
     if (dto.role === AccountRole.COLLABORATOR) {
       throw new BadRequestException('Use el flujo de invitacion de colaborador');
+    }
+    const inviteToken = dto.inviteToken?.trim();
+    if (inviteToken && dto.role !== AccountRole.DOCTOR) {
+      throw new BadRequestException('inviteToken solo aplica para registro de medicos');
     }
     const normalizedEmail = dto.email.trim().toLowerCase();
     const normalizedPhone = this.normalizePhoneNumber(dto.phoneNumber);
@@ -185,7 +193,7 @@ export class AuthService {
     const doctorId =
       dto.role === AccountRole.DOCTOR ? randomUUID() : null;
     const onboardingStatus =
-      dto.role === AccountRole.DOCTOR
+      dto.role === AccountRole.DOCTOR || dto.role === AccountRole.CLINIC
         ? OnboardingStatus.PENDING
         : OnboardingStatus.COMPLETE;
     let account: Account;
@@ -215,6 +223,14 @@ export class AuthService {
       }
       throw error;
     }
+    if (account.role === AccountRole.DOCTOR && inviteToken) {
+      try {
+        await this.completeClinicDoctorInviteRegistration(account, inviteToken);
+      } catch (error) {
+        await this.prisma.account.delete({ where: { id: account.id } }).catch(() => undefined);
+        throw error;
+      }
+    }
     if (account.role === AccountRole.PATIENT) {
       const firstName = dto.firstName?.trim();
       const lastName = dto.lastName?.trim();
@@ -237,19 +253,7 @@ export class AuthService {
       phoneNumber: normalizedPhone,
       email: account.email,
     });
-    if (account.role === AccountRole.DOCTOR && account.doctorId) {
-      await this.rabbitmq.publishAuthEvent({
-        type: 'AuthUserRegistered',
-        routingKey: 'auth.user_registered',
-        data: {
-          authUserId: account.id,
-          role: account.role,
-          doctorId: account.doctorId,
-          email: account.email,
-          phoneNumber: account.phoneNumber ?? undefined,
-        },
-      });
-    }
+    await this.publishUserRegisteredEvent(account);
     return this.issueTokens(account);
   }
 
@@ -320,29 +324,60 @@ export class AuthService {
       where: { email: normalizedEmail },
     });
     if (existing) {
-      throw new ConflictException('El email ya esta registrado');
+      if (existing.status !== AccountStatus.ACTIVE) {
+        throw new UnauthorizedException('Account disabled');
+      }
+      const validPassword = await argon2.verify(
+        existing.passwordHash,
+        dto.password + existing.salt,
+      );
+      if (!validPassword) {
+        throw new UnauthorizedException('Invalid credentials');
+      }
+      if (existing.role !== AccountRole.COLLABORATOR) {
+        throw new ConflictException(
+          'El email ya esta registrado con otro tipo de cuenta',
+        );
+      }
+      const linkedCollaborator = await this.prisma.collaborator.findUnique({
+        where: { accountId: existing.id },
+        select: { id: true },
+      });
+      if (linkedCollaborator) {
+        throw new ConflictException(
+          'La cuenta ya tiene una relacion de colaborador activa',
+        );
+      }
     }
 
-    const salt = randomBytes(24).toString('hex');
-    const passwordHash = await argon2.hash(dto.password + salt, {
-      type: argon2.argon2id,
-    });
-
     const account = await this.prisma.$transaction(async (tx) => {
-      const createdAccount = await tx.account.create({
-        data: {
-          email: normalizedEmail,
-          passwordHash,
-          salt,
-          role: AccountRole.COLLABORATOR,
-          subjectId: null,
-          phoneNumber: normalizedPhone,
-          onboardingStatus: OnboardingStatus.COMPLETE,
-        },
-      });
+      const accountRecord = existing
+        ? await tx.account.update({
+            where: { id: existing.id },
+            data: {
+              phoneNumber: normalizedPhone ?? existing.phoneNumber ?? null,
+            },
+          })
+        : await (async () => {
+            const salt = randomBytes(24).toString('hex');
+            const passwordHash = await argon2.hash(dto.password + salt, {
+              type: argon2.argon2id,
+            });
+            return tx.account.create({
+              data: {
+                email: normalizedEmail,
+                passwordHash,
+                salt,
+                role: AccountRole.COLLABORATOR,
+                subjectId: null,
+                phoneNumber: normalizedPhone,
+                onboardingStatus: OnboardingStatus.COMPLETE,
+              },
+            });
+          })();
       const collaborator = await tx.collaborator.create({
         data: {
-          accountId: createdAccount.id,
+          accountId: accountRecord.id,
           doctorId: invite.doctorId,
           firstName: dto.firstName,
           lastName: dto.lastName,
@@ -372,7 +407,7 @@ export class AuthService {
         where: { id: invite.id },
         data: { status: InviteStatus.ACCEPTED },
       });
-      return createdAccount;
+      return accountRecord;
     });
 
     return this.issueTokens(account);
@@ -740,7 +775,7 @@ export class AuthService {
       const doctorId =
         entry.role === AccountRole.DOCTOR ? randomUUID() : null;
       const onboardingStatus =
-        entry.role === AccountRole.DOCTOR
+        entry.role === AccountRole.DOCTOR || entry.role === AccountRole.CLINIC
           ? OnboardingStatus.PENDING
           : OnboardingStatus.COMPLETE;
       account = await this.prisma.account.create({
@@ -755,19 +790,7 @@ export class AuthService {
           onboardingStatus,
         },
       });
-      if (account.role === AccountRole.DOCTOR && account.doctorId) {
-        await this.rabbitmq.publishAuthEvent({
-          type: 'AuthUserRegistered',
-          routingKey: 'auth.user_registered',
-          data: {
-            authUserId: account.id,
-            role: account.role,
-            doctorId: account.doctorId,
-            email: account.email,
-            phoneNumber: account.phoneNumber ?? undefined,
-          },
-        });
-      }
+      await this.publishUserRegisteredEvent(account);
     }
 
     const tokens = await this.issueTokens(account);
@@ -869,7 +892,7 @@ export class AuthService {
       const doctorId =
         entry.role === AccountRole.DOCTOR ? randomUUID() : null;
       const onboardingStatus =
-        entry.role === AccountRole.DOCTOR
+        entry.role === AccountRole.DOCTOR || entry.role === AccountRole.CLINIC
           ? OnboardingStatus.PENDING
           : OnboardingStatus.COMPLETE;
       account = await this.prisma.account.create({
@@ -884,19 +907,7 @@ export class AuthService {
           onboardingStatus,
         },
       });
-      if (account.role === AccountRole.DOCTOR && account.doctorId) {
-        await this.rabbitmq.publishAuthEvent({
-          type: 'AuthUserRegistered',
-          routingKey: 'auth.user_registered',
-          data: {
-            authUserId: account.id,
-            role: account.role,
-            doctorId: account.doctorId,
-            email: account.email,
-            phoneNumber: account.phoneNumber ?? undefined,
-          },
-        });
-      }
+      await this.publishUserRegisteredEvent(account);
     }
 
     const tokens = await this.issueTokens(account);
@@ -984,6 +995,12 @@ export class AuthService {
       }
       payload.onboardingRequired =
         account.onboardingStatus !== OnboardingStatus.COMPLETE;
+    } else if (account.role === AccountRole.CLINIC) {
+      if (account.subjectId) {
+        payload.clinicId = account.subjectId;
+      }
+      payload.onboardingRequired =
+        account.onboardingStatus !== OnboardingStatus.COMPLETE;
     } else if (account.role === AccountRole.COLLABORATOR) {
       const collaborator = await this.prisma.collaborator.findUnique({
         where: { accountId: account.id },
@@ -1040,6 +1057,8 @@ export class AuthService {
         role: account.role,
         subjectId: account.subjectId,
         doctorId: account.doctorId,
+        clinicId:
+          account.role === AccountRole.CLINIC ? account.subjectId : null,
         onboardingStatus: account.onboardingStatus,
       },
     };
@@ -1141,12 +1160,70 @@ export class AuthService {
     };
   }
 
+  private async completeClinicDoctorInviteRegistration(account: Account, inviteToken: string) {
+    if (account.role !== AccountRole.DOCTOR || !account.doctorId) {
+      throw new BadRequestException('La cuenta no corresponde a un medico');
+    }
+
+    const url = `${this.clinicsInternalBaseUrl.replace(/\/$/, '')}/clinics/internal/doctors/invites/${encodeURIComponent(inviteToken)}/complete-registration`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-role': 'SYSTEM',
+        'x-auth-user-id': account.id,
+        'x-subject-id': account.doctorId,
+      },
+      body: JSON.stringify({
+        authUserId: account.id,
+        doctorId: account.doctorId,
+        email: account.email,
+      }),
+    });
+
+    if (response.ok) {
+      return;
+    }
+
+    const body = await response.text();
+    this.logger.error(
+      `No se pudo completar invitacion de clinica para medico (status ${response.status}): ${body}`,
+    );
+
+    if (response.status === 400 || response.status === 403 || response.status === 404) {
+      throw new BadRequestException('Invitacion de clinica invalida o expirada');
+    }
+
+    throw new ServiceUnavailableException('No se pudo completar la invitacion de clinica');
+  }
+
   private hashToken(token: string) {
     return createHash('sha256').update(token).digest('hex');
   }
 
-  private parseRole(roleInput?: string) {
-    if (roleInput === AccountRole.PATIENT || roleInput === AccountRole.DOCTOR) {
+  private async publishUserRegisteredEvent(account: Account) {
+    if (account.role !== AccountRole.DOCTOR && account.role !== AccountRole.CLINIC) {
+      return;
+    }
+    await this.rabbitmq.publishAuthEvent({
+      type: 'AuthUserRegistered',
+      routingKey: 'auth.user_registered',
+      data: {
+        authUserId: account.id,
+        role: account.role,
+        doctorId: account.doctorId ?? undefined,
+        email: account.email,
+        phoneNumber: account.phoneNumber ?? undefined,
+      },
+    });
+  }
+
+  private parseRole(roleInput?: string): AccountRole {
+    if (
+      roleInput === AccountRole.PATIENT ||
+      roleInput === AccountRole.DOCTOR ||
+      roleInput === AccountRole.CLINIC
+    ) {
       return roleInput;
     }
     throw new BadRequestException('Role inválido');

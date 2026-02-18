@@ -10,6 +10,7 @@ datasource db {
 enum AccountRole {
   PATIENT
   DOCTOR
+  CLINIC
   COLLABORATOR
 }
 
@@ -39,6 +40,16 @@ enum CollaboratorStatus {
   DISABLED
 }
 
+enum ClinicAdminRole {
+  OWNER
+  ADMIN
+}
+
+enum ClinicDoctorMembershipStatus {
+  ACTIVE
+  REMOVED
+}
+
 model Account {
   id                     String                @id @default(uuid())
   email                  String                @unique
@@ -61,8 +72,135 @@ model Account {
   passwordRecoveries     PasswordRecovery[]
   oauthAuthorizationCodes OAuthAuthorizationCode[]
   collaborator           Collaborator?
+  clinicAdmins           ClinicAdmin[]
+  createdClinics         Clinic[]               @relation("ClinicCreatedBy")
+  createdClinicMemberships ClinicDoctorMembership[] @relation("ClinicMembershipCreatedBy")
+  createdClinicDoctorInvites ClinicDoctorInvite[]   @relation("ClinicDoctorInviteCreatedBy")
 
   @@index([subjectId, role])
+}
+
+model Clinic {
+  id                 String   @id @default(uuid())
+  name               String
+  legalName          String?
+  taxId              String?
+  description        String?
+  website            String?
+  phoneNumber        String?
+  email              String?
+  profileImageId     String?
+  coverImageId       String?
+  createdByAccountId String
+  createdBy          Account  @relation("ClinicCreatedBy", fields: [createdByAccountId], references: [id], onDelete: Restrict)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  admins             ClinicAdmin[]
+  doctorMemberships  ClinicDoctorMembership[]
+  doctorInvites      ClinicDoctorInvite[]
+  locations          ClinicLocation[]
+
+  @@index([name])
+  @@index([createdByAccountId])
+}
+
+model ClinicLocation {
+  id                 String   @id @default(uuid())
+  clinicId           String
+  label              String?
+  city               String
+  address            String
+  postalCode         String?
+  additionalInfo     String?
+  placeId            String?
+  formattedAddress   String?
+  department         String?
+  countryCode        String?
+  lat                Float?
+  lng                Float?
+  isPrimary          Boolean  @default(false)
+  active             Boolean  @default(true)
+  createdByAccountId String
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  clinic             Clinic   @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  agendaAssignments  ClinicAgendaAssignment[]
+
+  @@index([clinicId, active])
+  @@index([clinicId, isPrimary])
+  @@index([createdByAccountId])
+}
+
+model ClinicAgendaAssignment {
+  clinicLocationId   String
+  agendaId           String
+  doctorId           String
+  active             Boolean  @default(true)
+  createdByAccountId String
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  clinicLocation     ClinicLocation @relation(fields: [clinicLocationId], references: [id], onDelete: Cascade)
+
+  @@id([clinicLocationId, agendaId])
+  @@unique([agendaId])
+  @@index([doctorId, active])
+  @@index([createdByAccountId])
+}
+
+model ClinicAdmin {
+  clinicId   String
+  accountId  String
+  role       ClinicAdminRole @default(ADMIN)
+  active     Boolean         @default(true)
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
+
+  clinic     Clinic          @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  account    Account         @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@id([clinicId, accountId])
+  @@index([accountId])
+  @@index([active])
+}
+
+model ClinicDoctorMembership {
+  clinicId            String
+  doctorId            String
+  status              ClinicDoctorMembershipStatus @default(ACTIVE)
+  createdByAccountId  String
+  createdBy           Account                      @relation("ClinicMembershipCreatedBy", fields: [createdByAccountId], references: [id], onDelete: Restrict)
+  createdAt           DateTime                     @default(now())
+  updatedAt           DateTime                     @updatedAt
+
+  clinic              Clinic                       @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+
+  @@id([clinicId, doctorId])
+  @@index([doctorId])
+  @@index([status])
+  @@index([createdByAccountId])
+}
+
+model ClinicDoctorInvite {
+  id                String      @id @default(uuid())
+  clinicId          String
+  doctorId          String
+  email             String
+  tokenHash         String      @unique
+  status            InviteStatus @default(PENDING)
+  expiresAt         DateTime
+  inviterAccountId  String
+  inviterAccount    Account     @relation("ClinicDoctorInviteCreatedBy", fields: [inviterAccountId], references: [id], onDelete: Restrict)
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  clinic            Clinic      @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+
+  @@index([clinicId, status])
+  @@index([doctorId, status])
+  @@index([email])
 }
 
 model Permission {

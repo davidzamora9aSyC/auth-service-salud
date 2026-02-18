@@ -1,0 +1,7 @@
+DO $$
+BEGIN
+  ALTER TYPE "AccountRole" ADD VALUE IF NOT EXISTS 'CLINIC';
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+END
+$$;

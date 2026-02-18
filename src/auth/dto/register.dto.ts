@@ -29,4 +29,8 @@ export class RegisterDto {
   @IsOptional()
   @IsString()
   subjectId?: string;
+
+  @IsOptional()
+  @IsString()
+  inviteToken?: string;
 }

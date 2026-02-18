@@ -6,10 +6,11 @@ import { PrismaModule } from '../prisma/prisma.module';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { RabbitmqService } from './rabbitmq.service';
 import { DoctorsConsumer } from './doctors.consumer';
+import { ClinicsConsumer } from './clinics.consumer';
 
 @Module({
   imports: [PrismaModule, NotificationsModule],
   controllers: [AuthController, OAuthController],
-  providers: [AuthService, RabbitmqService, DoctorsConsumer],
+  providers: [AuthService, RabbitmqService, DoctorsConsumer, ClinicsConsumer],
 })
 export class AuthModule {}

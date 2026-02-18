@@ -24,6 +24,23 @@ services:
       - db
       - communication-service
 
+  clinics-service:
+    build:
+      context: ../clinics-service
+    env_file:
+      - ../clinics-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=auth
+      PORT: 3025
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
+      RABBITMQ_EXCHANGE_AUTH: auth.events
+      RABBITMQ_EXCHANGE_CLINICS: clinics.events
+      RABBITMQ_QUEUE_CLINICS_AUTH: clinics.q.auth
+    ports:
+      - "3025:3025"
+    depends_on:
+      - db
+
   communication-service:
     build:
       context: ../communication-service
@@ -96,6 +113,7 @@ services:
       RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
       SERVICES_SERVICE_URL: http://services-service:3011/servicesms
       AVAILABILITY_SERVICE_URL: http://availability-service:3012/availabilityms
+      CLINICS_INTERNAL_BASE_URL: http://clinics-service:3025/clinicsms
       USERS_INTERNAL_BASE_URL: http://users-service:3008/usersms
       IMAGES_INTERNAL_BASE_URL: http://images-service:3019/imagesms
       REMINDERS_INTERNAL_BASE_URL: http://reminders-service:3021/remindersms
@@ -195,10 +213,12 @@ services:
       - ../meusaludgateway/.env
     environment:
       CORS_ALLOWED_ORIGINS: http://localhost:3000,http://localhost:3001,http://localhost:5173,http://localhost:3007,https://front-meu-salud.vercel.app
+      CLINICS_BASE_URL: http://clinics-service:3025
     ports:
       - "3020:3020"
     depends_on:
       - auth-service
+      - clinics-service
       - users-service
       - doctors-service
       - appointments-service
@@ -270,6 +290,7 @@ services:
       RABBITMQ_EXCHANGE_DOCTORS: doctors.events
       RABBITMQ_EXCHANGE_REVIEWS: reviews.events
       RABBITMQ_QUEUE_ANALYTICS: analytics.q.events
+      CLINICS_INTERNAL_BASE_URL: http://clinics-service:3025/clinicsms
     ports:
       - "3015:3015"
     depends_on:
