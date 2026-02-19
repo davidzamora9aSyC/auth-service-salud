@@ -12,6 +12,7 @@ services:
       - meusalud-auth-db:/var/lib/postgresql/data
 
   auth-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-auth-service-salud:${IMAGE_TAG:-latest}
     build: .
     env_file:
       - .env
@@ -25,6 +26,7 @@ services:
       - communication-service
 
   clinics-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-clinics-service:${IMAGE_TAG:-latest}
     build:
       context: ../clinics-service
     env_file:
@@ -42,6 +44,7 @@ services:
       - db
 
   communication-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-communication-service:${IMAGE_TAG:-latest}
     build:
       context: ../communication-service
     env_file:
@@ -54,6 +57,7 @@ services:
       - db
 
   users-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-users-service:${IMAGE_TAG:-latest}
     build:
       context: ../users-service
     env_file:
@@ -69,6 +73,7 @@ services:
       - db
 
   doctors-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-doctors-service:${IMAGE_TAG:-latest}
     build:
       context: ../doctors-service
     env_file:
@@ -86,6 +91,7 @@ services:
       - db
 
   reminders-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-reminders-service:${IMAGE_TAG:-latest}
     build:
       context: ../reminders-service
     env_file:
@@ -104,6 +110,7 @@ services:
       - doctors-service
 
   appointments-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-appointments-service:${IMAGE_TAG:-latest}
     build:
       context: ../appointments-service
     env_file:
@@ -123,6 +130,7 @@ services:
       - db
 
   reviews-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-reviews-service:${IMAGE_TAG:-latest}
     build:
       context: ../reviews-service
     env_file:
@@ -140,6 +148,7 @@ services:
       - appointments-service
 
   messages-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-messages-service:${IMAGE_TAG:-latest}
     build:
       context: ../messages-service
     env_file:
@@ -158,6 +167,7 @@ services:
       - appointments-service
 
   services-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-services-service:${IMAGE_TAG:-latest}
     build:
       context: ../services-service
     env_file:
@@ -171,6 +181,7 @@ services:
       - db
 
   availability-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-availability-service:${IMAGE_TAG:-latest}
     build:
       context: ../availability-service
     env_file:
@@ -185,6 +196,7 @@ services:
       - db
 
   templates-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-templates-service:${IMAGE_TAG:-latest}
     build:
       context: ../templates-service
     env_file:
@@ -207,6 +219,7 @@ services:
       - meili_data:/meili_data
 
   meusaludgateway:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-meusaludgateway:${IMAGE_TAG:-latest}
     build:
       context: ../meusaludgateway
     env_file:
@@ -234,6 +247,7 @@ services:
       - images-service
 
   search-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-search-service:${IMAGE_TAG:-latest}
     build:
       context: ../search-service
     env_file:
@@ -245,6 +259,7 @@ services:
       - meusaludgateway
 
   subscriptions-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-subscriptions-service:${IMAGE_TAG:-latest}
     build:
       context: ../subscriptions-service
     env_file:
@@ -262,6 +277,7 @@ services:
       - db
 
   payments-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-payments-service:${IMAGE_TAG:-latest}
     build:
       context: ../payments-service
     env_file:
@@ -278,6 +294,7 @@ services:
       - db
 
   analytics-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-analytics-service:${IMAGE_TAG:-latest}
     build:
       context: ../analytics-service
     env_file:
@@ -297,6 +314,7 @@ services:
       - db
 
   images-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-images-service:${IMAGE_TAG:-latest}
     build:
       context: ../images-service
     env_file:
@@ -331,6 +349,7 @@ services:
       - minio_data:/data
 
   consents-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-consents-service:${IMAGE_TAG:-latest}
     build:
       context: ../consents-service
     env_file:

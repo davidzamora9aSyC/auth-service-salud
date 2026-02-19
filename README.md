@@ -28,13 +28,13 @@ ACCESS_TOKEN_TTL=900
 REFRESH_TOKEN_TTL=604800
 LOGIN_CHALLENGE_TTL=300
 MFA_ISSUER=MeuSalud
-NOTIFICATIONS_SERVICE_URL=http://communication-service:3006
+NOTIFICATIONS_SERVICE_URL=http://communication-service:3006/communicationms
 WELCOME_WHATSAPP_TEMPLATE_KEY=MEUSALUD_WELCOME
 NOTIFICATIONS_TIMEOUT_MS=5000
 ```
 
 - Coloca el par RSA en `auth-service/secrets` o monta la ruta deseada y referencia el archivo privado mediante `JWT_PRIVATE_KEY_PATH`.
-- Si vas a correr el servicio fuera de Docker, apunta `NOTIFICATIONS_SERVICE_URL` a `http://localhost:3006`. Dentro de `docker compose` utilizamos `communication-service` como host.
+- Si vas a correr el servicio fuera de Docker, apunta `NOTIFICATIONS_SERVICE_URL` a `http://localhost:3006/communicationms`. Dentro de `docker compose` utilizamos `communication-service` como host.
 
 ## Notificaciones por WhatsApp
 
