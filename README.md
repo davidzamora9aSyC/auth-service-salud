@@ -22,7 +22,7 @@ Crea un `.env` a partir de `.env.example`:
 
 ```env
 PORT=3000
-DATABASE_URL="postgresql://meusalud_auth:meusalud_auth@localhost:5435/meusalud_auth?schema=public"
+DATABASE_URL="postgresql://<user>:<password>@localhost:5435/meusalud_auth?schema=public"
 JWT_PRIVATE_KEY_PATH=/keys/jwt_rsa_private.pem
 ACCESS_TOKEN_TTL=900
 REFRESH_TOKEN_TTL=604800
