@@ -79,11 +79,21 @@ export class AuthService {
     private readonly notifications: NotificationsService,
     private readonly rabbitmq: RabbitmqService,
   ) {
-    const privateKeyPath = this.config.get<string>('JWT_PRIVATE_KEY_PATH');
-    if (!privateKeyPath) {
-      throw new Error('JWT_PRIVATE_KEY_PATH is not configured');
+    const inlinePrivateKey = this.config.get<string>('JWT_PRIVATE_KEY');
+    if (inlinePrivateKey?.trim()) {
+      this.privateKey = Buffer.from(
+        inlinePrivateKey.replace(/\\n/g, '\n'),
+        'utf-8',
+      );
+    } else {
+      const privateKeyPath = this.config.get<string>('JWT_PRIVATE_KEY_PATH');
+      if (!privateKeyPath) {
+        throw new Error(
+          'JWT_PRIVATE_KEY or JWT_PRIVATE_KEY_PATH is required',
+        );
+      }
+      this.privateKey = readFileSync(privateKeyPath);
     }
-    this.privateKey = readFileSync(privateKeyPath);
     this.publicKey = createPublicKey(this.privateKey);
     this.accessTtl = parseInt(
       this.config.get<string>('ACCESS_TOKEN_TTL', '900'),
