@@ -1,4 +1,4 @@
-services:
+﻿services:
   db:
     image: postgres:16-alpine
     restart: unless-stopped
@@ -51,6 +51,12 @@ services:
       - ../communication-service/.env.compose
     environment:
       DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=notification
+      RABBITMQ_QUEUE_AUTH: comms.q.auth
+      RABBITMQ_EXCHANGE_AUTH: auth.events
+      WELCOME_TEMPLATE_PATIENT: bienvenida_pacientes
+      WELCOME_TEMPLATE_DOCTOR: bienvenida_doctor
+      WELCOME_TEMPLATE_CLINIC: bienvenida_clinica
+      META_TEMPLATE_LANGUAGE_CODE: es_CO
     ports:
       - "3006:3006"
     depends_on:
@@ -367,3 +373,4 @@ volumes:
   meusalud-auth-db:
   meili_data:
   minio_data:
+

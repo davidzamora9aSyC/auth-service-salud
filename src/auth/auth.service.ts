@@ -184,6 +184,8 @@ export class AuthService {
     }
     const normalizedEmail = dto.email.trim().toLowerCase();
     const normalizedPhone = this.normalizePhoneNumber(dto.phoneNumber);
+    const firstName = dto.firstName?.trim() || undefined;
+    const lastName = dto.lastName?.trim() || undefined;
     const existing = await this.prisma.account.findUnique({
       where: { email: normalizedEmail },
     });
@@ -242,8 +244,6 @@ export class AuthService {
       }
     }
     if (account.role === AccountRole.PATIENT) {
-      const firstName = dto.firstName?.trim();
-      const lastName = dto.lastName?.trim();
       if (!firstName || !lastName) {
         await this.prisma.account.delete({ where: { id: account.id } });
         throw new BadRequestException('Nombre y apellido son requeridos');
@@ -259,11 +259,10 @@ export class AuthService {
         throw error;
       }
     }
-    await this.notifications.sendRegistrationWhatsapp({
-      phoneNumber: normalizedPhone,
-      email: account.email,
+    await this.publishUserRegisteredEvent(account, {
+      firstName,
+      lastName,
     });
-    await this.publishUserRegisteredEvent(account);
     return this.issueTokens(account);
   }
 
@@ -1211,10 +1210,21 @@ export class AuthService {
     return createHash('sha256').update(token).digest('hex');
   }
 
-  private async publishUserRegisteredEvent(account: Account) {
-    if (account.role !== AccountRole.DOCTOR && account.role !== AccountRole.CLINIC) {
+  private async publishUserRegisteredEvent(
+    account: Account,
+    profile?: { firstName?: string; lastName?: string },
+  ) {
+    if (
+      account.role !== AccountRole.PATIENT &&
+      account.role !== AccountRole.DOCTOR &&
+      account.role !== AccountRole.CLINIC
+    ) {
       return;
     }
+
+    const firstName = profile?.firstName?.trim();
+    const lastName = profile?.lastName?.trim();
+
     await this.rabbitmq.publishAuthEvent({
       type: 'AuthUserRegistered',
       routingKey: 'auth.user_registered',
@@ -1224,6 +1234,8 @@ export class AuthService {
         doctorId: account.doctorId ?? undefined,
         email: account.email,
         phoneNumber: account.phoneNumber ?? undefined,
+        firstName: firstName || undefined,
+        lastName: lastName || undefined,
       },
     });
   }

@@ -9,6 +9,8 @@ type AuthEventPayload = {
   doctorId?: string;
   email?: string;
   phoneNumber?: string;
+  firstName?: string;
+  lastName?: string;
 };
 
 @Injectable()

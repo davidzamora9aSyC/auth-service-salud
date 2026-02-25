@@ -29,8 +29,9 @@ REFRESH_TOKEN_TTL=604800
 LOGIN_CHALLENGE_TTL=300
 MFA_ISSUER=MeuSalud
 NOTIFICATIONS_SERVICE_URL=http://communication-service:3006/communicationms
-WELCOME_WHATSAPP_TEMPLATE_KEY=MEUSALUD_WELCOME
 NOTIFICATIONS_TIMEOUT_MS=5000
+RABBITMQ_URL=amqp://app:app_pass_123@host.docker.internal:5673/
+RABBITMQ_EXCHANGE_AUTH=auth.events
 ```
 
 - Coloca el par RSA en `auth-service/secrets` o monta la ruta deseada y referencia el archivo privado mediante `JWT_PRIVATE_KEY_PATH`.
@@ -40,9 +41,12 @@ NOTIFICATIONS_TIMEOUT_MS=5000
 
 Este repositorio ahora incluye el microservicio `communication-service`, encargado de hablar con Meta WhatsApp Cloud API. Para tener el flujo completo en local:
 
-1. Copia `communication-service/.env.example` a `communication-service/.env` y define tus credenciales reales de Meta (el `docker-compose.yml` usa `communication-service/.env.compose` como base; puedes editarlo o sobreescribir las variables a la hora de ejecutar).
+1. Usa `communication-service/.env.compose` como base para tus variables de entorno y define tus credenciales reales de Meta.
 2. Ejecuta `docker compose up --build` dentro de `auth-service`. Además de PostgreSQL y el propio `auth-service`, se levantará `communication-service` en `http://localhost:3006`.
-3. El endpoint `POST /api/auth/register` guardará la cuenta y pedirá al servicio de comunicaciones que envíe un mensaje de bienvenida vía WhatsApp utilizando la plantilla `MEUSALUD_WELCOME`.
+3. El endpoint `POST /api/auth/register` guarda la cuenta y publica el evento `auth.user_registered` en `auth.events`.
+4. `communication-service` consume ese evento y envía la bienvenida por WhatsApp usando plantillas oficiales de Meta.
+5. Define el nombre exacto de cada plantilla aprobada en `communication-service/.env.compose`:
+   `WELCOME_TEMPLATE_PATIENT`, `WELCOME_TEMPLATE_DOCTOR`, `WELCOME_TEMPLATE_CLINIC` y `META_TEMPLATE_LANGUAGE_CODE`.
 
 Si no configuras las credenciales de Meta, el registro seguirá funcionando y sólo verás un log informando que el canal de WhatsApp no está disponible.
 
