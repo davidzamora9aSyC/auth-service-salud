@@ -37,6 +37,8 @@ import { RecoveryCompleteDto } from './dto/recovery-complete.dto';
 import { OAuthAuthorizeDto } from './dto/oauth-authorize.dto';
 import { OAuthTokenDto } from './dto/oauth-token.dto';
 import { RabbitmqService } from './rabbitmq.service';
+import { SimulateUserRegisteredDto } from './dto/simulate-user-registered.dto';
+import { BootstrapAdminDto } from './dto/bootstrap-admin.dto';
 
 @Injectable()
 export class AuthService {
@@ -177,6 +179,9 @@ export class AuthService {
   async register(dto: RegisterDto) {
     if (dto.role === AccountRole.COLLABORATOR) {
       throw new BadRequestException('Use el flujo de invitacion de colaborador');
+    }
+    if (dto.role === AccountRole.ADMIN) {
+      throw new BadRequestException('No esta permitido registrar cuentas ADMIN por este endpoint');
     }
     const inviteToken = dto.inviteToken?.trim();
     if (inviteToken && dto.role !== AccountRole.DOCTOR) {
@@ -418,6 +423,121 @@ export class AuthService {
       });
       return accountRecord;
     });
+
+    return this.issueTokens(account);
+  }
+
+  async publishUserRegisteredTestEvent(dto: SimulateUserRegisteredDto) {
+    if (
+      dto.role !== AccountRole.PATIENT &&
+      dto.role !== AccountRole.DOCTOR &&
+      dto.role !== AccountRole.CLINIC
+    ) {
+      throw new BadRequestException('Role invalido para simulacion');
+    }
+
+    const authUserId = dto.authUserId?.trim() || randomUUID();
+    const normalizedEmail = dto.email.trim().toLowerCase();
+    const normalizedPhone = dto.phoneNumber
+      ? this.normalizePhoneNumber(dto.phoneNumber)
+      : undefined;
+    const firstName = dto.firstName?.trim() || undefined;
+    const lastName = dto.lastName?.trim() || undefined;
+    const doctorId =
+      dto.role === AccountRole.DOCTOR
+        ? dto.doctorId?.trim() || randomUUID()
+        : undefined;
+
+    await this.rabbitmq.publishAuthEvent({
+      type: 'AuthUserRegistered',
+      routingKey: 'auth.user_registered',
+      data: {
+        authUserId,
+        role: dto.role,
+        doctorId,
+        email: normalizedEmail,
+        phoneNumber: normalizedPhone,
+        firstName,
+        lastName,
+      },
+    });
+
+    return {
+      published: true,
+      exchange: this.config.get<string>('RABBITMQ_EXCHANGE_AUTH') ?? 'auth.events',
+      routingKey: 'auth.user_registered',
+      data: {
+        authUserId,
+        role: dto.role,
+        doctorId,
+        email: normalizedEmail,
+        phoneNumber: normalizedPhone,
+        firstName,
+        lastName,
+      },
+    };
+  }
+
+  async bootstrapAdmin(dto: BootstrapAdminDto, bootstrapToken?: string) {
+    const expectedToken = this.config.get<string>('ADMIN_BOOTSTRAP_TOKEN');
+    if (!expectedToken) {
+      throw new ServiceUnavailableException('Bootstrap de admin deshabilitado');
+    }
+    if (!bootstrapToken || bootstrapToken !== expectedToken) {
+      throw new UnauthorizedException('Token de bootstrap invalido');
+    }
+
+    const normalizedEmail = dto.email.trim().toLowerCase();
+    const normalizedPhone = dto.phoneNumber
+      ? this.normalizePhoneNumber(dto.phoneNumber)
+      : null;
+
+    const existingByEmail = await this.prisma.account.findUnique({
+      where: { email: normalizedEmail },
+    });
+    if (existingByEmail) {
+      throw new ConflictException('El email ya esta registrado');
+    }
+    if (normalizedPhone) {
+      const existingByPhone = await this.prisma.account.findUnique({
+        where: { phoneNumber: normalizedPhone },
+      });
+      if (existingByPhone) {
+        throw new ConflictException('El numero de telefono ya esta registrado');
+      }
+    }
+
+    const salt = randomBytes(24).toString('hex');
+    const passwordHash = await argon2.hash(dto.password + salt, {
+      type: argon2.argon2id,
+    });
+
+    let account: Account;
+    try {
+      account = await this.prisma.account.create({
+        data: {
+          email: normalizedEmail,
+          passwordHash,
+          salt,
+          role: AccountRole.ADMIN,
+          subjectId: null,
+          phoneNumber: normalizedPhone,
+          doctorId: null,
+          onboardingStatus: OnboardingStatus.COMPLETE,
+        },
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        const targets = Array.isArray(error.meta?.target) ? error.meta.target : [];
+        if (targets.includes('email')) {
+          throw new ConflictException('El email ya esta registrado');
+        }
+        if (targets.includes('phoneNumber')) {
+          throw new ConflictException('El numero de telefono ya esta registrado');
+        }
+      }
+      throw error;
+    }
 
     return this.issueTokens(account);
   }

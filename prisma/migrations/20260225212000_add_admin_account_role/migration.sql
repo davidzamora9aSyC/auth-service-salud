@@ -1,0 +1,7 @@
+DO $$
+BEGIN
+  ALTER TYPE "AccountRole" ADD VALUE IF NOT EXISTS 'ADMIN';
+EXCEPTION
+  WHEN duplicate_object THEN NULL;
+END
+$$;

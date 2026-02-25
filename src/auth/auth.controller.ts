@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Post, Query, Res } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Headers, Post, Query, Res } from '@nestjs/common';
 import { Response } from 'express';
 import { AuthService } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
@@ -11,6 +11,8 @@ import { TwoFactorCodeDto } from './dto/two-factor-code.dto';
 import { RecoveryStartDto } from './dto/recovery-start.dto';
 import { RecoveryVerifyDto } from './dto/recovery-verify.dto';
 import { RecoveryCompleteDto } from './dto/recovery-complete.dto';
+import { SimulateUserRegisteredDto } from './dto/simulate-user-registered.dto';
+import { BootstrapAdminDto } from './dto/bootstrap-admin.dto';
 
 @Controller('auth')
 export class AuthController {
@@ -24,6 +26,19 @@ export class AuthController {
   @Post('register/collaborator')
   registerCollaborator(@Body() dto: RegisterCollaboratorDto) {
     return this.authService.registerCollaborator(dto);
+  }
+
+  @Post('test/publish-user-registered')
+  publishUserRegisteredTestEvent(@Body() dto: SimulateUserRegisteredDto) {
+    return this.authService.publishUserRegisteredTestEvent(dto);
+  }
+
+  @Post('admin/bootstrap')
+  bootstrapAdmin(
+    @Body() dto: BootstrapAdminDto,
+    @Headers('x-admin-bootstrap-token') bootstrapToken?: string,
+  ) {
+    return this.authService.bootstrapAdmin(dto, bootstrapToken);
   }
 
   @Post('login')

@@ -12,6 +12,7 @@ enum AccountRole {
   DOCTOR
   CLINIC
   COLLABORATOR
+  ADMIN
 }
 
 enum AccountStatus {
