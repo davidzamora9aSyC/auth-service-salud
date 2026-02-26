@@ -11,7 +11,6 @@ import { TwoFactorCodeDto } from './dto/two-factor-code.dto';
 import { RecoveryStartDto } from './dto/recovery-start.dto';
 import { RecoveryVerifyDto } from './dto/recovery-verify.dto';
 import { RecoveryCompleteDto } from './dto/recovery-complete.dto';
-import { SimulateUserRegisteredDto } from './dto/simulate-user-registered.dto';
 import { BootstrapAdminDto } from './dto/bootstrap-admin.dto';
 
 @Controller('auth')
@@ -26,11 +25,6 @@ export class AuthController {
   @Post('register/collaborator')
   registerCollaborator(@Body() dto: RegisterCollaboratorDto) {
     return this.authService.registerCollaborator(dto);
-  }
-
-  @Post('test/publish-user-registered')
-  publishUserRegisteredTestEvent(@Body() dto: SimulateUserRegisteredDto) {
-    return this.authService.publishUserRegisteredTestEvent(dto);
   }
 
   @Post('admin/bootstrap')
