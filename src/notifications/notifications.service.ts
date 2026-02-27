@@ -1,4 +1,4 @@
-import { HttpService } from '@nestjs/axios';
+﻿import { HttpService } from '@nestjs/axios';
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { firstValueFrom } from 'rxjs';
@@ -34,7 +34,7 @@ export class NotificationsService {
       this.config.get<string>('NOTIFICATIONS_SERVICE_URL') ??
       'http://communication-service:3006/communicationms';
     if (!baseUrl) {
-      this.logger.warn('NOTIFICATIONS_SERVICE_URL no está configurado');
+      this.logger.warn('NOTIFICATIONS_SERVICE_URL no esta configurado');
       return;
     }
     const endpoint = `${baseUrl.replace(/\/$/, '')}/internal/whatsapp/send-template`;
@@ -63,7 +63,7 @@ export class NotificationsService {
       const message =
         error instanceof Error ? error.message : 'Error desconocido';
       this.logger.error(
-        `Falló el envío del WhatsApp de bienvenida a ${input.phoneNumber}: ${message}`,
+        `Fallo el envio del WhatsApp de bienvenida a ${input.phoneNumber}: ${message}`,
         error as Error,
       );
     }
@@ -80,7 +80,7 @@ export class NotificationsService {
       this.config.get<string>('NOTIFICATIONS_SERVICE_URL') ??
       'http://communication-service:3006/communicationms';
     if (!baseUrl) {
-      this.logger.warn('NOTIFICATIONS_SERVICE_URL no está configurado');
+      this.logger.warn('NOTIFICATIONS_SERVICE_URL no esta configurado');
       return;
     }
     const endpoint = `${baseUrl.replace(/\/$/, '')}/internal/whatsapp/send-template`;
@@ -110,7 +110,7 @@ export class NotificationsService {
       const message =
         error instanceof Error ? error.message : 'Error desconocido';
       this.logger.error(
-        `Falló el envío del WhatsApp de recuperación a ${input.phoneNumber}: ${message}`,
+        `Fallo el envio del WhatsApp de recuperacion a ${input.phoneNumber}: ${message}`,
         error as Error,
       );
     }
@@ -127,27 +127,74 @@ export class NotificationsService {
       this.config.get<string>('NOTIFICATIONS_SERVICE_URL') ??
       'http://communication-service:3006/communicationms';
     if (!baseUrl) {
-      this.logger.warn('NOTIFICATIONS_SERVICE_URL no está configurado');
+      this.logger.warn('NOTIFICATIONS_SERVICE_URL no esta configurado');
       return;
     }
+
     const endpoint = `${baseUrl.replace(/\/$/, '')}/email/messages`;
-    const expiresMinutes = Math.max(
-      1,
-      Math.ceil((input.ttlSeconds ?? 600) / 60),
-    );
-    const subject = 'Código de recuperación de contraseña';
+    const expiresMinutes = Math.max(1, Math.ceil((input.ttlSeconds ?? 600) / 60));
+    const subject = 'Recuperacion de contrasena | MeuDoc';
+
+    const supportEmail =
+      this.config.get<string>('SUPPORT_EMAIL') ?? 'comunicaciones@meudoc.co';
+    const portalUrl =
+      this.config.get<string>('PATIENT_PORTAL_URL') ??
+      this.config.get<string>('DOCTOR_PORTAL_URL') ??
+      'https://front-meu-salud.vercel.app';
+    const headerImageUrl =
+      this.config.get<string>('RECOVERY_EMAIL_HEADER_IMAGE_URL') ??
+      this.config.get<string>('NOTIFICATIONS_BRAND_IMAGE_URL') ??
+      '';
+
+    const safeName = this.escapeHtml(input.name);
+    const safeCode = this.escapeHtml(input.code);
+    const safeLink = this.escapeHtml(input.link);
+    const safeSupport = this.escapeHtml(supportEmail);
+    const safePortal = this.escapeHtml(portalUrl);
+    const safeMinutes = this.escapeHtml(String(expiresMinutes));
+
     const text = [
       `Hola ${input.name},`,
-      `Tu código de recuperación es: ${input.code}`,
-      `Este código vence en ${expiresMinutes} minuto(s).`,
-      `También puedes abrir: ${input.link}`,
+      '',
+      'Recibimos una solicitud para cambiar la contrasena de tu cuenta en MeuDoc.',
+      `Tu codigo de recuperacion es: ${input.code}`,
+      `Este codigo vence en ${expiresMinutes} minuto(s).`,
+      '',
+      `Puedes continuar el proceso aqui: ${input.link}`,
+      '',
+      'Si no solicitaste este cambio, ignora este mensaje.',
+      `Soporte: ${supportEmail}`,
+      '',
+      'Equipo MeuDoc',
+      portalUrl,
     ].join('\n');
-    const html = [
-      `<p>Hola ${input.name},</p>`,
-      `<p>Tu código de recuperación es: <strong>${input.code}</strong></p>`,
-      `<p>Este código vence en <strong>${expiresMinutes} minuto(s)</strong>.</p>`,
-      `<p>También puedes abrir este enlace: <a href="${input.link}">${input.link}</a></p>`,
-    ].join('');
+
+    const html = `
+      <div style="margin:0;padding:24px;background:#f1f5f9;font-family:Arial,Helvetica,sans-serif;color:#0f172a;">
+        <div style="max-width:620px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;">
+          ${
+            headerImageUrl
+              ? `<img src="${this.escapeHtml(headerImageUrl)}" alt="MeuDoc" style="width:100%;max-height:220px;object-fit:cover;display:block;" />`
+              : ''
+          }
+          <div style="padding:24px;">
+            <h1 style="margin:0 0 12px 0;font-size:24px;line-height:1.25;">Recuperar contrasena</h1>
+            <p style="margin:0 0 10px 0;font-size:15px;">Hola <strong>${safeName}</strong>,</p>
+            <p style="margin:0 0 10px 0;font-size:15px;">Recibimos una solicitud para cambiar la contrasena de tu cuenta en MeuDoc.</p>
+            <p style="margin:0 0 12px 0;font-size:15px;">Tu codigo de recuperacion es:</p>
+            <div style="display:inline-block;background:#0f172a;color:#ffffff;padding:10px 14px;border-radius:10px;font-size:24px;font-weight:700;letter-spacing:4px;">${safeCode}</div>
+            <p style="margin:12px 0 0 0;font-size:14px;">Este codigo vence en <strong>${safeMinutes} minuto(s)</strong>.</p>
+            <p style="margin:14px 0 0 0;">
+              <a href="${safeLink}" style="display:inline-block;background:#059669;color:#ffffff;text-decoration:none;padding:11px 16px;border-radius:10px;font-weight:700;">Continuar recuperacion</a>
+            </p>
+            <p style="margin:16px 0 0 0;font-size:13px;color:#475569;">Si no solicitaste este cambio, ignora este mensaje.</p>
+            <p style="margin:8px 0 0 0;font-size:13px;color:#475569;">Soporte: ${safeSupport}</p>
+            <p style="margin:12px 0 0 0;font-size:13px;color:#475569;">Equipo MeuDoc<br />${safePortal}</p>
+          </div>
+        </div>
+      </div>
+    `.trim();
+
     const payload: EmailPayload = {
       to: input.email,
       templateKey: 'PASSWORD_RESET',
@@ -170,9 +217,18 @@ export class NotificationsService {
       const message =
         error instanceof Error ? error.message : 'Error desconocido';
       this.logger.error(
-        `Falló el envío del correo de recuperación a ${input.email}: ${message}`,
+        `Fallo el envio del correo de recuperacion a ${input.email}: ${message}`,
         error as Error,
       );
     }
+  }
+
+  private escapeHtml(value: string) {
+    return value
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/\"/g, '&quot;')
+      .replace(/'/g, '&#39;');
   }
 }
