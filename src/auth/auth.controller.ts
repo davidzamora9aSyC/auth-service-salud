@@ -1,5 +1,5 @@
-import { Body, Controller, Delete, Get, Headers, Post, Query, Res } from '@nestjs/common';
-import { Response } from 'express';
+import { Body, Controller, Delete, Get, Headers, Post, Query, Req, Res, UnauthorizedException } from '@nestjs/common';
+import { Request, Response } from 'express';
 import { AuthService } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
@@ -12,6 +12,8 @@ import { RecoveryStartDto } from './dto/recovery-start.dto';
 import { RecoveryVerifyDto } from './dto/recovery-verify.dto';
 import { RecoveryCompleteDto } from './dto/recovery-complete.dto';
 import { BootstrapAdminDto } from './dto/bootstrap-admin.dto';
+import { AccountDeletionStartDto } from './dto/account-deletion-start.dto';
+import { AccountDeletionConfirmDto } from './dto/account-deletion-confirm.dto';
 
 @Controller('auth')
 export class AuthController {
@@ -36,13 +38,13 @@ export class AuthController {
   }
 
   @Post('login')
-  login(@Body() dto: LoginDto) {
-    return this.authService.login(dto);
+  login(@Body() dto: LoginDto, @Req() req: Request) {
+    return this.authService.login(dto, this.buildRequestMeta(req));
   }
 
   @Post('login/verify')
-  verifyTwoFactor(@Body() dto: VerifyTwoFactorDto) {
-    return this.authService.verifyTwoFactor(dto);
+  verifyTwoFactor(@Body() dto: VerifyTwoFactorDto, @Req() req: Request) {
+    return this.authService.verifyTwoFactor(dto, this.buildRequestMeta(req));
   }
 
   @Post('refresh')
@@ -85,6 +87,38 @@ export class AuthController {
     return this.authService.completePasswordRecovery(dto);
   }
 
+  @Post('account-deletion/start')
+  startAccountDeletion(
+    @Body() dto: AccountDeletionStartDto,
+    @Req() req: Request,
+    @Headers('x-auth-user-id') authUserId?: string,
+  ) {
+    if (!authUserId) {
+      throw new UnauthorizedException('Token requerido');
+    }
+    return this.authService.startAccountDeletion(
+      authUserId,
+      dto,
+      this.buildRequestMeta(req),
+    );
+  }
+
+  @Post('account-deletion/confirm')
+  confirmAccountDeletion(
+    @Body() dto: AccountDeletionConfirmDto,
+    @Req() req: Request,
+    @Headers('x-auth-user-id') authUserId?: string,
+  ) {
+    if (!authUserId) {
+      throw new UnauthorizedException('Token requerido');
+    }
+    return this.authService.confirmAccountDeletion(
+      authUserId,
+      dto,
+      this.buildRequestMeta(req),
+    );
+  }
+
   @Get('oauth/google')
   startGoogleOAuth(@Query('role') role: string, @Query('redirect') redirect: string | undefined, @Res() res: Response) {
     const url = this.authService.getGoogleOAuthUrl(role, redirect);
@@ -92,8 +126,8 @@ export class AuthController {
   }
 
   @Get('oauth/google/callback')
-  async handleGoogleCallback(@Query('code') code: string, @Query('state') state: string, @Res() res: Response) {
-    const result = await this.authService.handleGoogleOAuthCallback(code, state);
+  async handleGoogleCallback(@Query('code') code: string, @Query('state') state: string, @Req() req: Request, @Res() res: Response) {
+    const result = await this.authService.handleGoogleOAuthCallback(code, state, this.buildRequestMeta(req));
     if (result.redirect) {
       return res.redirect(result.redirect);
     }
@@ -107,8 +141,8 @@ export class AuthController {
   }
 
   @Get('oauth/apple/callback')
-  async handleAppleCallbackGet(@Query('code') code: string, @Query('state') state: string, @Res() res: Response) {
-    const result = await this.authService.handleAppleOAuthCallback(code, state);
+  async handleAppleCallbackGet(@Query('code') code: string, @Query('state') state: string, @Req() req: Request, @Res() res: Response) {
+    const result = await this.authService.handleAppleOAuthCallback(code, state, this.buildRequestMeta(req));
     if (result.redirect) {
       return res.redirect(result.redirect);
     }
@@ -116,11 +150,27 @@ export class AuthController {
   }
 
   @Post('oauth/apple/callback')
-  async handleAppleCallbackPost(@Body('code') code: string, @Body('state') state: string, @Res() res: Response) {
-    const result = await this.authService.handleAppleOAuthCallback(code, state);
+  async handleAppleCallbackPost(@Body('code') code: string, @Body('state') state: string, @Req() req: Request, @Res() res: Response) {
+    const result = await this.authService.handleAppleOAuthCallback(code, state, this.buildRequestMeta(req));
     if (result.redirect) {
       return res.redirect(result.redirect);
     }
     return res.json(result.payload);
+  }
+
+  private buildRequestMeta(req: Request) {
+    return {
+      ip: req.ip ?? undefined,
+      forwardedFor:
+        typeof req.headers['x-forwarded-for'] === 'string'
+          ? req.headers['x-forwarded-for']
+          : Array.isArray(req.headers['x-forwarded-for'])
+            ? req.headers['x-forwarded-for'][0]
+            : undefined,
+      userAgent:
+        typeof req.headers['user-agent'] === 'string'
+          ? req.headers['user-agent']
+          : undefined,
+    };
   }
 }

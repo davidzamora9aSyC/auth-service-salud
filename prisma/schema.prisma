@@ -41,6 +41,24 @@ enum CollaboratorStatus {
   DISABLED
 }
 
+enum AccountDeletionChannel {
+  EMAIL
+  WHATSAPP
+}
+
+enum AccountDeletionAuditStatus {
+  COMPLETED
+  PARTIAL
+  FAILED
+}
+
+enum LoginEventSource {
+  PASSWORD
+  TWO_FACTOR
+  OAUTH_GOOGLE
+  OAUTH_APPLE
+}
+
 enum ClinicAdminRole {
   OWNER
   ADMIN
@@ -65,6 +83,7 @@ model Account {
   twoFactorEnabled       Boolean               @default(false)
   twoFactorSecret        String?
   pendingTwoFactorSecret String?
+  deletedAt              DateTime?
   createdAt              DateTime              @default(now())
   updatedAt              DateTime              @updatedAt
 
@@ -72,6 +91,9 @@ model Account {
   twoFactorChallenges    TwoFactorChallenge[]
   passwordRecoveries     PasswordRecovery[]
   oauthAuthorizationCodes OAuthAuthorizationCode[]
+  loginHistory           LoginHistory[]
+  accountDeletionChallenges AccountDeletionChallenge[]
+  accountDeletionAudits  AccountDeletionAudit[]
   collaborator           Collaborator?
   clinicAdmins           ClinicAdmin[]
   createdClinics         Clinic[]               @relation("ClinicCreatedBy")
@@ -360,4 +382,56 @@ model OAuthAuthorizationCode {
 
   @@index([clientId])
   @@index([accountId])
+}
+
+model LoginHistory {
+  id         String           @id @default(uuid())
+  account    Account          @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId  String
+  role       AccountRole
+  source     LoginEventSource
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime         @default(now())
+
+  @@index([accountId, createdAt])
+  @@index([role, createdAt])
+}
+
+model AccountDeletionChallenge {
+  id           String                 @id @default(uuid())
+  account      Account                @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId    String
+  channel      AccountDeletionChannel
+  destination  String
+  codeHash     String
+  expiresAt    DateTime
+  attempts     Int                    @default(0)
+  maxAttempts  Int                    @default(5)
+  verifiedAt   DateTime?
+  consumedAt   DateTime?
+  createdAt    DateTime               @default(now())
+
+  @@index([accountId, createdAt])
+  @@index([expiresAt])
+}
+
+model AccountDeletionAudit {
+  id                   String                    @id @default(uuid())
+  account              Account                   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId            String
+  role                 AccountRole
+  channel              AccountDeletionChannel
+  status               AccountDeletionAuditStatus
+  requestIp            String?
+  requestUserAgent     String?
+  requestedAt          DateTime                  @default(now())
+  deletedAt            DateTime?
+  detailsJson          Json?
+  error                String?
+  createdAt            DateTime                  @default(now())
+  updatedAt            DateTime                  @updatedAt
+
+  @@index([accountId, createdAt])
+  @@index([status, createdAt])
 }

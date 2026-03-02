@@ -8,10 +8,13 @@ import {
 } from '@nestjs/common';
 import {
   Account,
+  AccountDeletionAuditStatus,
+  AccountDeletionChannel,
   AccountRole,
   AccountStatus,
   CollaboratorStatus,
   InviteStatus,
+  LoginEventSource,
   OnboardingStatus,
   Prisma,
   TwoFactorMethod,
@@ -39,6 +42,21 @@ import { OAuthTokenDto } from './dto/oauth-token.dto';
 import { RabbitmqService } from './rabbitmq.service';
 import { SimulateUserRegisteredDto } from './dto/simulate-user-registered.dto';
 import { BootstrapAdminDto } from './dto/bootstrap-admin.dto';
+import { AccountDeletionStartDto } from './dto/account-deletion-start.dto';
+import { AccountDeletionConfirmDto } from './dto/account-deletion-confirm.dto';
+
+type RequestMeta = {
+  ip?: string;
+  forwardedFor?: string;
+  userAgent?: string;
+};
+
+type DeletionOperationLog = {
+  service: string;
+  ok: boolean;
+  operations?: Record<string, number>;
+  error?: string;
+};
 
 @Injectable()
 export class AuthService {
@@ -51,6 +69,8 @@ export class AuthService {
   private readonly recoveryCodeTtl: number;
   private readonly recoveryResetTtl: number;
   private readonly recoveryMaxAttempts: number;
+  private readonly accountDeletionCodeTtl: number;
+  private readonly accountDeletionMaxAttempts: number;
   private readonly recoveryLinkBase: string;
   private readonly oauthCodeTtl: number;
   private readonly oauthClientTtl: number;
@@ -119,6 +139,14 @@ export class AuthService {
     );
     this.recoveryMaxAttempts = parseInt(
       this.config.get<string>('RECOVERY_MAX_ATTEMPTS', '5'),
+      10,
+    );
+    this.accountDeletionCodeTtl = parseInt(
+      this.config.get<string>('ACCOUNT_DELETION_CODE_TTL', `${this.recoveryCodeTtl}`),
+      10,
+    );
+    this.accountDeletionMaxAttempts = parseInt(
+      this.config.get<string>('ACCOUNT_DELETION_MAX_ATTEMPTS', `${this.recoveryMaxAttempts}`),
       10,
     );
     this.recoveryLinkBase =
@@ -271,7 +299,7 @@ export class AuthService {
     return this.issueTokens(account);
   }
 
-  async login(dto: LoginDto) {
+  async login(dto: LoginDto, meta?: RequestMeta) {
     const normalizedEmail = dto.email.trim().toLowerCase();
     let account = await this.prisma.account.findFirst({
       where: {
@@ -298,6 +326,7 @@ export class AuthService {
       };
     }
     const tokens = await this.issueTokens(account);
+    await this.recordLoginHistory(account, LoginEventSource.PASSWORD, meta);
     return {
       requiresTwoFactor: false,
       ...tokens,
@@ -542,7 +571,7 @@ export class AuthService {
     return this.issueTokens(account);
   }
 
-  async verifyTwoFactor(dto: VerifyTwoFactorDto) {
+  async verifyTwoFactor(dto: VerifyTwoFactorDto, meta?: RequestMeta) {
     const challenge = await this.prisma.twoFactorChallenge.findUnique({
       where: { id: dto.challengeId },
       include: { account: true },
@@ -567,6 +596,11 @@ export class AuthService {
       data: { resolved: true },
     });
     const tokens = await this.issueTokens(challenge.account);
+    await this.recordLoginHistory(
+      challenge.account,
+      LoginEventSource.TWO_FACTOR,
+      meta,
+    );
     return {
       requiresTwoFactor: false,
       ...tokens,
@@ -733,6 +767,129 @@ export class AuthService {
     return { success: true };
   }
 
+  async startAccountDeletion(
+    authUserId: string,
+    dto: AccountDeletionStartDto,
+    meta?: RequestMeta,
+  ) {
+    const account = await this.prisma.account.findUnique({
+      where: { id: authUserId },
+    });
+    if (!account || account.status !== AccountStatus.ACTIVE) {
+      throw new UnauthorizedException('Cuenta no disponible');
+    }
+    if (account.deletedAt) {
+      throw new BadRequestException('La cuenta ya fue eliminada');
+    }
+
+    const channel = this.resolveAccountDeletionChannel(account, dto.channel);
+    const destination =
+      channel === AccountDeletionChannel.EMAIL
+        ? account.email
+        : account.phoneNumber;
+
+    if (!destination) {
+      throw new BadRequestException(
+        'No hay un canal disponible para validar el borrado de cuenta',
+      );
+    }
+
+    await this.prisma.accountDeletionChallenge.deleteMany({
+      where: {
+        accountId: account.id,
+        consumedAt: null,
+      },
+    });
+
+    const code = this.generateRecoveryCode();
+    const codeHash = this.hashToken(code);
+    const expiresAt = new Date(Date.now() + this.accountDeletionCodeTtl * 1000);
+    const challenge = await this.prisma.accountDeletionChallenge.create({
+      data: {
+        accountId: account.id,
+        channel,
+        destination,
+        codeHash,
+        expiresAt,
+        maxAttempts: this.accountDeletionMaxAttempts,
+      },
+    });
+
+    const name = account.email.split('@')[0]?.trim() || 'Usuario MeuSalud';
+    if (channel === AccountDeletionChannel.EMAIL) {
+      await this.notifications.sendAccountDeletionEmail({
+        email: destination,
+        name,
+        code,
+        ttlSeconds: this.accountDeletionCodeTtl,
+      });
+    } else {
+      await this.notifications.sendAccountDeletionWhatsapp({
+        phoneNumber: destination,
+        name,
+        code,
+        ttlSeconds: this.accountDeletionCodeTtl,
+      });
+    }
+
+    return {
+      challengeId: challenge.id,
+      channel,
+      destinationMasked: this.maskDestination(channel, destination),
+      expiresAt: challenge.expiresAt.toISOString(),
+    };
+  }
+
+  async confirmAccountDeletion(
+    authUserId: string,
+    dto: AccountDeletionConfirmDto,
+    meta?: RequestMeta,
+  ) {
+    const challenge = await this.prisma.accountDeletionChallenge.findUnique({
+      where: { id: dto.challengeId },
+      include: { account: true },
+    });
+    if (!challenge || challenge.accountId !== authUserId) {
+      throw new UnauthorizedException('Codigo invalido');
+    }
+    if (challenge.consumedAt || challenge.expiresAt < new Date()) {
+      throw new UnauthorizedException('Codigo expirado');
+    }
+    if (challenge.attempts >= challenge.maxAttempts) {
+      throw new UnauthorizedException('Codigo bloqueado');
+    }
+    const codeHash = this.hashToken(dto.code);
+    if (codeHash !== challenge.codeHash) {
+      await this.prisma.accountDeletionChallenge.update({
+        where: { id: challenge.id },
+        data: { attempts: { increment: 1 } },
+      });
+      throw new UnauthorizedException('Codigo invalido');
+    }
+
+    await this.prisma.accountDeletionChallenge.update({
+      where: { id: challenge.id },
+      data: {
+        verifiedAt: new Date(),
+        consumedAt: new Date(),
+      },
+    });
+
+    const result = await this.executeAccountDeletion(
+      challenge.account,
+      challenge.channel,
+      meta,
+    );
+
+    return {
+      success: result.status === AccountDeletionAuditStatus.COMPLETED,
+      status: result.status,
+      deletedAt: result.deletedAt.toISOString(),
+      logs: result.logs,
+      error: result.error,
+    };
+  }
+
   async authorizeOAuth(dto: OAuthAuthorizeDto, authorization?: string) {
     const token = this.extractBearerToken(authorization);
     if (!token) {
@@ -821,7 +978,7 @@ export class AuthService {
     return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
   }
 
-  async handleGoogleOAuthCallback(code?: string, state?: string) {
+  async handleGoogleOAuthCallback(code?: string, state?: string, meta?: RequestMeta) {
     if (!code || !state) {
       throw new BadRequestException('Missing OAuth code or state');
     }
@@ -923,6 +1080,7 @@ export class AuthService {
     }
 
     const tokens = await this.issueTokens(account);
+    await this.recordLoginHistory(account, LoginEventSource.OAUTH_GOOGLE, meta);
     const redirect = entry.redirect ?? this.googleSuccessRedirect;
     if (redirect) {
       const url = new URL(redirect);
@@ -954,7 +1112,7 @@ export class AuthService {
     return `https://appleid.apple.com/auth/authorize?${params.toString()}`;
   }
 
-  async handleAppleOAuthCallback(code?: string, state?: string) {
+  async handleAppleOAuthCallback(code?: string, state?: string, meta?: RequestMeta) {
     if (!code || !state) {
       throw new BadRequestException('Missing OAuth code or state');
     }
@@ -1040,6 +1198,7 @@ export class AuthService {
     }
 
     const tokens = await this.issueTokens(account);
+    await this.recordLoginHistory(account, LoginEventSource.OAUTH_APPLE, meta);
     const redirect = entry.redirect ?? this.appleSuccessRedirect;
     if (redirect) {
       const url = new URL(redirect);
@@ -1324,6 +1483,776 @@ export class AuthService {
     }
 
     throw new ServiceUnavailableException('No se pudo completar la invitacion de clinica');
+  }
+
+  private async recordLoginHistory(
+    account: Account,
+    source: LoginEventSource,
+    meta?: RequestMeta,
+  ) {
+    const ipAddress = this.extractClientIp(meta);
+    await this.prisma.loginHistory.create({
+      data: {
+        accountId: account.id,
+        role: account.role,
+        source,
+        ipAddress,
+        userAgent: meta?.userAgent ?? null,
+      },
+    });
+  }
+
+  private resolveAccountDeletionChannel(
+    account: Account,
+    preferred?: AccountDeletionChannel,
+  ) {
+    if (preferred === AccountDeletionChannel.EMAIL) {
+      if (!account.email) {
+        throw new BadRequestException('No hay correo disponible');
+      }
+      return AccountDeletionChannel.EMAIL;
+    }
+    if (preferred === AccountDeletionChannel.WHATSAPP) {
+      if (!account.phoneNumber) {
+        throw new BadRequestException('No hay WhatsApp disponible');
+      }
+      return AccountDeletionChannel.WHATSAPP;
+    }
+    if (account.email) {
+      return AccountDeletionChannel.EMAIL;
+    }
+    if (account.phoneNumber) {
+      return AccountDeletionChannel.WHATSAPP;
+    }
+    throw new BadRequestException('No hay canal de verificacion disponible');
+  }
+
+  private maskDestination(channel: AccountDeletionChannel, destination: string) {
+    if (channel === AccountDeletionChannel.EMAIL) {
+      const [local, domain] = destination.split('@');
+      const visibleLocal = local.length <= 2 ? `${local[0] ?? '*'}*` : `${local.slice(0, 2)}***`;
+      return `${visibleLocal}@${domain ?? ''}`;
+    }
+    const digits = destination.replace(/[^\d+]/g, '');
+    if (digits.length <= 4) return '***';
+    return `${digits.slice(0, 3)}***${digits.slice(-2)}`;
+  }
+
+  private extractClientIp(meta?: RequestMeta) {
+    const forwarded = meta?.forwardedFor?.split(',')[0]?.trim();
+    if (forwarded) return forwarded;
+    return meta?.ip ?? null;
+  }
+
+  private async runDeletionStep(
+    service: string,
+    operation: () => Promise<Record<string, number>>,
+  ): Promise<DeletionOperationLog> {
+    try {
+      const operations = await operation();
+      return { service, ok: true, operations };
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Error desconocido';
+      this.logger.error(`Error limpiando datos en ${service}: ${message}`);
+      return { service, ok: false, error: message };
+    }
+  }
+
+  private async executeAccountDeletion(
+    account: Account,
+    channel: AccountDeletionChannel,
+    meta?: RequestMeta,
+  ) {
+    const logs: DeletionOperationLog[] = [];
+    const doctorId = account.doctorId ?? (account.role === AccountRole.DOCTOR ? account.subjectId ?? null : null);
+    const patientId = account.role === AccountRole.PATIENT ? account.subjectId ?? null : null;
+    const deletedAt = new Date();
+
+    logs.push(
+      await this.runDeletionStep('auth', async () => {
+        const randomSalt = randomBytes(24).toString('hex');
+        const randomPassword = randomBytes(64).toString('hex');
+        const randomHash = await argon2.hash(randomPassword + randomSalt, {
+          type: argon2.argon2id,
+        });
+
+        const refreshTokens = Number(
+          await this.prisma.$executeRaw`DELETE FROM "RefreshToken" WHERE "accountId" = ${account.id}`,
+        );
+        const twoFactorChallenges = Number(
+          await this.prisma.$executeRaw`DELETE FROM "TwoFactorChallenge" WHERE "accountId" = ${account.id}`,
+        );
+        const recoveries = Number(
+          await this.prisma.$executeRaw`DELETE FROM "PasswordRecovery" WHERE "accountId" = ${account.id}`,
+        );
+        const oauthCodes = Number(
+          await this.prisma.$executeRaw`DELETE FROM "OAuthAuthorizationCode" WHERE "accountId" = ${account.id}`,
+        );
+        const collaboratorAgendas = Number(
+          await this.prisma.$executeRaw`
+            DELETE FROM "CollaboratorAgenda"
+            WHERE "collaboratorId" IN (
+              SELECT "id" FROM "Collaborator" WHERE "accountId" = ${account.id}
+            )
+          `,
+        );
+        const collaboratorPermissions = Number(
+          await this.prisma.$executeRaw`
+            DELETE FROM "CollaboratorPermission"
+            WHERE "collaboratorId" IN (
+              SELECT "id" FROM "Collaborator" WHERE "accountId" = ${account.id}
+            )
+          `,
+        );
+        const collaborators = Number(
+          await this.prisma.$executeRaw`DELETE FROM "Collaborator" WHERE "accountId" = ${account.id}`,
+        );
+        const clinicAdmins = Number(
+          await this.prisma.$executeRaw`DELETE FROM "ClinicAdmin" WHERE "accountId" = ${account.id}`,
+        );
+        const accountUpdated = Number(
+          await this.prisma.$executeRaw`
+            UPDATE "Account"
+            SET
+              "status" = CAST('LOCKED' AS "AccountStatus"),
+              "passwordHash" = ${randomHash},
+              "salt" = ${randomSalt},
+              "phoneNumber" = NULL,
+              "twoFactorEnabled" = FALSE,
+              "twoFactorSecret" = NULL,
+              "pendingTwoFactorSecret" = NULL,
+              "deletedAt" = ${deletedAt},
+              "updatedAt" = ${deletedAt}
+            WHERE "id" = ${account.id}
+          `,
+        );
+        return {
+          refreshTokens,
+          twoFactorChallenges,
+          recoveries,
+          oauthCodes,
+          collaboratorAgendas,
+          collaboratorPermissions,
+          collaborators,
+          clinicAdmins,
+          accountUpdated,
+        };
+      }),
+    );
+
+    if (patientId) {
+      logs.push(
+        await this.runDeletionStep('users', async () => {
+          const owners = Number(
+            await this.prisma.$executeRaw`DELETE FROM "users"."PatientOwner" WHERE "patientId" = ${patientId}`,
+          );
+          const blocks = Number(
+            await this.prisma.$executeRaw`DELETE FROM "users"."PatientDoctorBlock" WHERE "patientId" = ${patientId}`,
+          );
+          const insurers = Number(
+            await this.prisma.$executeRaw`DELETE FROM "users"."PatientInsurer" WHERE "patientId" = ${patientId}`,
+          );
+          const contacts = Number(
+            await this.prisma.$executeRaw`DELETE FROM "users"."PatientContact" WHERE "patientId" = ${patientId}`,
+          );
+          const addresses = Number(
+            await this.prisma.$executeRaw`DELETE FROM "users"."PatientAddress" WHERE "patientId" = ${patientId}`,
+          );
+          const documents = Number(
+            await this.prisma.$executeRaw`DELETE FROM "users"."PatientDocument" WHERE "patientId" = ${patientId}`,
+          );
+          const preference = Number(
+            await this.prisma.$executeRaw`DELETE FROM "users"."PatientPreference" WHERE "patientId" = ${patientId}`,
+          );
+          const patientUpdated = Number(
+            await this.prisma.$executeRaw`
+              UPDATE "users"."Patient"
+              SET
+                "ownerPatientId" = NULL,
+                "gender" = NULL,
+                "birthDate" = NULL,
+                "patientType" = CAST('NONE' AS "users"."PatientType"),
+                "insuranceName" = NULL,
+                "insuranceCard" = NULL,
+                "dataController" = NULL,
+                "birthCity" = NULL,
+                "birthProvince" = NULL,
+                "nationalityCountryId" = NULL,
+                "religion" = NULL,
+                "maritalStatusId" = NULL,
+                "educationId" = NULL,
+                "notes" = NULL,
+                "allergies" = NULL,
+                "medication" = NULL,
+                "medicalHistory" = NULL,
+                "otherInfo" = NULL,
+                "profileImageId" = NULL,
+                "isDependent" = FALSE,
+                "updatedAt" = ${deletedAt}
+              WHERE "id" = ${patientId}
+            `,
+          );
+          return {
+            owners,
+            blocks,
+            insurers,
+            contacts,
+            addresses,
+            documents,
+            preference,
+            patientUpdated,
+          };
+        }),
+      );
+    }
+
+    if (doctorId) {
+      logs.push(
+        await this.runDeletionStep('users-doctor-links', async () => {
+          const owners = Number(
+            await this.prisma.$executeRaw`DELETE FROM "users"."PatientOwner" WHERE "doctorId" = ${doctorId}`,
+          );
+          const blocks = Number(
+            await this.prisma.$executeRaw`DELETE FROM "users"."PatientDoctorBlock" WHERE "doctorId" = ${doctorId}`,
+          );
+          return { owners, blocks };
+        }),
+      );
+
+      logs.push(
+        await this.runDeletionStep('doctors', async () => {
+          const diseases = Number(
+            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorDisease" WHERE "doctorId" = ${doctorId}`,
+          );
+          const locationPaymentMethods = Number(
+            await this.prisma.$executeRaw`
+              DELETE FROM "doctors"."DoctorLocationPaymentMethod"
+              WHERE "locationId" IN (
+                SELECT "id" FROM "doctors"."DoctorLocation" WHERE "doctorId" = ${doctorId}
+              )
+            `,
+          );
+          const locationNews = Number(
+            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorLocationNews" WHERE "doctorId" = ${doctorId}`,
+          );
+          const locations = Number(
+            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorLocation" WHERE "doctorId" = ${doctorId}`,
+          );
+          const preference = Number(
+            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorPreference" WHERE "doctorId" = ${doctorId}`,
+          );
+          const media = Number(
+            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorMedia" WHERE "doctorId" = ${doctorId}`,
+          );
+          const experienceItems = Number(
+            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorExperienceItem" WHERE "doctorId" = ${doctorId}`,
+          );
+          const languages = Number(
+            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorLanguage" WHERE "doctorId" = ${doctorId}`,
+          );
+          const certificates = Number(
+            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorCertificate" WHERE "doctorId" = ${doctorId}`,
+          );
+          const socialLinks = Number(
+            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorSocialLinks" WHERE "doctorId" = ${doctorId}`,
+          );
+          const bookingInfo = Number(
+            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorBookingInfo" WHERE "doctorId" = ${doctorId}`,
+          );
+          const doctorUpdated = Number(
+            await this.prisma.$executeRaw`
+              UPDATE "doctors"."Doctor"
+              SET
+                "phoneNumber" = NULL,
+                "birthCity" = NULL,
+                "birthProvince" = NULL,
+                "nationality" = NULL,
+                "bio" = NULL,
+                "profileImageId" = NULL,
+                "gender" = NULL,
+                "rethusVerified" = FALSE,
+                "reviewsCount" = 0,
+                "reviewsAverage" = 0,
+                "updatedAt" = ${deletedAt}
+              WHERE "id" = ${doctorId}
+            `,
+          );
+          return {
+            diseases,
+            locationPaymentMethods,
+            locationNews,
+            locations,
+            preference,
+            media,
+            experienceItems,
+            languages,
+            certificates,
+            socialLinks,
+            bookingInfo,
+            doctorUpdated,
+          };
+        }),
+      );
+
+      logs.push(
+        await this.runDeletionStep('services', async () => {
+          const preferences = Number(
+            await this.prisma.$executeRaw`DELETE FROM "services"."ServiceColumnsPreference" WHERE "doctorId" = ${doctorId}`,
+          );
+          const services = Number(
+            await this.prisma.$executeRaw`DELETE FROM "services"."Service" WHERE "doctorId" = ${doctorId}`,
+          );
+          return { preferences, services };
+        }),
+      );
+
+      logs.push(
+        await this.runDeletionStep('availability', async () => {
+          const timeOff = Number(
+            await this.prisma.$executeRaw`DELETE FROM "availability"."TimeOff" WHERE "doctorId" = ${doctorId}`,
+          );
+          const holidayOverrides = Number(
+            await this.prisma.$executeRaw`DELETE FROM "availability"."HolidayOverride" WHERE "doctorId" = ${doctorId}`,
+          );
+          const rules = Number(
+            await this.prisma.$executeRaw`DELETE FROM "availability"."WorkingHoursRule" WHERE "doctorId" = ${doctorId}`,
+          );
+          const policies = Number(
+            await this.prisma.$executeRaw`DELETE FROM "availability"."BookingPolicy" WHERE "doctorId" = ${doctorId}`,
+          );
+          const agendas = Number(
+            await this.prisma.$executeRaw`DELETE FROM "availability"."Agenda" WHERE "doctorId" = ${doctorId}`,
+          );
+          return { timeOff, holidayOverrides, rules, policies, agendas };
+        }),
+      );
+
+      logs.push(
+        await this.runDeletionStep('payments', async () => {
+          const payments = Number(
+            await this.prisma.$executeRaw`DELETE FROM "payments"."Payment" WHERE "doctorId" = ${doctorId}`,
+          );
+          return { payments };
+        }),
+      );
+
+      logs.push(
+        await this.runDeletionStep('subscriptions', async () => {
+          const subscriptions = Number(
+            await this.prisma.$executeRaw`DELETE FROM "subscriptions"."Subscription" WHERE "doctorId" = ${doctorId}`,
+          );
+          return { subscriptions };
+        }),
+      );
+
+      logs.push(
+        await this.runDeletionStep('templates', async () => {
+          const templates = Number(
+            await this.prisma.$executeRaw`DELETE FROM "templates"."Template" WHERE "doctorId" = ${doctorId}`,
+          );
+          return { templates };
+        }),
+      );
+    }
+
+    logs.push(
+      await this.runDeletionStep('appointments', async () => {
+        const episodeDocuments = doctorId
+          ? Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "appointments"."EpisodeDocument"
+                WHERE ${patientId ? Prisma.sql`"patientId" = ${patientId} OR ` : Prisma.empty}
+                  "doctorId" = ${doctorId}
+              `,
+            )
+          : patientId
+            ? Number(
+                await this.prisma.$executeRaw`DELETE FROM "appointments"."EpisodeDocument" WHERE "patientId" = ${patientId}`,
+              )
+            : 0;
+        const episodeAttachments = doctorId
+          ? Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "appointments"."EpisodeAttachment"
+                WHERE ${patientId ? Prisma.sql`"patientId" = ${patientId} OR ` : Prisma.empty}
+                  "doctorId" = ${doctorId}
+              `,
+            )
+          : patientId
+            ? Number(
+                await this.prisma.$executeRaw`DELETE FROM "appointments"."EpisodeAttachment" WHERE "patientId" = ${patientId}`,
+              )
+            : 0;
+        const episodes = doctorId
+          ? Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "appointments"."Episode"
+                WHERE ${patientId ? Prisma.sql`"patientId" = ${patientId} OR ` : Prisma.empty}
+                  "doctorId" = ${doctorId}
+              `,
+            )
+          : patientId
+            ? Number(
+                await this.prisma.$executeRaw`DELETE FROM "appointments"."Episode" WHERE "patientId" = ${patientId}`,
+              )
+            : 0;
+        const patientAttachments = doctorId
+          ? Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "appointments"."PatientAttachment"
+                WHERE ${patientId ? Prisma.sql`"patientId" = ${patientId} OR ` : Prisma.empty}
+                  "doctorId" = ${doctorId}
+              `,
+            )
+          : patientId
+            ? Number(
+                await this.prisma.$executeRaw`DELETE FROM "appointments"."PatientAttachment" WHERE "patientId" = ${patientId}`,
+              )
+            : 0;
+        const appointments = doctorId
+          ? Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "appointments"."Appointment"
+                WHERE ${patientId ? Prisma.sql`"patientId" = ${patientId} OR ` : Prisma.empty}
+                  "doctorId" = ${doctorId}
+              `,
+            )
+          : patientId
+            ? Number(
+                await this.prisma.$executeRaw`DELETE FROM "appointments"."Appointment" WHERE "patientId" = ${patientId}`,
+              )
+            : 0;
+        const series = doctorId
+          ? Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "appointments"."AppointmentSeries"
+                WHERE ${patientId ? Prisma.sql`"patientId" = ${patientId} OR ` : Prisma.empty}
+                  "doctorId" = ${doctorId}
+              `,
+            )
+          : patientId
+            ? Number(
+                await this.prisma.$executeRaw`DELETE FROM "appointments"."AppointmentSeries" WHERE "patientId" = ${patientId}`,
+              )
+            : 0;
+        return {
+          episodeDocuments,
+          episodeAttachments,
+          episodes,
+          patientAttachments,
+          appointments,
+          series,
+        };
+      }),
+    );
+
+    logs.push(
+      await this.runDeletionStep('analytics', async () => {
+        const dimOwnership = doctorId || patientId
+          ? Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "analytics"."DimDoctorPatientOwnership"
+                WHERE ${doctorId ? Prisma.sql`"doctorId" = ${doctorId}` : Prisma.sql`FALSE`}
+                  ${patientId ? Prisma.sql` OR "patientId" = ${patientId}` : Prisma.empty}
+              `,
+            )
+          : 0;
+        const factAppointments = doctorId || patientId
+          ? Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "analytics"."FactAppointment"
+                WHERE ${doctorId ? Prisma.sql`"doctorId" = ${doctorId}` : Prisma.sql`FALSE`}
+                  ${patientId ? Prisma.sql` OR "patientId" = ${patientId}` : Prisma.empty}
+              `,
+            )
+          : 0;
+        const factPayments = doctorId || patientId
+          ? Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "analytics"."FactPaymentTransaction"
+                WHERE ${doctorId ? Prisma.sql`"doctorId" = ${doctorId}` : Prisma.sql`FALSE`}
+                  ${patientId ? Prisma.sql` OR "patientId" = ${patientId}` : Prisma.empty}
+              `,
+            )
+          : 0;
+        const factReviews = doctorId || patientId
+          ? Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "analytics"."FactReview"
+                WHERE ${doctorId ? Prisma.sql`"doctorId" = ${doctorId}` : Prisma.sql`FALSE`}
+                  ${patientId ? Prisma.sql` OR "patientId" = ${patientId}` : Prisma.empty}
+              `,
+            )
+          : 0;
+        const feedback = doctorId || patientId
+          ? Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "analytics"."FactBookingFeedback"
+                WHERE ${doctorId ? Prisma.sql`"doctorId" = ${doctorId}` : Prisma.sql`FALSE`}
+                  ${patientId ? Prisma.sql` OR "patientId" = ${patientId}` : Prisma.empty}
+              `,
+            )
+          : 0;
+        const dimServices = doctorId
+          ? Number(
+              await this.prisma.$executeRaw`DELETE FROM "analytics"."DimService" WHERE "doctorId" = ${doctorId}`,
+            )
+          : 0;
+        const presence = doctorId
+          ? Number(
+              await this.prisma.$executeRaw`DELETE FROM "analytics"."AggDoctorPresenceDaily" WHERE "doctorId" = ${doctorId}`,
+            )
+          : 0;
+        const series = doctorId
+          ? Number(
+              await this.prisma.$executeRaw`DELETE FROM "analytics"."AggSeries" WHERE "doctorId" = ${doctorId}`,
+            )
+          : 0;
+        const messageMetrics = doctorId
+          ? Number(
+              await this.prisma.$executeRaw`DELETE FROM "analytics"."DoctorMessageMetric" WHERE "doctorId" = ${doctorId}`,
+            )
+          : 0;
+        const conversationStatus = doctorId || patientId
+          ? Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "analytics"."ConversationMessageStatus"
+                WHERE ${doctorId ? Prisma.sql`"doctorId" = ${doctorId}` : Prisma.sql`FALSE`}
+                  ${patientId ? Prisma.sql` OR "patientId" = ${patientId}` : Prisma.empty}
+              `,
+            )
+          : 0;
+        const dimDoctor = doctorId
+          ? Number(
+              await this.prisma.$executeRaw`DELETE FROM "analytics"."DimDoctor" WHERE "doctorId" = ${doctorId}`,
+            )
+          : 0;
+        return {
+          dimOwnership,
+          factAppointments,
+          factPayments,
+          factReviews,
+          feedback,
+          dimServices,
+          presence,
+          series,
+          messageMetrics,
+          conversationStatus,
+          dimDoctor,
+        };
+      }),
+    );
+
+    logs.push(
+      await this.runDeletionStep('reminders', async () => {
+        const reminders = doctorId || patientId
+          ? Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "reminders"."Reminder"
+                WHERE ${doctorId ? Prisma.sql`"doctorId" = ${doctorId}` : Prisma.sql`FALSE`}
+                  ${patientId ? Prisma.sql` OR "patientId" = ${patientId}` : Prisma.empty}
+              `,
+            )
+          : 0;
+        return { reminders };
+      }),
+    );
+
+    logs.push(
+      await this.runDeletionStep('messages', async () => {
+        const blocks = doctorId || patientId
+          ? Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "messages"."MessageBlock"
+                WHERE ${doctorId ? Prisma.sql`"doctorId" = ${doctorId}` : Prisma.sql`FALSE`}
+                  ${patientId ? Prisma.sql` OR "patientId" = ${patientId}` : Prisma.empty}
+              `,
+            )
+          : 0;
+        const conversations = doctorId || patientId
+          ? Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "messages"."Conversation"
+                WHERE ${doctorId ? Prisma.sql`"doctorId" = ${doctorId}` : Prisma.sql`FALSE`}
+                  ${patientId ? Prisma.sql` OR "patientId" = ${patientId}` : Prisma.empty}
+              `,
+            )
+          : 0;
+        return { blocks, conversations };
+      }),
+    );
+
+    logs.push(
+      await this.runDeletionStep('reviews', async () => {
+        const reviews = doctorId || patientId
+          ? Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "reviews"."Review"
+                WHERE ${doctorId ? Prisma.sql`"doctorId" = ${doctorId}` : Prisma.sql`FALSE`}
+                  ${patientId ? Prisma.sql` OR "patientId" = ${patientId}` : Prisma.empty}
+              `,
+            )
+          : 0;
+        return { reviews };
+      }),
+    );
+
+    logs.push(
+      await this.runDeletionStep('clinics', async () => {
+        const memberships = doctorId
+          ? Number(
+              await this.prisma.$executeRaw`DELETE FROM "ClinicDoctorMembership" WHERE "doctorId" = ${doctorId}`,
+            )
+          : 0;
+        const invites = doctorId
+          ? Number(
+              await this.prisma.$executeRaw`DELETE FROM "ClinicDoctorInvite" WHERE "doctorId" = ${doctorId}`,
+            )
+          : 0;
+        const agendaAssignments = doctorId
+          ? Number(
+              await this.prisma.$executeRaw`DELETE FROM "ClinicAgendaAssignment" WHERE "doctorId" = ${doctorId}`,
+            )
+          : 0;
+        const agendaSlots = doctorId
+          ? Number(
+              await this.prisma.$executeRaw`
+                UPDATE "ClinicLocationAgendaSlot"
+                SET "assignedDoctorId" = NULL, "assignedAgendaId" = NULL, "status" = CAST('OPEN' AS "ClinicAgendaSlotStatus")
+                WHERE "assignedDoctorId" = ${doctorId}
+              `,
+            )
+          : 0;
+        return { memberships, invites, agendaAssignments, agendaSlots };
+      }),
+    );
+
+    if (account.role === AccountRole.DOCTOR || account.role === AccountRole.PATIENT) {
+      const subjectType =
+        account.role === AccountRole.DOCTOR ? 'DOCTOR' : 'PATIENT';
+      const subjectId = account.role === AccountRole.DOCTOR ? doctorId : patientId;
+      if (subjectId) {
+        logs.push(
+          await this.runDeletionStep('consents', async () => {
+            const consents = Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "consents"."Consent"
+                WHERE "subjectType" = CAST(${subjectType} AS "consents"."SubjectType")
+                  AND "subjectId" = ${subjectId}
+              `,
+            );
+            const deletionTasks = Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "consents"."DeletionTask"
+                WHERE "deletionRequestId" IN (
+                  SELECT "id" FROM "consents"."DataDeletionRequest"
+                  WHERE "subjectType" = CAST(${subjectType} AS "consents"."SubjectType")
+                    AND "subjectId" = ${subjectId}
+                )
+              `,
+            );
+            const deletionRequests = Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "consents"."DataDeletionRequest"
+                WHERE "subjectType" = CAST(${subjectType} AS "consents"."SubjectType")
+                  AND "subjectId" = ${subjectId}
+              `,
+            );
+            return { consents, deletionTasks, deletionRequests };
+          }),
+        );
+      }
+    }
+
+    logs.push(
+      await this.runDeletionStep('images', async () => {
+        const doctorImages = doctorId
+          ? Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "images"."ImageAsset"
+                WHERE "ownerType" = CAST('DOCTOR' AS "images"."OwnerType")
+                  AND "ownerId" = ${doctorId}
+              `,
+            )
+          : 0;
+        const patientImages = patientId
+          ? Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "images"."ImageAsset"
+                WHERE "ownerType" = CAST('PATIENT' AS "images"."OwnerType")
+                  AND "ownerId" = ${patientId}
+              `,
+            )
+          : 0;
+        return { doctorImages, patientImages };
+      }),
+    );
+
+    logs.push(
+      await this.runDeletionStep('communication', async () => {
+        const normalizedEmail = account.email.toLowerCase();
+        const notificationByEmail = Number(
+          await this.prisma.$executeRaw`
+            DELETE FROM "notification"."notification_log"
+            WHERE lower("destination") = ${normalizedEmail}
+              OR lower("normalizedDestination") = ${normalizedEmail}
+          `,
+        );
+        const outboxByPhone = account.phoneNumber
+          ? Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "notification"."message_outbox"
+                WHERE "to_e164" = ${account.phoneNumber}
+              `,
+            )
+          : 0;
+        const leadsByPhone = account.phoneNumber
+          ? Number(
+              await this.prisma.$executeRaw`
+                DELETE FROM "notification"."lead_capture"
+                WHERE "phone" = ${account.phoneNumber}
+              `,
+            )
+          : 0;
+        return { notificationByEmail, outboxByPhone, leadsByPhone };
+      }),
+    );
+
+    const failed = logs.filter((item) => !item.ok);
+    const successful = logs.filter((item) => item.ok);
+    const status =
+      failed.length === 0
+        ? AccountDeletionAuditStatus.COMPLETED
+        : successful.length > 0
+          ? AccountDeletionAuditStatus.PARTIAL
+          : AccountDeletionAuditStatus.FAILED;
+    const error =
+      failed.length > 0
+        ? failed.map((item) => `${item.service}: ${item.error}`).join(' | ')
+        : null;
+
+    await this.prisma.accountDeletionAudit.create({
+      data: {
+        accountId: account.id,
+        role: account.role,
+        channel,
+        status,
+        requestIp: this.extractClientIp(meta),
+        requestUserAgent: meta?.userAgent ?? null,
+        requestedAt: deletedAt,
+        deletedAt,
+        detailsJson: logs,
+        error,
+      },
+    });
+
+    return {
+      status,
+      deletedAt,
+      logs,
+      error,
+    };
   }
 
   private hashToken(token: string) {
