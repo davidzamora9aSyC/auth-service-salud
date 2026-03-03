@@ -441,7 +441,7 @@ model AccountDeletionAudit {
 }
 
 model AccountIdentityReuseAudit {
-  id                     String   @id @default(uuid())
+  id                     String   @id @default(dbgenerated("gen_random_uuid()"))
   account                Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
   accountId              String
   previousAccountId      String?

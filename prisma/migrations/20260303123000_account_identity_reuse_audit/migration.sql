@@ -1,5 +1,7 @@
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
 CREATE TABLE IF NOT EXISTS "AccountIdentityReuseAudit" (
-  "id" TEXT NOT NULL DEFAULT uuid(),
+  "id" TEXT NOT NULL DEFAULT gen_random_uuid(),
   "accountId" TEXT NOT NULL,
   "previousAccountId" TEXT,
   "previousDeletionAuditId" TEXT,
