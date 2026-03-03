@@ -1,6 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import amqplib, { Channel, Connection, ConsumeMessage } from 'amqplib';
+import { Channel, Connection, ConsumeMessage, connect } from 'amqplib';
 import { PrismaService } from '../prisma/prisma.service';
 import { AccountRole, OnboardingStatus } from '@prisma/client';
 
@@ -30,11 +30,12 @@ export class DoctorsConsumer implements OnModuleInit, OnModuleDestroy {
       'doctors.events';
 
     try {
-      this.connection = await amqplib.connect(url);
+      this.connection = await connect(url);
       this.channel = await this.connection.createChannel();
       await this.channel.assertExchange(exchange, 'topic', { durable: true });
       await this.channel.assertQueue(queue, { durable: true });
       await this.channel.bindQueue(queue, exchange, 'doctors.profile_completed');
+      await this.channel.bindQueue(queue, exchange, 'doctors.onboarding_completed');
       await this.channel.prefetch(5);
       await this.channel.consume(queue, (msg) => this.handleMessage(msg), {
         noAck: false,
@@ -61,7 +62,7 @@ export class DoctorsConsumer implements OnModuleInit, OnModuleDestroy {
         data?: Record<string, unknown>;
       };
 
-      if (payload.type !== 'DoctorProfileCompleted') {
+      if (payload.type !== 'DoctorProfileCompleted' && payload.type !== 'DoctorOnboardingCompleted') {
         this.channel.ack(msg);
         return;
       }

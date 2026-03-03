@@ -1,6 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import amqplib, { Channel, Connection } from 'amqplib';
+import { Channel, Connection, connect } from 'amqplib';
 import { randomUUID } from 'node:crypto';
 
 type AuthEventPayload = {
@@ -13,11 +13,17 @@ type AuthEventPayload = {
   lastName?: string;
 };
 
+type DoctorEventPayload = {
+  doctorId: string;
+};
+
 @Injectable()
 export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(RabbitmqService.name);
   private connection: Connection | null = null;
   private channel: Channel | null = null;
+  private authExchange = 'auth.events';
+  private doctorsExchange = 'doctors.events';
 
   constructor(private readonly config: ConfigService) {}
 
@@ -28,11 +34,16 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
       return;
     }
     try {
-      this.connection = await amqplib.connect(url);
+      this.connection = await connect(url);
       this.channel = await this.connection.createChannel();
-      const exchange =
+      this.authExchange =
         this.config.get<string>('RABBITMQ_EXCHANGE_AUTH') ?? 'auth.events';
-      await this.channel.assertExchange(exchange, 'topic', {
+      this.doctorsExchange =
+        this.config.get<string>('RABBITMQ_EXCHANGE_DOCTORS') ?? 'doctors.events';
+      await this.channel.assertExchange(this.authExchange, 'topic', {
+        durable: true,
+      });
+      await this.channel.assertExchange(this.doctorsExchange, 'topic', {
         durable: true,
       });
     } catch (error) {
@@ -54,8 +65,6 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
     if (!this.channel) {
       return;
     }
-    const exchange =
-      this.config.get<string>('RABBITMQ_EXCHANGE_AUTH') ?? 'auth.events';
     const payload = {
       id: randomUUID(),
       type: event.type,
@@ -66,7 +75,36 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
       data: event.data,
     };
     this.channel.publish(
-      exchange,
+      this.authExchange,
+      event.routingKey,
+      Buffer.from(JSON.stringify(payload)),
+      {
+        persistent: true,
+        contentType: 'application/json',
+      },
+    );
+  }
+
+  async publishDoctorEvent(event: {
+    type: 'DoctorDeleted';
+    routingKey: string;
+    data: DoctorEventPayload;
+    correlationId?: string;
+  }) {
+    if (!this.channel) {
+      return;
+    }
+    const payload = {
+      id: randomUUID(),
+      type: event.type,
+      version: 1,
+      occurredAt: new Date().toISOString(),
+      producer: 'auth-service',
+      correlationId: event.correlationId,
+      data: event.data,
+    };
+    this.channel.publish(
+      this.doctorsExchange,
       event.routingKey,
       Buffer.from(JSON.stringify(payload)),
       {

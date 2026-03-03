@@ -94,6 +94,7 @@ model Account {
   loginHistory           LoginHistory[]
   accountDeletionChallenges AccountDeletionChallenge[]
   accountDeletionAudits  AccountDeletionAudit[]
+  accountIdentityReuseAudits AccountIdentityReuseAudit[]
   collaborator           Collaborator?
   clinicAdmins           ClinicAdmin[]
   createdClinics         Clinic[]               @relation("ClinicCreatedBy")
@@ -320,6 +321,8 @@ model RefreshToken {
   id        String   @id @default(uuid())
   account   Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
   accountId String
+  sessionRole AccountRole?
+  sessionSubjectId String?
   tokenHash String   @unique
   expiresAt DateTime
   createdAt DateTime @default(now())
@@ -329,6 +332,7 @@ model TwoFactorChallenge {
   id        String           @id
   account   Account          @relation(fields: [accountId], references: [id], onDelete: Cascade)
   accountId String
+  sessionRole AccountRole?
   method    TwoFactorMethod
   expiresAt DateTime
   resolved  Boolean          @default(false)
@@ -434,4 +438,19 @@ model AccountDeletionAudit {
 
   @@index([accountId, createdAt])
   @@index([status, createdAt])
+}
+
+model AccountIdentityReuseAudit {
+  id                     String   @id @default(uuid())
+  account                Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId              String
+  previousAccountId      String?
+  previousDeletionAuditId String?
+  matchedBy              String
+  matchedValue           String?
+  createdAt              DateTime @default(now())
+
+  @@index([accountId, createdAt])
+  @@index([previousAccountId, createdAt])
+  @@index([matchedBy, createdAt])
 }

@@ -57,6 +57,19 @@ export class AuthController {
     return this.authService.logout(dto.refreshToken);
   }
 
+  @Get('login-history')
+  getLoginHistory(
+    @Query('limit') limit: string | undefined,
+    @Headers('x-auth-user-id') authUserId?: string,
+  ) {
+    if (!authUserId) {
+      throw new UnauthorizedException('Token requerido');
+    }
+    const parsedLimit = Number.parseInt(limit ?? '', 10);
+    const safeLimit = Number.isFinite(parsedLimit) ? Math.min(Math.max(parsedLimit, 1), 50) : 20;
+    return this.authService.getLoginHistory(authUserId, safeLimit);
+  }
+
   @Post('2fa/setup')
   setupTwoFactor(@Body() dto: TwoFactorSetupDto) {
     return this.authService.setupTwoFactor(dto);

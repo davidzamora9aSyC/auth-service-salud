@@ -296,16 +296,14 @@ export class AuthService {
       firstName,
       lastName,
     });
+    await this.recordIdentityReuse(account, normalizedEmail, normalizedPhone);
     return this.issueTokens(account);
   }
 
   async login(dto: LoginDto, meta?: RequestMeta) {
     const normalizedEmail = dto.email.trim().toLowerCase();
-    let account = await this.prisma.account.findFirst({
-      where: {
-        email: normalizedEmail,
-        role: dto.role ?? undefined,
-      },
+    const account = await this.prisma.account.findUnique({
+      where: { email: normalizedEmail },
     });
     if (
       !account ||
@@ -316,17 +314,20 @@ export class AuthService {
     if (account.status !== AccountStatus.ACTIVE) {
       throw new UnauthorizedException('Account disabled');
     }
-    account = await this.ensurePatientSubjectId(account);
+    const sessionRole = this.resolveSessionRole(account, dto.role);
+    if (sessionRole === AccountRole.DOCTOR && !account.doctorId) {
+      throw new BadRequestException('No hay perfil de doctor para esta cuenta');
+    }
     if (account.twoFactorEnabled && account.twoFactorSecret) {
-      const challenge = await this.createTwoFactorChallenge(account.id);
+      const challenge = await this.createTwoFactorChallenge(account.id, sessionRole);
       return {
         requiresTwoFactor: true,
         challengeId: challenge.id,
         expiresAt: challenge.expiresAt.toISOString(),
       };
     }
-    const tokens = await this.issueTokens(account);
-    await this.recordLoginHistory(account, LoginEventSource.PASSWORD, meta);
+    const tokens = await this.issueTokens(account, { sessionRole });
+    await this.recordLoginHistory(account, sessionRole, LoginEventSource.PASSWORD, meta);
     return {
       requiresTwoFactor: false,
       ...tokens,
@@ -595,9 +596,11 @@ export class AuthService {
       where: { id: dto.challengeId },
       data: { resolved: true },
     });
-    const tokens = await this.issueTokens(challenge.account);
+    const sessionRole = challenge.sessionRole ?? challenge.account.role;
+    const tokens = await this.issueTokens(challenge.account, { sessionRole });
     await this.recordLoginHistory(
       challenge.account,
+      sessionRole,
       LoginEventSource.TWO_FACTOR,
       meta,
     );
@@ -608,9 +611,12 @@ export class AuthService {
   }
 
   async refresh(refreshToken: string) {
-    const { account } = await this.findRefreshToken(refreshToken);
+    const { account, sessionRole, sessionSubjectId } = await this.findRefreshToken(refreshToken);
     await this.revokeRefreshToken(refreshToken);
-    return this.issueTokens(account);
+    return this.issueTokens(account, {
+      sessionRole: sessionRole ?? account.role,
+      sessionSubjectId: sessionSubjectId ?? undefined,
+    });
   }
 
   async logout(refreshToken: string) {
@@ -881,6 +887,26 @@ export class AuthService {
       meta,
     );
 
+    if (challenge.account.role === AccountRole.DOCTOR) {
+      const doctorId =
+        challenge.account.doctorId ?? challenge.account.subjectId ?? '';
+      if (doctorId) {
+        try {
+          await this.rabbitmq.publishDoctorEvent({
+            type: 'DoctorDeleted',
+            routingKey: 'doctors.deleted',
+            correlationId: dto.challengeId,
+            data: { doctorId },
+          });
+        } catch (error) {
+          this.logger.warn(
+            `No se pudo publicar DoctorDeleted (${doctorId})`,
+            error as Error,
+          );
+        }
+      }
+    }
+
     return {
       success: result.status === AccountDeletionAuditStatus.COMPLETED,
       status: result.status,
@@ -1080,7 +1106,7 @@ export class AuthService {
     }
 
     const tokens = await this.issueTokens(account);
-    await this.recordLoginHistory(account, LoginEventSource.OAUTH_GOOGLE, meta);
+    await this.recordLoginHistory(account, account.role, LoginEventSource.OAUTH_GOOGLE, meta);
     const redirect = entry.redirect ?? this.googleSuccessRedirect;
     if (redirect) {
       const url = new URL(redirect);
@@ -1198,7 +1224,7 @@ export class AuthService {
     }
 
     const tokens = await this.issueTokens(account);
-    await this.recordLoginHistory(account, LoginEventSource.OAUTH_APPLE, meta);
+    await this.recordLoginHistory(account, account.role, LoginEventSource.OAUTH_APPLE, meta);
     const redirect = entry.redirect ?? this.appleSuccessRedirect;
     if (redirect) {
       const url = new URL(redirect);
@@ -1271,25 +1297,51 @@ export class AuthService {
     return { twoFactorEnabled: false };
   }
 
-  private async issueTokens(account: Account, scope?: string) {
+  private async issueTokens(
+    account: Account,
+    options?: { scope?: string; sessionRole?: AccountRole; sessionSubjectId?: string | null },
+  ) {
+    const sessionRole = options?.sessionRole ?? account.role;
+    let sessionSubjectId = options?.sessionSubjectId ?? null;
+    let accountForSession = account;
     const payload: Record<string, unknown> = {
       sub: account.id,
-      role: account.role,
-      subjectId: account.subjectId,
+      role: sessionRole,
     };
-    if (account.role === AccountRole.DOCTOR) {
-      if (account.doctorId) {
-        payload.doctorId = account.doctorId;
+    if (sessionRole === AccountRole.PATIENT) {
+      if (account.role === AccountRole.PATIENT) {
+        accountForSession = await this.ensurePatientSubjectId(account);
+        sessionSubjectId = accountForSession.subjectId ?? null;
+      } else {
+        sessionSubjectId = await this.resolvePatientIdForSession(
+          account,
+          sessionSubjectId,
+        );
+      }
+      if (sessionSubjectId) {
+        payload.patientId = sessionSubjectId;
+        payload.subjectId = sessionSubjectId;
+      }
+      payload.onboardingRequired = false;
+    } else if (sessionRole === AccountRole.DOCTOR) {
+      const doctorId =
+        account.doctorId ?? (account.role === AccountRole.DOCTOR ? account.subjectId ?? null : null);
+      if (doctorId) {
+        payload.doctorId = doctorId;
       }
       payload.onboardingRequired =
         account.onboardingStatus !== OnboardingStatus.COMPLETE;
-    } else if (account.role === AccountRole.CLINIC) {
+    } else if (sessionRole === AccountRole.CLINIC) {
       if (account.subjectId) {
         payload.clinicId = account.subjectId;
+        payload.subjectId = account.subjectId;
       }
       payload.onboardingRequired =
         account.onboardingStatus !== OnboardingStatus.COMPLETE;
-    } else if (account.role === AccountRole.COLLABORATOR) {
+    } else if (sessionRole === AccountRole.COLLABORATOR) {
+      if (account.role !== AccountRole.COLLABORATOR) {
+        throw new UnauthorizedException('Account disabled');
+      }
       const collaborator = await this.prisma.collaborator.findUnique({
         where: { accountId: account.id },
         include: {
@@ -1310,13 +1362,10 @@ export class AuthService {
       );
       payload.onboardingRequired = false;
     } else {
-      if (account.role === AccountRole.PATIENT && account.subjectId) {
-        payload.patientId = account.subjectId;
-      }
       payload.onboardingRequired = false;
     }
-    if (scope) {
-      payload.scope = scope;
+    if (options?.scope) {
+      payload.scope = options.scope;
     }
     const signOptions: SignOptions = {
       algorithm: 'RS256',
@@ -1330,6 +1379,8 @@ export class AuthService {
     await this.prisma.refreshToken.create({
       data: {
         accountId: account.id,
+        sessionRole,
+        sessionSubjectId: sessionSubjectId ?? undefined,
         tokenHash: refreshTokenHash,
         expiresAt: refreshExpiresAt,
       },
@@ -1342,11 +1393,19 @@ export class AuthService {
       account: {
         id: account.id,
         email: account.email,
-        role: account.role,
-        subjectId: account.subjectId,
-        doctorId: account.doctorId,
+        role: sessionRole,
+        subjectId:
+          sessionRole === AccountRole.PATIENT
+            ? sessionSubjectId
+            : sessionRole === AccountRole.CLINIC
+              ? account.subjectId
+              : null,
+        doctorId:
+          sessionRole === AccountRole.DOCTOR || sessionRole === AccountRole.COLLABORATOR
+            ? (payload.doctorId as string | null | undefined) ?? null
+            : null,
         clinicId:
-          account.role === AccountRole.CLINIC ? account.subjectId : null,
+          sessionRole === AccountRole.CLINIC ? account.subjectId : null,
         onboardingStatus: account.onboardingStatus,
       },
     };
@@ -1399,7 +1458,7 @@ export class AuthService {
       data: { consumedAt: new Date() },
     });
 
-    const tokens = await this.issueTokens(stored.account, stored.scope);
+    const tokens = await this.issueTokens(stored.account, { scope: stored.scope });
     return {
       accessToken: tokens.accessToken,
       refreshToken: tokens.refreshToken,
@@ -1487,6 +1546,7 @@ export class AuthService {
 
   private async recordLoginHistory(
     account: Account,
+    sessionRole: AccountRole,
     source: LoginEventSource,
     meta?: RequestMeta,
   ) {
@@ -1494,10 +1554,117 @@ export class AuthService {
     await this.prisma.loginHistory.create({
       data: {
         accountId: account.id,
-        role: account.role,
+        role: sessionRole,
         source,
         ipAddress,
         userAgent: meta?.userAgent ?? null,
+      },
+    });
+  }
+
+  async getLoginHistory(authUserId: string, limit = 20) {
+    const safeLimit = Math.min(Math.max(limit, 1), 50);
+    return this.prisma.loginHistory.findMany({
+      where: { accountId: authUserId },
+      orderBy: { createdAt: 'desc' },
+      take: safeLimit,
+      select: {
+        id: true,
+        role: true,
+        source: true,
+        ipAddress: true,
+        userAgent: true,
+        createdAt: true,
+      },
+    });
+  }
+
+  private async buildIdentitySnapshot(
+    account: Account,
+    doctorId: string | null,
+    patientId: string | null,
+  ) {
+    const email = account.email?.trim().toLowerCase() ?? null;
+    const phoneNumber = account.phoneNumber ?? null;
+    let doctorDocumentNumber: string | null = null;
+    let doctorDocumentType: string | null = null;
+    let patientDocumentNumber: string | null = null;
+    let patientDocumentType: string | null = null;
+
+    if (doctorId) {
+      const rows = await this.prisma.$queryRaw<
+        Array<{ documentNumber: string | null; legalDocumentType: string | null }>
+      >`SELECT "documentNumber", "legalDocumentType" FROM "doctors"."Doctor" WHERE "id" = ${doctorId}`;
+      doctorDocumentNumber = rows[0]?.documentNumber ?? null;
+      doctorDocumentType = rows[0]?.legalDocumentType ?? null;
+    }
+
+    if (patientId) {
+      const rows = await this.prisma.$queryRaw<
+        Array<{ documentNumber: string | null; documentType: string | null }>
+      >`SELECT "documentNumber", "documentType" FROM "users"."Patient" WHERE "id" = ${patientId}`;
+      patientDocumentNumber = rows[0]?.documentNumber ?? null;
+      patientDocumentType = rows[0]?.documentType ?? null;
+    }
+
+    return {
+      email,
+      phoneNumber,
+      doctorId,
+      patientId,
+      doctorDocumentNumber,
+      doctorDocumentType,
+      patientDocumentNumber,
+      patientDocumentType,
+    };
+  }
+
+  private async recordIdentityReuse(
+    account: Account,
+    email: string,
+    phoneNumber: string,
+  ) {
+    const matches = await this.prisma.$queryRaw<
+      Array<{ id: string; accountId: string; detailsJson: unknown }>
+    >`
+      SELECT "id", "accountId", "detailsJson"
+      FROM "AccountDeletionAudit"
+      WHERE ("detailsJson"->'identity'->>'email' = ${email})
+         OR ("detailsJson"->'identity'->>'phoneNumber' = ${phoneNumber})
+      ORDER BY "createdAt" DESC
+      LIMIT 1
+    `;
+
+    const match = matches[0];
+    if (!match) {
+      return;
+    }
+
+    const details =
+      typeof match.detailsJson === 'object' && match.detailsJson !== null
+        ? (match.detailsJson as { identity?: Record<string, unknown> })
+        : undefined;
+    const identity = details?.identity ?? {};
+    const matchedBy =
+      identity.email === email
+        ? 'EMAIL'
+        : identity.phoneNumber === phoneNumber
+          ? 'PHONE'
+          : 'UNKNOWN';
+    const matchedValue =
+      matchedBy === 'EMAIL'
+        ? email
+        : matchedBy === 'PHONE'
+          ? phoneNumber
+          : null;
+
+    await this.prisma.accountIdentityReuseAudit.create({
+      data: {
+        accountId: account.id,
+        previousAccountId: match.accountId,
+        previousDeletionAuditId: match.id,
+        matchedBy,
+        matchedValue,
       },
     });
   }
@@ -1568,6 +1735,7 @@ export class AuthService {
     const doctorId = account.doctorId ?? (account.role === AccountRole.DOCTOR ? account.subjectId ?? null : null);
     const patientId = account.role === AccountRole.PATIENT ? account.subjectId ?? null : null;
     const deletedAt = new Date();
+    const identitySnapshot = await this.buildIdentitySnapshot(account, doctorId, patientId);
 
     logs.push(
       await this.runDeletionStep('auth', async () => {
@@ -1611,6 +1779,7 @@ export class AuthService {
         const clinicAdmins = Number(
           await this.prisma.$executeRaw`DELETE FROM "ClinicAdmin" WHERE "accountId" = ${account.id}`,
         );
+        const deletedEmail = `deleted+${account.id}+${randomUUID()}@meusalud.local`;
         const accountUpdated = Number(
           await this.prisma.$executeRaw`
             UPDATE "Account"
@@ -1618,6 +1787,7 @@ export class AuthService {
               "status" = CAST('LOCKED' AS "AccountStatus"),
               "passwordHash" = ${randomHash},
               "salt" = ${randomSalt},
+              "email" = ${deletedEmail},
               "phoneNumber" = NULL,
               "twoFactorEnabled" = FALSE,
               "twoFactorSecret" = NULL,
@@ -1650,6 +1820,9 @@ export class AuthService {
           const blocks = Number(
             await this.prisma.$executeRaw`DELETE FROM "users"."PatientDoctorBlock" WHERE "patientId" = ${patientId}`,
           );
+          const doctorNotes = Number(
+            await this.prisma.$executeRaw`DELETE FROM "users"."PatientDoctorNote" WHERE "patientId" = ${patientId}`,
+          );
           const insurers = Number(
             await this.prisma.$executeRaw`DELETE FROM "users"."PatientInsurer" WHERE "patientId" = ${patientId}`,
           );
@@ -1672,6 +1845,8 @@ export class AuthService {
                 "ownerPatientId" = NULL,
                 "gender" = NULL,
                 "birthDate" = NULL,
+                "documentType" = NULL,
+                "documentNumber" = NULL,
                 "patientType" = CAST('NONE' AS "users"."PatientType"),
                 "insuranceName" = NULL,
                 "insuranceCard" = NULL,
@@ -1696,6 +1871,7 @@ export class AuthService {
           return {
             owners,
             blocks,
+            doctorNotes,
             insurers,
             contacts,
             addresses,
@@ -1716,7 +1892,10 @@ export class AuthService {
           const blocks = Number(
             await this.prisma.$executeRaw`DELETE FROM "users"."PatientDoctorBlock" WHERE "doctorId" = ${doctorId}`,
           );
-          return { owners, blocks };
+          const doctorNotes = Number(
+            await this.prisma.$executeRaw`DELETE FROM "users"."PatientDoctorNote" WHERE "doctorId" = ${doctorId}`,
+          );
+          return { owners, blocks, doctorNotes };
         }),
       );
 
@@ -1764,7 +1943,11 @@ export class AuthService {
             await this.prisma.$executeRaw`
               UPDATE "doctors"."Doctor"
               SET
+                "email" = NULL,
                 "phoneNumber" = NULL,
+                "documentNumber" = NULL,
+                "legalDocumentType" = NULL,
+                "licenseNumbers" = CAST('{}' AS TEXT[]),
                 "birthCity" = NULL,
                 "birthProvince" = NULL,
                 "nationality" = NULL,
@@ -2242,7 +2425,10 @@ export class AuthService {
         requestUserAgent: meta?.userAgent ?? null,
         requestedAt: deletedAt,
         deletedAt,
-        detailsJson: logs,
+        detailsJson: {
+          identity: identitySnapshot,
+          logs,
+        },
         error,
       },
     });
@@ -2455,12 +2641,7 @@ export class AuthService {
       return account;
     }
 
-    let patientId = await this.findPatientIdByAuthUserId(account.id);
-    if (!patientId) {
-      const inferredName = this.inferPatientNameFromEmail(account.email);
-      patientId = await this.createPatientForAccount(account, inferredName.firstName, inferredName.lastName);
-    }
-
+    const patientId = await this.resolvePatientIdForSession(account);
     return this.prisma.account.update({
       where: { id: account.id },
       data: { subjectId: patientId },
@@ -2475,17 +2656,56 @@ export class AuthService {
     return trimmed;
   }
 
-  private async createTwoFactorChallenge(accountId: string) {
+  private async createTwoFactorChallenge(
+    accountId: string,
+    sessionRole?: AccountRole,
+  ) {
     const id = nanoid(48);
     const expiresAt = new Date(Date.now() + this.challengeTtl * 1000);
     return this.prisma.twoFactorChallenge.create({
       data: {
         id,
         accountId,
+        sessionRole,
         method: TwoFactorMethod.TOTP,
         expiresAt,
       },
     });
+  }
+
+  private resolveSessionRole(account: Account, requestedRole?: AccountRole) {
+    if (!requestedRole) {
+      return account.role;
+    }
+    if (requestedRole === account.role) {
+      return requestedRole;
+    }
+    if (requestedRole === AccountRole.PATIENT && account.role === AccountRole.DOCTOR) {
+      return requestedRole;
+    }
+    throw new BadRequestException('Rol no permitido para esta cuenta');
+  }
+
+  private async resolvePatientIdForSession(
+    account: Account,
+    sessionSubjectId?: string | null,
+  ) {
+    if (sessionSubjectId) {
+      return sessionSubjectId;
+    }
+    if (account.role === AccountRole.PATIENT && account.subjectId) {
+      return account.subjectId;
+    }
+    let patientId = await this.findPatientIdByAuthUserId(account.id);
+    if (!patientId) {
+      const inferredName = this.inferPatientNameFromEmail(account.email);
+      patientId = await this.createPatientForAccount(
+        account,
+        inferredName.firstName,
+        inferredName.lastName,
+      );
+    }
+    return patientId;
   }
 
   private async findRefreshToken(refreshToken: string) {
