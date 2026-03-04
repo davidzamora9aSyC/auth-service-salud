@@ -29,7 +29,7 @@ import { LoginDto } from './dto/login.dto';
 import { RegisterCollaboratorDto } from './dto/register-collaborator.dto';
 import { VerifyTwoFactorDto } from './dto/verify-two-factor.dto';
 import { authenticator } from 'otplib';
-import { decode, sign, SignOptions, verify } from 'jsonwebtoken';
+import { decode, sign, SignOptions, verify, TokenExpiredError } from 'jsonwebtoken';
 import { nanoid } from 'nanoid';
 import { TwoFactorSetupDto } from './dto/two-factor-setup.dto';
 import { TwoFactorCodeDto } from './dto/two-factor-code.dto';
@@ -81,7 +81,6 @@ export class AuthService {
   private readonly googleStateTtl: number;
   private readonly googleSuccessRedirect?: string;
   private readonly googleErrorRedirect?: string;
-  private readonly googleStateStore = new Map<string, { role: AccountRole; redirect?: string; createdAt: number }>();
   private readonly appleClientId?: string;
   private readonly appleTeamId?: string;
   private readonly appleKeyId?: string;
@@ -93,7 +92,6 @@ export class AuthService {
   private readonly applePrivateKey?: string;
   private readonly usersBaseUrl: string;
   private readonly clinicsInternalBaseUrl: string;
-  private readonly appleStateStore = new Map<string, { role: AccountRole; redirect?: string; createdAt: number }>();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -988,10 +986,8 @@ export class AuthService {
       throw new ServiceUnavailableException('Google OAuth no está configurado');
     }
     const role = this.parseRole(roleInput);
-    const state = nanoid(48);
-    const createdAt = Date.now();
     const sanitizedRedirect = this.sanitizeRedirect(redirect, this.googleSuccessRedirect);
-    this.googleStateStore.set(state, { role, redirect: sanitizedRedirect, createdAt });
+    const state = this.createOAuthState({ role, redirect: sanitizedRedirect }, this.googleStateTtl, 'google');
     const params = new URLSearchParams({
       client_id: this.googleClientId,
       redirect_uri: this.googleRedirectUri,
@@ -1005,117 +1001,125 @@ export class AuthService {
   }
 
   async handleGoogleOAuthCallback(code?: string, state?: string, meta?: RequestMeta) {
-    if (!code || !state) {
-      throw new BadRequestException('Missing OAuth code or state');
-    }
-    const entry = this.googleStateStore.get(state);
-    this.googleStateStore.delete(state);
-    if (!entry) {
-      throw new UnauthorizedException('OAuth state inválido');
-    }
-    if (Date.now() - entry.createdAt > this.googleStateTtl * 1000) {
-      throw new UnauthorizedException('OAuth state expirado');
-    }
-    if (!this.googleClientId || !this.googleClientSecret || !this.googleRedirectUri) {
-      throw new ServiceUnavailableException('Google OAuth no está configurado');
-    }
+    try {
+      if (!code || !state) {
+        throw new BadRequestException('Missing OAuth code or state');
+      }
+      const entry = this.verifyOAuthState(state, 'google');
+      if (!this.googleClientId || !this.googleClientSecret || !this.googleRedirectUri) {
+        throw new ServiceUnavailableException('Google OAuth no est?? configurado');
+      }
 
-    const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        code,
-        client_id: this.googleClientId,
-        client_secret: this.googleClientSecret,
-        redirect_uri: this.googleRedirectUri,
-        grant_type: 'authorization_code',
-      }),
-    });
-    if (!tokenResponse.ok) {
-      const errorText = await tokenResponse.text();
-      this.logger.error(`Google OAuth token error: ${errorText}`);
-      return this.buildOauthErrorResult('No fue posible validar Google');
-    }
-    const tokenPayload = (await tokenResponse.json()) as {
-      access_token?: string;
-      id_token?: string;
-      expires_in?: number;
-      scope?: string;
-      token_type?: string;
-    };
-    if (!tokenPayload.access_token) {
-      return this.buildOauthErrorResult('Google no devolvió access token');
-    }
-
-    const userinfoResponse = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-      headers: {
-        Authorization: `Bearer ${tokenPayload.access_token}`,
-      },
-    });
-    if (!userinfoResponse.ok) {
-      const errorText = await userinfoResponse.text();
-      this.logger.error(`Google userinfo error: ${errorText}`);
-      return this.buildOauthErrorResult('No fue posible obtener datos de Google');
-    }
-    const profile = (await userinfoResponse.json()) as {
-      sub?: string;
-      email?: string;
-      email_verified?: boolean;
-      name?: string;
-    };
-
-    if (!profile.email) {
-      return this.buildOauthErrorResult('Google no devolvió email');
-    }
-    if (profile.email_verified === false) {
-      return this.buildOauthErrorResult('Email de Google no verificado');
-    }
-
-    const normalizedEmail = profile.email.trim().toLowerCase();
-    const existing = await this.prisma.account.findUnique({
-      where: { email: normalizedEmail },
-    });
-    if (existing && existing.role !== entry.role) {
-      throw new ConflictException('Email ya registrado con otro rol');
-    }
-    let account = existing;
-    if (!account) {
-      const salt = randomBytes(24).toString('hex');
-      const passwordHash = await argon2.hash(randomBytes(32).toString('hex') + salt, {
-        type: argon2.argon2id,
+      const tokenResponse = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          code,
+          client_id: this.googleClientId,
+          client_secret: this.googleClientSecret,
+          redirect_uri: this.googleRedirectUri,
+          grant_type: 'authorization_code',
+        }),
       });
-      const doctorId =
-        entry.role === AccountRole.DOCTOR ? randomUUID() : null;
-      const onboardingStatus =
-        entry.role === AccountRole.DOCTOR || entry.role === AccountRole.CLINIC
-          ? OnboardingStatus.PENDING
-          : OnboardingStatus.COMPLETE;
-      account = await this.prisma.account.create({
-        data: {
-          email: normalizedEmail,
-          passwordHash,
-          salt,
-          role: entry.role,
-          subjectId: profile.sub ?? null,
-          phoneNumber: null,
-          doctorId,
-          onboardingStatus,
+      if (!tokenResponse.ok) {
+        const errorText = await tokenResponse.text();
+        this.logger.error(`Google OAuth token error: ${errorText}`);
+        return this.buildOauthErrorResult('No fue posible validar Google', this.googleErrorRedirect, this.googleSuccessRedirect);
+      }
+      const tokenPayload = (await tokenResponse.json()) as {
+        access_token?: string;
+        id_token?: string;
+        expires_in?: number;
+        scope?: string;
+        token_type?: string;
+      };
+      if (!tokenPayload.access_token) {
+        return this.buildOauthErrorResult('Google no devolvi?? access token', this.googleErrorRedirect, this.googleSuccessRedirect);
+      }
+
+      const userinfoResponse = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+        headers: {
+          Authorization: `Bearer ${tokenPayload.access_token}`,
         },
       });
-      await this.publishUserRegisteredEvent(account);
-    }
+      if (!userinfoResponse.ok) {
+        const errorText = await userinfoResponse.text();
+        this.logger.error(`Google userinfo error: ${errorText}`);
+        return this.buildOauthErrorResult('No fue posible obtener datos de Google', this.googleErrorRedirect, this.googleSuccessRedirect);
+      }
+      const profile = (await userinfoResponse.json()) as {
+        sub?: string;
+        email?: string;
+        email_verified?: boolean;
+        name?: string;
+      };
 
-    const tokens = await this.issueTokens(account);
-    await this.recordLoginHistory(account, account.role, LoginEventSource.OAUTH_GOOGLE, meta);
-    const redirect = entry.redirect ?? this.googleSuccessRedirect;
-    if (redirect) {
-      const url = new URL(redirect);
-      url.searchParams.set('accessToken', tokens.accessToken);
-      url.searchParams.set('refreshToken', tokens.refreshToken);
-      url.searchParams.set('expiresIn', String(tokens.accessTokenExpiresIn));
-      return { redirect: url.toString(), payload: null };
+      if (!profile.email) {
+        return this.buildOauthErrorResult('Google no devolvi?? email', this.googleErrorRedirect, this.googleSuccessRedirect);
+      }
+      if (profile.email_verified === false) {
+        return this.buildOauthErrorResult('Email de Google no verificado', this.googleErrorRedirect, this.googleSuccessRedirect);
+      }
+
+      const normalizedEmail = profile.email.trim().toLowerCase();
+      const existing = await this.prisma.account.findUnique({
+        where: { email: normalizedEmail },
+      });
+      const allowDoctorToPatient =
+        Boolean(existing) &&
+        existing?.role === AccountRole.DOCTOR &&
+        entry.role === AccountRole.PATIENT;
+      if (existing && existing.role !== entry.role && !allowDoctorToPatient) {
+        throw new ConflictException('Email ya registrado con otro rol');
+      }
+      let account = existing;
+      if (!account) {
+        const salt = randomBytes(24).toString('hex');
+        const passwordHash = await argon2.hash(randomBytes(32).toString('hex') + salt, {
+          type: argon2.argon2id,
+        });
+        const doctorId =
+          entry.role === AccountRole.DOCTOR ? randomUUID() : null;
+        const onboardingStatus =
+          entry.role === AccountRole.DOCTOR || entry.role === AccountRole.CLINIC
+            ? OnboardingStatus.PENDING
+            : OnboardingStatus.COMPLETE;
+        account = await this.prisma.account.create({
+          data: {
+            email: normalizedEmail,
+            passwordHash,
+            salt,
+            role: entry.role,
+            subjectId: profile.sub ?? null,
+            phoneNumber: null,
+            doctorId,
+            onboardingStatus,
+          },
+        });
+        await this.publishUserRegisteredEvent(account);
+      }
+
+      const sessionRole =
+        allowDoctorToPatient && account?.role === AccountRole.DOCTOR
+          ? AccountRole.PATIENT
+          : account.role;
+      const tokens = await this.issueTokens(account, { sessionRole });
+      await this.recordLoginHistory(account, sessionRole, LoginEventSource.OAUTH_GOOGLE, meta);
+      const redirect = entry.redirect ?? this.googleSuccessRedirect;
+      if (redirect) {
+        const url = new URL(redirect);
+        url.searchParams.set('accessToken', tokens.accessToken);
+        url.searchParams.set('refreshToken', tokens.refreshToken);
+        url.searchParams.set('expiresIn', String(tokens.accessTokenExpiresIn));
+        return { redirect: url.toString(), payload: null };
+      }
+      return { redirect: null, payload: tokens };
+    } catch (error) {
+      if (error instanceof BadRequestException || error instanceof UnauthorizedException || error instanceof ConflictException) {
+        return this.buildOauthErrorResult(error.message, this.googleErrorRedirect, this.googleSuccessRedirect);
+      }
+      throw error;
     }
-    return { redirect: null, payload: tokens };
   }
 
   getAppleOAuthUrl(roleInput: string, redirect?: string) {
@@ -1123,10 +1127,8 @@ export class AuthService {
       throw new ServiceUnavailableException('Apple OAuth no está configurado');
     }
     const role = this.parseRole(roleInput);
-    const state = nanoid(48);
-    const createdAt = Date.now();
     const sanitizedRedirect = this.sanitizeRedirect(redirect, this.appleSuccessRedirect);
-    this.appleStateStore.set(state, { role, redirect: sanitizedRedirect, createdAt });
+    const state = this.createOAuthState({ role, redirect: sanitizedRedirect }, this.appleStateTtl, 'apple');
     const params = new URLSearchParams({
       client_id: this.appleClientId,
       redirect_uri: this.appleRedirectUri,
@@ -1142,14 +1144,7 @@ export class AuthService {
     if (!code || !state) {
       throw new BadRequestException('Missing OAuth code or state');
     }
-    const entry = this.appleStateStore.get(state);
-    this.appleStateStore.delete(state);
-    if (!entry) {
-      throw new UnauthorizedException('OAuth state inválido');
-    }
-    if (Date.now() - entry.createdAt > this.appleStateTtl * 1000) {
-      throw new UnauthorizedException('OAuth state expirado');
-    }
+    const entry = this.verifyOAuthState(state, 'apple');
     if (!this.appleClientId || !this.appleRedirectUri || !this.appleTeamId || !this.appleKeyId || !this.applePrivateKey) {
       throw new ServiceUnavailableException('Apple OAuth no está configurado');
     }
@@ -1193,7 +1188,11 @@ export class AuthService {
     const existing = await this.prisma.account.findUnique({
       where: { email: normalizedEmail },
     });
-    if (existing && existing.role !== entry.role) {
+    const allowDoctorToPatient =
+      Boolean(existing) &&
+      existing?.role === AccountRole.DOCTOR &&
+      entry.role === AccountRole.PATIENT;
+    if (existing && existing.role !== entry.role && !allowDoctorToPatient) {
       throw new ConflictException('Email ya registrado con otro rol');
     }
     let account = existing;
@@ -1223,8 +1222,12 @@ export class AuthService {
       await this.publishUserRegisteredEvent(account);
     }
 
-    const tokens = await this.issueTokens(account);
-    await this.recordLoginHistory(account, account.role, LoginEventSource.OAUTH_APPLE, meta);
+    const sessionRole =
+      allowDoctorToPatient && account?.role === AccountRole.DOCTOR
+        ? AccountRole.PATIENT
+        : account.role;
+    const tokens = await this.issueTokens(account, { sessionRole });
+    await this.recordLoginHistory(account, sessionRole, LoginEventSource.OAUTH_APPLE, meta);
     const redirect = entry.redirect ?? this.appleSuccessRedirect;
     if (redirect) {
       const url = new URL(redirect);
@@ -2492,6 +2495,47 @@ export class AuthService {
       return redirect;
     }
     return undefined;
+  }
+
+  private createOAuthState(
+    payload: { role: AccountRole; redirect?: string },
+    ttlSeconds: number,
+    provider: 'google' | 'apple',
+  ) {
+    return sign(
+      {
+        role: payload.role,
+        redirect: payload.redirect ?? undefined,
+        provider,
+      },
+      this.privateKey,
+      {
+        algorithm: 'RS256',
+        expiresIn: ttlSeconds,
+        keyid: 'meusalud-auth',
+        issuer: 'meusalud-auth',
+        audience: `${provider}-oauth-state`,
+      },
+    );
+  }
+
+  private verifyOAuthState(state: string, provider: 'google' | 'apple') {
+    try {
+      const decoded = verify(state, this.publicKey, {
+        algorithms: ['RS256'],
+        issuer: 'meusalud-auth',
+        audience: `${provider}-oauth-state`,
+      }) as { role?: AccountRole; redirect?: string; provider?: string };
+      if (!decoded?.role || decoded.provider !== provider) {
+        throw new UnauthorizedException('OAuth state invÃ¡lido');
+      }
+      return { role: decoded.role, redirect: decoded.redirect };
+    } catch (error) {
+      if (error instanceof TokenExpiredError) {
+        throw new UnauthorizedException('OAuth state expirado');
+      }
+      throw new UnauthorizedException('OAuth state invÃ¡lido');
+    }
   }
 
   private buildOauthErrorResult(message: string, errorRedirect?: string, successRedirect?: string) {
