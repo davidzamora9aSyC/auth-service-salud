@@ -14,6 +14,7 @@ import { RecoveryCompleteDto } from './dto/recovery-complete.dto';
 import { BootstrapAdminDto } from './dto/bootstrap-admin.dto';
 import { AccountDeletionStartDto } from './dto/account-deletion-start.dto';
 import { AccountDeletionConfirmDto } from './dto/account-deletion-confirm.dto';
+import { ImpersonateDoctorDto } from './dto/impersonate-doctor.dto';
 
 @Controller('auth')
 export class AuthController {
@@ -130,6 +131,18 @@ export class AuthController {
       dto,
       this.buildRequestMeta(req),
     );
+  }
+
+  @Post('internal/impersonate/doctor')
+  impersonateDoctor(
+    @Body() dto: ImpersonateDoctorDto,
+    @Headers('x-api-key') apiKey?: string,
+  ) {
+    const expected = process.env.AUTH_INTERNAL_API_KEY;
+    if (expected && apiKey !== expected) {
+      throw new UnauthorizedException('No autorizado');
+    }
+    return this.authService.impersonateDoctor(dto.doctorId);
   }
 
   @Get('oauth/google')

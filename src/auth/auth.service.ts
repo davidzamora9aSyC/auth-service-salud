@@ -5,6 +5,7 @@ import {
   Logger,
   ServiceUnavailableException,
   UnauthorizedException,
+  NotFoundException,
 } from '@nestjs/common';
 import {
   Account,
@@ -623,6 +624,19 @@ export class AuthService {
     }
     await this.revokeRefreshToken(refreshToken);
     return { success: true };
+  }
+
+  async impersonateDoctor(doctorId: string) {
+    const account = await this.prisma.account.findFirst({
+      where: { doctorId },
+    });
+    if (!account) {
+      throw new NotFoundException('Doctor no encontrado');
+    }
+    if (account.status !== AccountStatus.ACTIVE) {
+      throw new UnauthorizedException('Cuenta inactiva');
+    }
+    return this.issueTokens(account, { sessionRole: AccountRole.DOCTOR });
   }
 
   async startPasswordRecovery(dto: RecoveryStartDto) {

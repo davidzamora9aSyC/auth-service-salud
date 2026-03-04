@@ -140,7 +140,7 @@ export class NotificationsService {
     const portalUrl =
       this.config.get<string>('PATIENT_PORTAL_URL') ??
       this.config.get<string>('DOCTOR_PORTAL_URL') ??
-      'https://front-meu-salud.vercel.app';
+      'https://meudoc.co';
     const headerImageUrl =
       this.config.get<string>('RECOVERY_EMAIL_HEADER_IMAGE_URL') ??
       this.config.get<string>('NOTIFICATIONS_BRAND_IMAGE_URL') ??
@@ -291,7 +291,7 @@ export class NotificationsService {
     const portalUrl =
       this.config.get<string>('PATIENT_PORTAL_URL') ??
       this.config.get<string>('DOCTOR_PORTAL_URL') ??
-      'https://front-meu-salud.vercel.app';
+      'https://meudoc.co';
 
     const safeName = this.escapeHtml(input.name);
     const safeCode = this.escapeHtml(input.code);

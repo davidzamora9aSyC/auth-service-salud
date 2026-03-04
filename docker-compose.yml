@@ -53,6 +53,7 @@
       DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=notification
       RABBITMQ_QUEUE_AUTH: comms.q.auth
       RABBITMQ_EXCHANGE_AUTH: auth.events
+      RABBITMQ_EXCHANGE_COMMUNICATION: communication.events
       WELCOME_TEMPLATE_PATIENT: bienvenida_pacientes
       WELCOME_TEMPLATE_DOCTOR: bienvenida_doctor
       WELCOME_TEMPLATE_CLINIC: bienvenida_clinica
@@ -61,6 +62,36 @@
       - "3006:3006"
     depends_on:
       - db
+
+  ai-assistant-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-ai-assistant-service:${IMAGE_TAG:-latest}
+    build:
+      context: ../ai-assistant-service
+    env_file:
+      - ../ai-assistant-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=ai
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
+      RABBITMQ_EXCHANGE_COMMUNICATION: communication.events
+      RABBITMQ_QUEUE_WHATSAPP_INBOUND: ai.q.whatsapp.inbound
+      RABBITMQ_ROUTINGKEY_WHATSAPP_INBOUND: whatsapp.inbound
+      RABBITMQ_EXCHANGE_AI: ai.events
+      GATEWAY_BASE_URL: http://meusaludgateway:3020
+      AUTH_INTERNAL_BASE_URL: http://auth-service:3000/authms
+      AUTH_INTERNAL_API_KEY: ""
+      OPENAI_API_KEY: ""
+      AI_MODEL: gpt-4o-mini
+      AI_USAGE_PRICE_INPUT: 0
+      AI_USAGE_PRICE_OUTPUT: 0
+      META_WHATSAPP_TOKEN: ""
+      META_WHATSAPP_API_BASE_URL: https://graph.facebook.com
+      META_WHATSAPP_API_VERSION: v22.0
+      META_WHATSAPP_WABA_ID: ""
+    ports:
+      - "3030:3030"
+    depends_on:
+      - db
+      - communication-service
 
   users-service:
     image: ${DOCKERHUB_USERNAME:-local}/meusalud-users-service:${IMAGE_TAG:-latest}
@@ -233,6 +264,7 @@
     environment:
       CORS_ALLOWED_ORIGINS: http://localhost:3000,http://localhost:3001,http://localhost:5173,http://localhost:3007,https://front-meu-salud.vercel.app
       CLINICS_BASE_URL: http://clinics-service:3025
+      AI_BASE_URL: http://ai-assistant-service:3030
     ports:
       - "3020:3020"
     depends_on:
