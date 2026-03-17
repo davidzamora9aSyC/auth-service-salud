@@ -36,6 +36,7 @@ export class DoctorsConsumer implements OnModuleInit, OnModuleDestroy {
       await this.channel.assertQueue(queue, { durable: true });
       await this.channel.bindQueue(queue, exchange, 'doctors.profile_completed');
       await this.channel.bindQueue(queue, exchange, 'doctors.onboarding_completed');
+      await this.channel.bindQueue(queue, exchange, 'doctors.phone_updated');
       await this.channel.prefetch(5);
       await this.channel.consume(queue, (msg) => this.handleMessage(msg), {
         noAck: false,
@@ -62,13 +63,39 @@ export class DoctorsConsumer implements OnModuleInit, OnModuleDestroy {
         data?: Record<string, unknown>;
       };
 
-      if (payload.type !== 'DoctorProfileCompleted' && payload.type !== 'DoctorOnboardingCompleted') {
+      if (
+        payload.type !== 'DoctorProfileCompleted' &&
+        payload.type !== 'DoctorOnboardingCompleted' &&
+        payload.type !== 'DoctorPhoneUpdated'
+      ) {
         this.channel.ack(msg);
         return;
       }
 
       const authUserId = String(payload.data?.authUserId ?? '');
       const doctorId = String(payload.data?.doctorId ?? '');
+      if (payload.type === 'DoctorPhoneUpdated') {
+        const phoneNumber = String(payload.data?.phoneNumber ?? '').trim();
+        if (!authUserId || !phoneNumber) {
+          this.channel.ack(msg);
+          return;
+        }
+        const updated = await this.prisma.account.updateMany({
+          where: {
+            id: authUserId,
+            role: AccountRole.DOCTOR,
+          },
+          data: {
+            phoneNumber,
+          },
+        });
+        if (updated.count === 0) {
+          this.logger.warn(`No se actualizo telefono para ${authUserId}`);
+        }
+        this.channel.ack(msg);
+        return;
+      }
+
       if (!authUserId || !doctorId) {
         this.channel.ack(msg);
         return;

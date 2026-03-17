@@ -41,8 +41,7 @@ export class NotificationsService {
     const templateKey =
       this.config.get<string>('WELCOME_WHATSAPP_TEMPLATE_KEY') ??
       'MEUSALUD_WELCOME';
-    const fallbackName =
-      input.email.split('@')[0]?.trim() || 'Profesional MeuSalud';
+    const fallbackName = 'Usuario MeuSalud';
     const payload: WhatsappPayload = {
       to_e164: input.phoneNumber,
       template_code: templateKey,

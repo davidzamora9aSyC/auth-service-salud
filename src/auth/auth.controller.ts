@@ -11,6 +11,8 @@ import { TwoFactorCodeDto } from './dto/two-factor-code.dto';
 import { RecoveryStartDto } from './dto/recovery-start.dto';
 import { RecoveryVerifyDto } from './dto/recovery-verify.dto';
 import { RecoveryCompleteDto } from './dto/recovery-complete.dto';
+import { RecoveryLinkDto } from './dto/recovery-link.dto';
+import { PhoneAvailabilityDto } from './dto/phone-availability.dto';
 import { BootstrapAdminDto } from './dto/bootstrap-admin.dto';
 import { AccountDeletionStartDto } from './dto/account-deletion-start.dto';
 import { AccountDeletionConfirmDto } from './dto/account-deletion-confirm.dto';
@@ -96,6 +98,11 @@ export class AuthController {
     return this.authService.verifyPasswordRecovery(dto);
   }
 
+  @Post('recovery/magic')
+  verifyRecoveryLink(@Body() dto: RecoveryLinkDto) {
+    return this.authService.verifyPasswordRecoveryLink(dto);
+  }
+
   @Post('recovery/complete')
   completeRecovery(@Body() dto: RecoveryCompleteDto) {
     return this.authService.completePasswordRecovery(dto);
@@ -143,6 +150,18 @@ export class AuthController {
       throw new UnauthorizedException('No autorizado');
     }
     return this.authService.impersonateDoctor(dto.doctorId);
+  }
+
+  @Post('internal/phone/availability')
+  checkPhoneAvailability(
+    @Body() dto: PhoneAvailabilityDto,
+    @Headers('x-api-key') apiKey?: string,
+  ) {
+    const expected = process.env.AUTH_INTERNAL_API_KEY;
+    if (expected && apiKey !== expected) {
+      throw new UnauthorizedException('No autorizado');
+    }
+    return this.authService.checkPhoneAvailability(dto);
   }
 
   @Get('oauth/google')

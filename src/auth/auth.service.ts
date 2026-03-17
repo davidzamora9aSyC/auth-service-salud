@@ -38,6 +38,8 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { RecoveryStartDto } from './dto/recovery-start.dto';
 import { RecoveryVerifyDto } from './dto/recovery-verify.dto';
 import { RecoveryCompleteDto } from './dto/recovery-complete.dto';
+import { RecoveryLinkDto } from './dto/recovery-link.dto';
+import { PhoneAvailabilityDto } from './dto/phone-availability.dto';
 import { OAuthAuthorizeDto } from './dto/oauth-authorize.dto';
 import { OAuthTokenDto } from './dto/oauth-token.dto';
 import { RabbitmqService } from './rabbitmq.service';
@@ -92,6 +94,7 @@ export class AuthService {
   private readonly appleErrorRedirect?: string;
   private readonly applePrivateKey?: string;
   private readonly usersBaseUrl: string;
+  private readonly doctorsBaseUrl: string;
   private readonly clinicsInternalBaseUrl: string;
 
   constructor(
@@ -191,6 +194,9 @@ export class AuthService {
     this.usersBaseUrl =
       this.config.get<string>('USERS_BASE_URL') ??
       'http://users-service:3008/usersms';
+    this.doctorsBaseUrl =
+      this.config.get<string>('DOCTORS_BASE_URL') ??
+      'http://doctors-service:3009/doctorsms';
     this.clinicsInternalBaseUrl =
       this.config.get<string>('CLINICS_INTERNAL_BASE_URL') ??
       'http://clinics-service:3025/clinicsms';
@@ -658,6 +664,7 @@ export class AuthService {
     if (!account) {
       throw new BadRequestException('No hay cuenta para los datos suministrados');
     }
+    await this.ensureRecoveryProfile(account);
 
     await this.prisma.passwordRecovery.deleteMany({
       where: { accountId: account.id },
@@ -666,22 +673,28 @@ export class AuthService {
     const code = this.generateRecoveryCode();
     const codeHash = this.hashToken(code);
     const expiresAt = new Date(Date.now() + this.recoveryCodeTtl * 1000);
+    const magicToken = randomBytes(48).toString('hex');
+    const magicTokenHash = this.hashToken(magicToken);
+    const magicExpiresAt = new Date(Date.now() + this.recoveryCodeTtl * 1000);
     const recovery = await this.prisma.passwordRecovery.create({
       data: {
         accountId: account.id,
         codeHash,
         expiresAt,
+        magicTokenHash,
+        magicExpiresAt,
       },
     });
 
-    const name = account.email.split('@')[0]?.trim() || 'Paciente MeuSalud';
+      const name = await this.resolveRecoveryName(account);
+    const recoveryLink = this.buildRecoveryLink(this.recoveryLinkBase, magicToken);
 
     if (normalizedEmail) {
       await this.notifications.sendPasswordRecoveryEmail({
         email: account.email,
         name,
         code,
-        link: this.recoveryLinkBase,
+        link: recoveryLink,
         ttlSeconds: this.recoveryCodeTtl,
       });
     } else if (account.phoneNumber) {
@@ -689,7 +702,7 @@ export class AuthService {
         phoneNumber: account.phoneNumber,
         name,
         code,
-        link: this.recoveryLinkBase,
+        link: recoveryLink,
         ttlSeconds: this.recoveryCodeTtl,
       });
     } else {
@@ -734,6 +747,60 @@ export class AuthService {
         resetTokenHash,
         resetExpiresAt,
         verifiedAt: new Date(),
+        magicConsumedAt: recovery.magicConsumedAt ?? new Date(),
+      },
+    });
+
+    return {
+      resetToken,
+      resetExpiresAt: resetExpiresAt.toISOString(),
+    };
+  }
+
+  async checkPhoneAvailability(dto: PhoneAvailabilityDto) {
+    const normalizedPhone = this.normalizePhoneNumber(dto.phoneNumber);
+    const existing = await this.prisma.account.findUnique({
+      where: { phoneNumber: normalizedPhone },
+      select: { id: true },
+    });
+    if (!existing) {
+      return { available: true };
+    }
+    if (dto.authUserId && existing.id === dto.authUserId) {
+      return { available: true };
+    }
+    throw new ConflictException('El numero de telefono ya esta registrado');
+  }
+
+  async verifyPasswordRecoveryLink(dto: RecoveryLinkDto) {
+    const magicTokenHash = this.hashToken(dto.token);
+    const recovery = await this.prisma.passwordRecovery.findFirst({
+      where: { magicTokenHash },
+      include: { account: true },
+    });
+    if (
+      !recovery ||
+      !recovery.magicExpiresAt ||
+      recovery.magicExpiresAt < new Date() ||
+      recovery.magicConsumedAt ||
+      recovery.consumedAt
+    ) {
+      throw new UnauthorizedException('Recovery link expired');
+    }
+
+    const resetToken = randomBytes(48).toString('hex');
+    const resetTokenHash = this.hashToken(resetToken);
+    const resetExpiresAt = new Date(
+      Date.now() + this.recoveryResetTtl * 1000,
+    );
+
+    await this.prisma.passwordRecovery.update({
+      where: { id: recovery.id },
+      data: {
+        resetTokenHash,
+        resetExpiresAt,
+        verifiedAt: new Date(),
+        magicConsumedAt: new Date(),
       },
     });
 
@@ -833,7 +900,7 @@ export class AuthService {
       },
     });
 
-    const name = account.email.split('@')[0]?.trim() || 'Usuario MeuSalud';
+    const name = await this.resolveRecoveryName(account);
     if (channel === AccountDeletionChannel.EMAIL) {
       await this.notifications.sendAccountDeletionEmail({
         email: destination,
@@ -2616,6 +2683,18 @@ export class AuthService {
     return randomInt(0, 1000000).toString().padStart(6, '0');
   }
 
+  private buildRecoveryLink(baseUrl: string, token: string) {
+    const trimmed = baseUrl.trim();
+    if (!trimmed) {
+      return `/recover?token=${encodeURIComponent(token)}`;
+    }
+    const hashIndex = trimmed.indexOf('#');
+    const basePart = hashIndex >= 0 ? trimmed.slice(0, hashIndex) : trimmed;
+    const hashPart = hashIndex >= 0 ? trimmed.slice(hashIndex) : '';
+    const separator = basePart.includes('?') ? '&' : '?';
+    return `${basePart}${separator}token=${encodeURIComponent(token)}${hashPart}`;
+  }
+
   private async createPatientForAccount(account: Account, firstName: string, lastName: string) {
     const fullName = `${firstName} ${lastName}`.trim();
     const response = await fetch(`${this.usersBaseUrl.replace(/\/$/, '')}/patients`, {
@@ -2689,6 +2768,124 @@ export class AuthService {
 
     const data = (await response.json()) as { patientId?: string | null };
     return data?.patientId ?? null;
+  }
+
+  private async resolveRecoveryName(account: Account) {
+    if (account.role === AccountRole.PATIENT) {
+      return this.resolvePatientName(account.id);
+    }
+    if (account.role === AccountRole.DOCTOR) {
+      return this.resolveDoctorName(account.id);
+    }
+    if (account.role === AccountRole.CLINIC) {
+      return this.resolveClinicName(account.id);
+    }
+    return 'Usuario MeuSalud';
+  }
+
+  private async ensureRecoveryProfile(account: Account) {
+    if (account.role === AccountRole.DOCTOR) {
+      const name = await this.resolveDoctorName(account.id);
+      if (!name || name === 'Usuario MeuSalud') {
+        throw new BadRequestException('No se encontro el perfil del doctor');
+      }
+    }
+    if (account.role === AccountRole.CLINIC) {
+      const name = await this.resolveClinicName(account.id);
+      if (!name || name === 'Usuario MeuSalud') {
+        throw new BadRequestException('No se encontro el perfil de la clinica');
+      }
+    }
+  }
+
+  private async resolvePatientName(authUserId: string) {
+    try {
+      const response = await fetch(
+        `${this.usersBaseUrl.replace(/\/$/, '')}/patients/internal/by-auth-user/${encodeURIComponent(authUserId)}`,
+        {
+          headers: {
+            'x-role': 'SYSTEM',
+          },
+        },
+      );
+      if (!response.ok) {
+        const body = await response.text();
+        this.logger.warn(`No se pudo obtener nombre del paciente (status ${response.status}): ${body}`);
+        return 'Usuario MeuSalud';
+      }
+      const data = (await response.json()) as {
+        fullName?: string | null;
+        firstName?: string | null;
+        lastName?: string | null;
+      };
+      return this.composeName(data.fullName, data.firstName, data.lastName);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`No se pudo obtener nombre del paciente: ${message}`);
+      return 'Usuario MeuSalud';
+    }
+  }
+
+  private async resolveDoctorName(authUserId: string) {
+    try {
+      const response = await fetch(
+        `${this.doctorsBaseUrl.replace(/\/$/, '')}/doctors/me?authUserId=${encodeURIComponent(authUserId)}`,
+        {
+          headers: {
+            'x-role': 'SYSTEM',
+          },
+        },
+      );
+      if (!response.ok) {
+        const body = await response.text();
+        this.logger.warn(`No se pudo obtener nombre del doctor (status ${response.status}): ${body}`);
+        return 'Usuario MeuSalud';
+      }
+      const data = (await response.json()) as { fullName?: string | null };
+      return (data.fullName?.trim() || 'Usuario MeuSalud');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`No se pudo obtener nombre del doctor: ${message}`);
+      return 'Usuario MeuSalud';
+    }
+  }
+
+  private async resolveClinicName(authUserId: string) {
+    try {
+      const response = await fetch(
+        `${this.clinicsInternalBaseUrl.replace(/\/$/, '')}/clinics/me/default`,
+        {
+          headers: {
+            'x-role': 'SYSTEM',
+            'x-auth-user-id': authUserId,
+          },
+        },
+      );
+      if (!response.ok) {
+        const body = await response.text();
+        this.logger.warn(`No se pudo obtener nombre de la clinica (status ${response.status}): ${body}`);
+        return 'Usuario MeuSalud';
+      }
+      const data = (await response.json()) as { clinic?: { name?: string | null } | null };
+      return (data.clinic?.name?.trim() || 'Usuario MeuSalud');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`No se pudo obtener nombre de la clinica: ${message}`);
+      return 'Usuario MeuSalud';
+    }
+  }
+
+  private composeName(fullName?: string | null, firstName?: string | null, lastName?: string | null) {
+    const safeFull = fullName?.trim();
+    if (safeFull) {
+      return safeFull;
+    }
+    const composed = [firstName, lastName]
+      .map((value) => value?.trim() || '')
+      .filter(Boolean)
+      .join(' ')
+      .trim();
+    return composed || 'Usuario MeuSalud';
   }
 
   private async ensurePatientSubjectId(account: Account) {

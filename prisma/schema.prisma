@@ -345,14 +345,18 @@ model PasswordRecovery {
   accountId       String
   codeHash        String
   resetTokenHash  String?
+  magicTokenHash  String?
   expiresAt       DateTime
   resetExpiresAt  DateTime?
+  magicExpiresAt  DateTime?
   verifiedAt      DateTime?
   consumedAt      DateTime?
+  magicConsumedAt DateTime?
   attempts        Int      @default(0)
   createdAt       DateTime @default(now())
 
   @@index([accountId])
+  @@index([magicTokenHash])
 }
 
 model OAuthClient {
