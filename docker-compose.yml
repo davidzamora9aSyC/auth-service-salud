@@ -265,6 +265,7 @@
       CORS_ALLOWED_ORIGINS: http://localhost:3000,http://localhost:3001,http://localhost:5173,http://localhost:3007,https://front-meu-salud.vercel.app,http://192.168.1.7:3007,https://hamulate-lakenya-contributively.ngrok-free.dev
       CLINICS_BASE_URL: http://clinics-service:3025
       AI_BASE_URL: http://ai-assistant-service:3030
+      GATEWAY_AI_DEBUG: "true"
     ports:
       - "3020:3020"
     depends_on:

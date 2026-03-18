@@ -17,6 +17,10 @@ import { BootstrapAdminDto } from './dto/bootstrap-admin.dto';
 import { AccountDeletionStartDto } from './dto/account-deletion-start.dto';
 import { AccountDeletionConfirmDto } from './dto/account-deletion-confirm.dto';
 import { ImpersonateDoctorDto } from './dto/impersonate-doctor.dto';
+import { PasswordChangeStartDto } from './dto/password-change-start.dto';
+import { PhoneChangeStartDto } from './dto/phone-change-start.dto';
+import { PhoneChangeVerifyDto } from './dto/phone-change-verify.dto';
+import { PhoneChangeCompleteDto } from './dto/phone-change-complete.dto';
 
 @Controller('auth')
 export class AuthController {
@@ -93,6 +97,17 @@ export class AuthController {
     return this.authService.startPasswordRecovery(dto);
   }
 
+  @Post('recovery/start/me')
+  startRecoveryForAccount(
+    @Body() dto: PasswordChangeStartDto,
+    @Headers('x-auth-user-id') authUserId?: string,
+  ) {
+    if (!authUserId) {
+      throw new UnauthorizedException('Token requerido');
+    }
+    return this.authService.startPasswordRecoveryForAccount(authUserId, dto);
+  }
+
   @Post('recovery/verify')
   verifyRecovery(@Body() dto: RecoveryVerifyDto) {
     return this.authService.verifyPasswordRecovery(dto);
@@ -106,6 +121,39 @@ export class AuthController {
   @Post('recovery/complete')
   completeRecovery(@Body() dto: RecoveryCompleteDto) {
     return this.authService.completePasswordRecovery(dto);
+  }
+
+  @Post('account/phone-change/start')
+  startPhoneChange(
+    @Body() dto: PhoneChangeStartDto,
+    @Headers('x-auth-user-id') authUserId?: string,
+  ) {
+    if (!authUserId) {
+      throw new UnauthorizedException('Token requerido');
+    }
+    return this.authService.startPhoneChange(authUserId, dto);
+  }
+
+  @Post('account/phone-change/verify')
+  verifyPhoneChange(
+    @Body() dto: PhoneChangeVerifyDto,
+    @Headers('x-auth-user-id') authUserId?: string,
+  ) {
+    if (!authUserId) {
+      throw new UnauthorizedException('Token requerido');
+    }
+    return this.authService.verifyPhoneChange(authUserId, dto);
+  }
+
+  @Post('account/phone-change/complete')
+  completePhoneChange(
+    @Body() dto: PhoneChangeCompleteDto,
+    @Headers('x-auth-user-id') authUserId?: string,
+  ) {
+    if (!authUserId) {
+      throw new UnauthorizedException('Token requerido');
+    }
+    return this.authService.completePhoneChange(authUserId, dto);
   }
 
   @Post('account-deletion/start')

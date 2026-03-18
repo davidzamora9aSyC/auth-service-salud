@@ -11,6 +11,7 @@ import {
   Account,
   AccountDeletionAuditStatus,
   AccountDeletionChannel,
+  AccountVerificationChannel,
   AccountRole,
   AccountStatus,
   CollaboratorStatus,
@@ -39,6 +40,10 @@ import { RecoveryStartDto } from './dto/recovery-start.dto';
 import { RecoveryVerifyDto } from './dto/recovery-verify.dto';
 import { RecoveryCompleteDto } from './dto/recovery-complete.dto';
 import { RecoveryLinkDto } from './dto/recovery-link.dto';
+import { PasswordChangeStartDto } from './dto/password-change-start.dto';
+import { PhoneChangeStartDto } from './dto/phone-change-start.dto';
+import { PhoneChangeVerifyDto } from './dto/phone-change-verify.dto';
+import { PhoneChangeCompleteDto } from './dto/phone-change-complete.dto';
 import { PhoneAvailabilityDto } from './dto/phone-availability.dto';
 import { OAuthAuthorizeDto } from './dto/oauth-authorize.dto';
 import { OAuthTokenDto } from './dto/oauth-token.dto';
@@ -715,6 +720,83 @@ export class AuthService {
     };
   }
 
+  async startPasswordRecoveryForAccount(
+    authUserId: string,
+    dto: PasswordChangeStartDto,
+  ) {
+    const account = await this.prisma.account.findUnique({
+      where: { id: authUserId },
+    });
+    if (!account || account.status !== AccountStatus.ACTIVE) {
+      throw new UnauthorizedException('Cuenta no disponible');
+    }
+    if (account.deletedAt) {
+      throw new BadRequestException('La cuenta ya fue eliminada');
+    }
+
+    const channel = this.resolveAccountDeletionChannel(account, dto.channel);
+    const destination =
+      channel === AccountDeletionChannel.EMAIL
+        ? account.email
+        : account.phoneNumber;
+    if (!destination) {
+      throw new BadRequestException(
+        'No hay un canal disponible para enviar el codigo',
+      );
+    }
+
+    await this.ensureRecoveryProfile(account);
+    await this.prisma.passwordRecovery.deleteMany({
+      where: { accountId: account.id },
+    });
+
+    const code = this.generateRecoveryCode();
+    const codeHash = this.hashToken(code);
+    const expiresAt = new Date(Date.now() + this.recoveryCodeTtl * 1000);
+    const magicToken = randomBytes(48).toString('hex');
+    const magicTokenHash = this.hashToken(magicToken);
+    const magicExpiresAt = new Date(Date.now() + this.recoveryCodeTtl * 1000);
+    const recovery = await this.prisma.passwordRecovery.create({
+      data: {
+        accountId: account.id,
+        codeHash,
+        expiresAt,
+        magicTokenHash,
+        magicExpiresAt,
+      },
+    });
+
+    const name = await this.resolveRecoveryName(account);
+    const recoveryLink = this.buildRecoveryLink(this.recoveryLinkBase, magicToken);
+
+    if (channel === AccountDeletionChannel.EMAIL) {
+      await this.notifications.sendPasswordRecoveryEmail({
+        email: account.email,
+        name,
+        code,
+        link: recoveryLink,
+        ttlSeconds: this.recoveryCodeTtl,
+      });
+    } else if (account.phoneNumber) {
+      await this.notifications.sendPasswordRecoveryWhatsapp({
+        phoneNumber: account.phoneNumber,
+        name,
+        code,
+        link: recoveryLink,
+        ttlSeconds: this.recoveryCodeTtl,
+      });
+    } else {
+      throw new BadRequestException('No hay cuenta con WhatsApp disponible');
+    }
+
+    return {
+      recoveryId: recovery.id,
+      expiresAt: recovery.expiresAt.toISOString(),
+      channel,
+      destinationMasked: this.maskDestination(channel, destination),
+    };
+  }
+
   async verifyPasswordRecovery(dto: RecoveryVerifyDto) {
     const recovery = await this.prisma.passwordRecovery.findUnique({
       where: { id: dto.recoveryId },
@@ -846,6 +928,170 @@ export class AuthService {
       }),
       this.prisma.refreshToken.deleteMany({
         where: { accountId: recovery.accountId },
+      }),
+    ]);
+
+    return { success: true };
+  }
+
+  async startPhoneChange(authUserId: string, dto: PhoneChangeStartDto) {
+    const account = await this.prisma.account.findUnique({
+      where: { id: authUserId },
+    });
+    if (!account || account.status !== AccountStatus.ACTIVE) {
+      throw new UnauthorizedException('Cuenta no disponible');
+    }
+    if (account.deletedAt) {
+      throw new BadRequestException('La cuenta ya fue eliminada');
+    }
+
+    const channel = this.resolvePhoneChangeChannel(account, dto.channel);
+    const destination =
+      channel === AccountVerificationChannel.EMAIL
+        ? account.email
+        : account.phoneNumber;
+
+    if (!destination) {
+      throw new BadRequestException(
+        'No hay un canal disponible para enviar el codigo',
+      );
+    }
+
+    await this.prisma.accountPhoneChange.deleteMany({
+      where: { accountId: account.id },
+    });
+
+    const code = this.generateRecoveryCode();
+    const codeHash = this.hashToken(code);
+    const expiresAt = new Date(Date.now() + this.recoveryCodeTtl * 1000);
+
+    const change = await this.prisma.accountPhoneChange.create({
+      data: {
+        accountId: account.id,
+        channel,
+        destination,
+        codeHash,
+        expiresAt,
+        maxAttempts: this.recoveryMaxAttempts,
+      },
+    });
+
+    const name = await this.resolveRecoveryName(account);
+    if (channel === AccountVerificationChannel.EMAIL) {
+      await this.notifications.sendPhoneChangeEmail({
+        email: account.email,
+        name,
+        code,
+        ttlSeconds: this.recoveryCodeTtl,
+      });
+    } else if (account.phoneNumber) {
+      await this.notifications.sendPhoneChangeWhatsapp({
+        phoneNumber: account.phoneNumber,
+        name,
+        code,
+        ttlSeconds: this.recoveryCodeTtl,
+      });
+    } else {
+      throw new BadRequestException('No hay cuenta con WhatsApp disponible');
+    }
+
+    return {
+      changeId: change.id,
+      channel,
+      destinationMasked: this.maskDestination(channel, destination),
+      expiresAt: change.expiresAt.toISOString(),
+    };
+  }
+
+  async verifyPhoneChange(authUserId: string, dto: PhoneChangeVerifyDto) {
+    const change = await this.prisma.accountPhoneChange.findUnique({
+      where: { id: dto.changeId },
+    });
+    if (!change || change.expiresAt < new Date() || change.consumedAt) {
+      throw new UnauthorizedException('Codigo expirado');
+    }
+    if (change.accountId !== authUserId) {
+      throw new UnauthorizedException('Codigo invalido');
+    }
+    if (change.attempts >= change.maxAttempts) {
+      throw new UnauthorizedException('Codigo bloqueado');
+    }
+
+    const codeHash = this.hashToken(dto.code);
+    if (codeHash !== change.codeHash) {
+      await this.prisma.accountPhoneChange.update({
+        where: { id: change.id },
+        data: { attempts: { increment: 1 } },
+      });
+      throw new UnauthorizedException('Codigo invalido');
+    }
+
+    const token = randomBytes(48).toString('hex');
+    const tokenHash = this.hashToken(token);
+    const tokenExpiresAt = new Date(Date.now() + this.recoveryResetTtl * 1000);
+
+    await this.prisma.accountPhoneChange.update({
+      where: { id: change.id },
+      data: {
+        tokenHash,
+        tokenExpiresAt,
+        verifiedAt: new Date(),
+      },
+    });
+
+    return {
+      token,
+      tokenExpiresAt: tokenExpiresAt.toISOString(),
+    };
+  }
+
+  async completePhoneChange(authUserId: string, dto: PhoneChangeCompleteDto) {
+    const tokenHash = this.hashToken(dto.token);
+    const change = await this.prisma.accountPhoneChange.findFirst({
+      where: { tokenHash },
+    });
+    if (
+      !change ||
+      !change.tokenExpiresAt ||
+      change.tokenExpiresAt < new Date() ||
+      change.consumedAt
+    ) {
+      throw new UnauthorizedException('Token expirado');
+    }
+    if (change.accountId !== authUserId) {
+      throw new UnauthorizedException('Token invalido');
+    }
+
+    const account = await this.prisma.account.findUnique({
+      where: { id: authUserId },
+      select: { status: true, deletedAt: true },
+    });
+    if (!account || account.status !== AccountStatus.ACTIVE) {
+      throw new UnauthorizedException('Cuenta no disponible');
+    }
+    if (account.deletedAt) {
+      throw new BadRequestException('La cuenta ya fue eliminada');
+    }
+
+    const normalizedPhone = this.normalizePhoneNumber(dto.phoneNumber);
+    const existing = await this.prisma.account.findUnique({
+      where: { phoneNumber: normalizedPhone },
+      select: { id: true },
+    });
+    if (existing && existing.id !== authUserId) {
+      throw new ConflictException('El numero de telefono ya esta registrado');
+    }
+
+    await this.prisma.$transaction([
+      this.prisma.account.update({
+        where: { id: authUserId },
+        data: {
+          phoneNumber: normalizedPhone,
+        },
+      }),
+      this.prisma.accountPhoneChange.update({
+        where: { id: change.id },
+        data: { consumedAt: new Date() },
       }),
     ]);
 
@@ -1778,8 +2024,39 @@ export class AuthService {
     throw new BadRequestException('No hay canal de verificacion disponible');
   }
 
-  private maskDestination(channel: AccountDeletionChannel, destination: string) {
-    if (channel === AccountDeletionChannel.EMAIL) {
+  private resolvePhoneChangeChannel(
+    account: Account,
+    preferred?: AccountVerificationChannel,
+  ) {
+    if (preferred === AccountVerificationChannel.EMAIL) {
+      if (!account.email) {
+        throw new BadRequestException('No hay correo disponible');
+      }
+      return AccountVerificationChannel.EMAIL;
+    }
+    if (preferred === AccountVerificationChannel.WHATSAPP) {
+      if (!account.phoneNumber) {
+        throw new BadRequestException('No hay WhatsApp disponible');
+      }
+      return AccountVerificationChannel.WHATSAPP;
+    }
+    if (account.email) {
+      return AccountVerificationChannel.EMAIL;
+    }
+    if (account.phoneNumber) {
+      return AccountVerificationChannel.WHATSAPP;
+    }
+    throw new BadRequestException('No hay canal de verificacion disponible');
+  }
+
+  private maskDestination(
+    channel: AccountDeletionChannel | AccountVerificationChannel,
+    destination: string,
+  ) {
+    if (
+      channel === AccountDeletionChannel.EMAIL ||
+      channel === AccountVerificationChannel.EMAIL
+    ) {
       const [local, domain] = destination.split('@');
       const visibleLocal = local.length <= 2 ? `${local[0] ?? '*'}*` : `${local.slice(0, 2)}***`;
       return `${visibleLocal}@${domain ?? ''}`;

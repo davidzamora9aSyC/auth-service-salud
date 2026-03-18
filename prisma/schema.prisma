@@ -46,6 +46,11 @@ enum AccountDeletionChannel {
   WHATSAPP
 }
 
+enum AccountVerificationChannel {
+  EMAIL
+  WHATSAPP
+}
+
 enum AccountDeletionAuditStatus {
   COMPLETED
   PARTIAL
@@ -419,6 +424,26 @@ model AccountDeletionChallenge {
   verifiedAt   DateTime?
   consumedAt   DateTime?
   createdAt    DateTime               @default(now())
+
+  @@index([accountId, createdAt])
+  @@index([expiresAt])
+}
+
+model AccountPhoneChange {
+  id            String                    @id @default(uuid())
+  account       Account                   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId     String
+  channel       AccountVerificationChannel
+  destination   String
+  codeHash      String
+  tokenHash     String?
+  expiresAt     DateTime
+  tokenExpiresAt DateTime?
+  attempts      Int                       @default(0)
+  maxAttempts   Int                       @default(5)
+  verifiedAt    DateTime?
+  consumedAt    DateTime?
+  createdAt     DateTime                  @default(now())
 
   @@index([accountId, createdAt])
   @@index([expiresAt])

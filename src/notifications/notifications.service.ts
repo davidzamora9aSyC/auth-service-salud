@@ -222,6 +222,142 @@ export class NotificationsService {
     }
   }
 
+  async sendPhoneChangeWhatsapp(input: {
+    phoneNumber: string;
+    name: string;
+    code: string;
+    ttlSeconds?: number;
+  }) {
+    const baseUrl =
+      this.config.get<string>('NOTIFICATIONS_SERVICE_URL') ??
+      'http://communication-service:3006/communicationms';
+    if (!baseUrl) {
+      this.logger.warn('NOTIFICATIONS_SERVICE_URL no esta configurado');
+      return;
+    }
+    const endpoint = `${baseUrl.replace(/\/$/, '')}/internal/whatsapp/send-template`;
+    const templateKey =
+      this.config.get<string>('PHONE_CHANGE_WHATSAPP_TEMPLATE_KEY') ??
+      this.config.get<string>('PASSWORD_RESET_TEMPLATE_KEY') ??
+      'PASSWORD_RESET';
+
+    const payload: WhatsappPayload = {
+      to_e164: input.phoneNumber,
+      template_code: templateKey,
+      variables: {
+        name: input.name,
+        code: input.code,
+        ttl: String(input.ttlSeconds ?? ''),
+      },
+    };
+
+    try {
+      await firstValueFrom(
+        this.http.post(endpoint, payload, {
+          timeout:
+            this.config.get<number>('NOTIFICATIONS_TIMEOUT_MS') ?? 5000,
+        }),
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Error desconocido';
+      this.logger.error(
+        `Fallo el envio del WhatsApp de cambio de telefono a ${input.phoneNumber}: ${message}`,
+        error as Error,
+      );
+    }
+  }
+
+  async sendPhoneChangeEmail(input: {
+    email: string;
+    name: string;
+    code: string;
+    ttlSeconds?: number;
+  }) {
+    const baseUrl =
+      this.config.get<string>('NOTIFICATIONS_SERVICE_URL') ??
+      'http://communication-service:3006/communicationms';
+    if (!baseUrl) {
+      this.logger.warn('NOTIFICATIONS_SERVICE_URL no esta configurado');
+      return;
+    }
+
+    const endpoint = `${baseUrl.replace(/\/$/, '')}/email/messages`;
+    const expiresMinutes = Math.max(1, Math.ceil((input.ttlSeconds ?? 600) / 60));
+    const subject = 'Verificacion de cambio de telefono | MeuDoc';
+
+    const supportEmail =
+      this.config.get<string>('SUPPORT_EMAIL') ?? 'comunicaciones@meudoc.co';
+    const portalUrl =
+      this.config.get<string>('PATIENT_PORTAL_URL') ??
+      this.config.get<string>('DOCTOR_PORTAL_URL') ??
+      'https://meudoc.co';
+
+    const safeName = this.escapeHtml(input.name);
+    const safeCode = this.escapeHtml(input.code);
+    const safeSupport = this.escapeHtml(supportEmail);
+    const safePortal = this.escapeHtml(portalUrl);
+    const safeMinutes = this.escapeHtml(String(expiresMinutes));
+
+    const text = [
+      `Hola ${input.name},`,
+      '',
+      'Recibimos una solicitud para cambiar el telefono asociado a tu cuenta en MeuDoc.',
+      `Tu codigo de verificacion es: ${input.code}`,
+      `Este codigo vence en ${expiresMinutes} minuto(s).`,
+      '',
+      'Si no solicitaste este cambio, ignora este mensaje.',
+      `Soporte: ${supportEmail}`,
+      '',
+      'Equipo MeuDoc',
+      portalUrl,
+    ].join('\n');
+
+    const html = `
+      <div style="margin:0;padding:24px;background:#f1f5f9;font-family:Arial,Helvetica,sans-serif;color:#0f172a;">
+        <div style="max-width:620px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:12px;overflow:hidden;">
+          <div style="padding:24px;">
+            <h1 style="margin:0 0 12px 0;font-size:24px;line-height:1.25;">Confirmar cambio de telefono</h1>
+            <p style="margin:0 0 10px 0;font-size:15px;">Hola <strong>${safeName}</strong>,</p>
+            <p style="margin:0 0 12px 0;font-size:15px;">Recibimos una solicitud para cambiar el telefono asociado a tu cuenta en MeuDoc. Si deseas continuar, usa este codigo:</p>
+            <div style="display:inline-block;background:#0f172a;color:#ffffff;padding:10px 14px;border-radius:10px;font-size:24px;font-weight:700;letter-spacing:4px;">${safeCode}</div>
+            <p style="margin:12px 0 0 0;font-size:14px;">Este codigo vence en <strong>${safeMinutes} minuto(s)</strong>.</p>
+            <p style="margin:16px 0 0 0;font-size:13px;color:#475569;">Si no solicitaste este cambio, ignora este mensaje.</p>
+            <p style="margin:8px 0 0 0;font-size:13px;color:#475569;">Soporte: ${safeSupport}</p>
+            <p style="margin:12px 0 0 0;font-size:13px;color:#475569;">Equipo MeuDoc<br />${safePortal}</p>
+          </div>
+        </div>
+      </div>
+    `.trim();
+
+    const payload: EmailPayload = {
+      to: input.email,
+      templateKey: 'PHONE_CHANGE',
+      subject,
+      text,
+      html,
+      metadata: {
+        flow: 'phone-change',
+      },
+    };
+
+    try {
+      await firstValueFrom(
+        this.http.post(endpoint, payload, {
+          timeout:
+            this.config.get<number>('NOTIFICATIONS_TIMEOUT_MS') ?? 5000,
+        }),
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Error desconocido';
+      this.logger.error(
+        `Fallo el envio del correo de cambio de telefono a ${input.email}: ${message}`,
+        error as Error,
+      );
+    }
+  }
+
   async sendAccountDeletionWhatsapp(input: {
     phoneNumber: string;
     name: string;
