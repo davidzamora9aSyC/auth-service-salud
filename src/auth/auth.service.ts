@@ -2053,10 +2053,7 @@ export class AuthService {
     channel: AccountDeletionChannel | AccountVerificationChannel,
     destination: string,
   ) {
-    if (
-      channel === AccountDeletionChannel.EMAIL ||
-      channel === AccountVerificationChannel.EMAIL
-    ) {
+    if (String(channel) === 'EMAIL') {
       const [local, domain] = destination.split('@');
       const visibleLocal = local.length <= 2 ? `${local[0] ?? '*'}*` : `${local.slice(0, 2)}***`;
       return `${visibleLocal}@${domain ?? ''}`;

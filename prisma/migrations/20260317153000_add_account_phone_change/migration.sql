@@ -3,8 +3,8 @@ CREATE TYPE "AccountVerificationChannel" AS ENUM ('EMAIL', 'WHATSAPP');
 
 -- CreateTable
 CREATE TABLE "AccountPhoneChange" (
-    "id" UUID NOT NULL DEFAULT gen_random_uuid(),
-    "accountId" UUID NOT NULL,
+    "id" TEXT NOT NULL DEFAULT gen_random_uuid()::text,
+    "accountId" TEXT NOT NULL,
     "channel" "AccountVerificationChannel" NOT NULL,
     "destination" TEXT NOT NULL,
     "codeHash" TEXT NOT NULL,
