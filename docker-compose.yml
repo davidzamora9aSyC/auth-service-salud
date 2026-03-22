@@ -52,7 +52,9 @@
     environment:
       DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=notification
       RABBITMQ_QUEUE_AUTH: comms.q.auth
+      RABBITMQ_QUEUE_QUESTIONS: comms.q.questions
       RABBITMQ_EXCHANGE_AUTH: auth.events
+      RABBITMQ_EXCHANGE_QUESTIONS: questions.events
       RABBITMQ_EXCHANGE_COMMUNICATION: communication.events
       WELCOME_TEMPLATE_PATIENT: bienvenida_pacientes
       WELCOME_TEMPLATE_DOCTOR: bienvenida_doctor
@@ -203,6 +205,22 @@
       - db
       - appointments-service
 
+  questions-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-questions-service:${IMAGE_TAG:-latest}
+    build:
+      context: ../questions-service
+    env_file:
+      - ../questions-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=questions
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
+      RABBITMQ_EXCHANGE_QUESTIONS: questions.events
+      DOCTORS_INTERNAL_BASE_URL: http://doctors-service:3009/doctorsms
+    ports:
+      - "3026:3026"
+    depends_on:
+      - db
+
   services-service:
     image: ${DOCKERHUB_USERNAME:-local}/meusalud-services-service:${IMAGE_TAG:-latest}
     build:
@@ -266,6 +284,7 @@
       CLINICS_BASE_URL: http://clinics-service:3025
       AI_BASE_URL: http://ai-assistant-service:3030
       GATEWAY_AI_DEBUG: "true"
+      QUESTIONS_BASE_URL: http://questions-service:3026
     ports:
       - "3020:3020"
     depends_on:
@@ -276,6 +295,7 @@
       - appointments-service
       - reviews-service
       - messages-service
+      - questions-service
       - services-service
       - availability-service
       - templates-service

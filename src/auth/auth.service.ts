@@ -292,7 +292,7 @@ export class AuthService {
         throw new BadRequestException('Nombre y apellido son requeridos');
       }
       try {
-        const patientId = await this.createPatientForAccount(account, firstName, lastName);
+        const patientId = await this.linkOrCreatePatientForAccount(account, firstName, lastName);
         account = await this.prisma.account.update({
           where: { id: account.id },
           data: { subjectId: patientId },
@@ -3042,6 +3042,88 @@ export class AuthService {
 
     const data = (await response.json()) as { patientId?: string | null };
     return data?.patientId ?? null;
+  }
+
+  private async linkOrCreatePatientForAccount(account: Account, firstName: string, lastName: string) {
+    const existing = await this.findPatientByContact(account.email, account.phoneNumber ?? undefined);
+    if (existing?.patientId) {
+      const existingAuthUserId = existing.authUserId;
+      if (existingAuthUserId) {
+        const linkedAccount = await this.prisma.account.findUnique({ where: { id: existingAuthUserId } });
+        if (linkedAccount && linkedAccount.id !== account.id) {
+          throw new ConflictException('El paciente ya tiene una cuenta vinculada');
+        }
+      }
+      await this.linkAuthUserToPatient({
+        patientId: existing.patientId,
+        authUserId: account.id,
+        expectedAuthUserId: existingAuthUserId ?? undefined,
+        email: account.email,
+        phoneNumber: account.phoneNumber ?? undefined,
+      });
+      return existing.patientId;
+    }
+    return this.createPatientForAccount(account, firstName, lastName);
+  }
+
+  private async findPatientByContact(email: string, phoneNumber?: string) {
+    const base = this.usersBaseUrl.replace(/\/$/, '');
+    const headers = { 'x-role': 'SYSTEM' };
+    if (phoneNumber) {
+      try {
+        const response = await fetch(`${base}/patients/search?phone=${encodeURIComponent(phoneNumber)}`, { headers });
+        if (response.ok) {
+          const data = (await response.json()) as { items?: Array<{ id: string; authUserId?: string | null }> };
+          const match = data.items?.[0];
+          if (match?.id) {
+            return { patientId: match.id, authUserId: match.authUserId ?? null };
+          }
+        }
+      } catch {
+        // ignore and try email
+      }
+    }
+    try {
+      const response = await fetch(`${base}/patients/search?q=${encodeURIComponent(email)}`, { headers });
+      if (!response.ok) return null;
+      const data = (await response.json()) as { items?: Array<{ id: string; authUserId?: string | null; contacts?: Array<{ email?: string | null }> }> };
+      const lower = email.toLowerCase();
+      const match = data.items?.find((item) =>
+        item.contacts?.some((contact) => (contact.email ?? '').toLowerCase() === lower),
+      ) ?? data.items?.[0];
+      if (!match?.id) return null;
+      return { patientId: match.id, authUserId: match.authUserId ?? null };
+    } catch {
+      return null;
+    }
+  }
+
+  private async linkAuthUserToPatient(input: {
+    patientId: string;
+    authUserId: string;
+    expectedAuthUserId?: string;
+    email?: string;
+    phoneNumber?: string;
+  }) {
+    const base = this.usersBaseUrl.replace(/\/$/, '');
+    const response = await fetch(`${base}/patients/internal/link-auth-user`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-role': 'SYSTEM',
+      },
+      body: JSON.stringify({
+        patientId: input.patientId,
+        authUserId: input.authUserId,
+        expectedAuthUserId: input.expectedAuthUserId,
+        email: input.email,
+        phoneE164: input.phoneNumber,
+      }),
+    });
+    if (!response.ok) {
+      const body = await response.text();
+      throw new ServiceUnavailableException(`No se pudo vincular el paciente: ${body}`);
+    }
   }
 
   private async resolveRecoveryName(account: Account) {
