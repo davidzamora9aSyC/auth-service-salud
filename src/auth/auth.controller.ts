@@ -1,4 +1,5 @@
 import { Body, Controller, Delete, Get, Headers, Post, Query, Req, Res, UnauthorizedException } from '@nestjs/common';
+import { SelectRoleDto } from './dto/select-role.dto';
 import { Request, Response } from 'express';
 import { AuthService } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
@@ -57,6 +58,11 @@ export class AuthController {
   @Post('refresh')
   refresh(@Body() dto: RefreshTokenDto) {
     return this.authService.refresh(dto.refreshToken);
+  }
+
+  @Post('select-role')
+  selectRole(@Body() dto: SelectRoleDto) {
+    return this.authService.selectRole(dto.refreshToken, dto.role);
   }
 
   @Post('logout')

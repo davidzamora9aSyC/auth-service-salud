@@ -106,8 +106,25 @@ model Account {
   createdClinics         Clinic[]               @relation("ClinicCreatedBy")
   createdClinicMemberships ClinicDoctorMembership[] @relation("ClinicMembershipCreatedBy")
   createdClinicDoctorInvites ClinicDoctorInvite[]   @relation("ClinicDoctorInviteCreatedBy")
+  roleProfiles           AccountRoleProfile[]
 
   @@index([subjectId, role])
+}
+
+model AccountRoleProfile {
+  id               String           @id @default(uuid())
+  accountId        String
+  role             AccountRole
+  subjectId        String?
+  doctorId         String?          @unique
+  onboardingStatus OnboardingStatus @default(COMPLETE)
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  account          Account          @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, role])
+  @@index([accountId])
 }
 
 model Clinic {

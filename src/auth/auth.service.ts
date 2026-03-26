@@ -233,7 +233,12 @@ export class AuthService {
       where: { email: normalizedEmail },
     });
     if (existing) {
-      throw new ConflictException('El email ya esta registrado');
+      // Si el email ya existe y la contraseña coincide, intentamos agregar el nuevo rol
+      const passwordOk = await argon2.verify(existing.passwordHash, dto.password + existing.salt);
+      if (!passwordOk) {
+        throw new ConflictException('El email ya esta registrado');
+      }
+      return this.addRoleToAccount(existing, dto, firstName, lastName, inviteToken);
     }
     const existingPhone = await this.prisma.account.findUnique({
       where: { phoneNumber: normalizedPhone },
@@ -310,6 +315,80 @@ export class AuthService {
     return this.issueTokens(account);
   }
 
+  private async addRoleToAccount(
+    account: Account,
+    dto: RegisterDto,
+    firstName?: string,
+    lastName?: string,
+    inviteToken?: string,
+  ) {
+    if (account.status !== AccountStatus.ACTIVE) {
+      throw new UnauthorizedException('Account disabled');
+    }
+    // Verificar que el rol no esté ya registrado
+    const isPrimaryRole = account.role === dto.role;
+    if (isPrimaryRole) {
+      throw new ConflictException('Ya tienes una cuenta con este rol');
+    }
+    const existingProfile = await this.prisma.accountRoleProfile.findUnique({
+      where: { accountId_role: { accountId: account.id, role: dto.role } },
+    });
+    if (existingProfile) {
+      throw new ConflictException('Ya tienes una cuenta con este rol');
+    }
+
+    if (dto.role === AccountRole.PATIENT) {
+      if (!firstName || !lastName) {
+        throw new BadRequestException('Nombre y apellido son requeridos');
+      }
+      const patientId = await this.linkOrCreatePatientForAccount(account, firstName, lastName);
+      await this.prisma.accountRoleProfile.create({
+        data: {
+          accountId: account.id,
+          role: AccountRole.PATIENT,
+          subjectId: patientId,
+          onboardingStatus: OnboardingStatus.COMPLETE,
+        },
+      });
+    } else if (dto.role === AccountRole.DOCTOR) {
+      const doctorId = randomUUID();
+      await this.prisma.accountRoleProfile.create({
+        data: {
+          accountId: account.id,
+          role: AccountRole.DOCTOR,
+          doctorId,
+          onboardingStatus: OnboardingStatus.PENDING,
+        },
+      });
+      // Guardar doctorId en Account para compatibilidad con issueTokens
+      if (!account.doctorId) {
+        await this.prisma.account.update({
+          where: { id: account.id },
+          data: { doctorId },
+        });
+        account = { ...account, doctorId };
+      }
+      if (inviteToken) {
+        await this.completeClinicDoctorInviteRegistration({ ...account }, inviteToken);
+      }
+    } else if (dto.role === AccountRole.CLINIC) {
+      await this.prisma.accountRoleProfile.create({
+        data: {
+          accountId: account.id,
+          role: AccountRole.CLINIC,
+          onboardingStatus: OnboardingStatus.PENDING,
+        },
+      });
+    } else {
+      throw new BadRequestException('Rol no soportado para registro multi-rol');
+    }
+
+    const updatedAccount = await this.prisma.account.findUniqueOrThrow({
+      where: { id: account.id },
+    });
+    return this.issueTokens(updatedAccount, { sessionRole: dto.role });
+  }
+
   async login(dto: LoginDto, meta?: RequestMeta) {
     const normalizedEmail = dto.email.trim().toLowerCase();
     const account = await this.prisma.account.findUnique({
@@ -324,16 +403,18 @@ export class AuthService {
     if (account.status !== AccountStatus.ACTIVE) {
       throw new UnauthorizedException('Account disabled');
     }
-    const sessionRole = this.resolveSessionRole(account, dto.role);
+    const sessionRole = await this.resolveSessionRole(account, dto.role);
     if (sessionRole === AccountRole.DOCTOR && !account.doctorId) {
       throw new BadRequestException('No hay perfil de doctor para esta cuenta');
     }
+    const availableRoles = await this.getAvailableRoles(account);
     if (account.twoFactorEnabled && account.twoFactorSecret) {
       const challenge = await this.createTwoFactorChallenge(account.id, sessionRole);
       return {
         requiresTwoFactor: true,
         challengeId: challenge.id,
         expiresAt: challenge.expiresAt.toISOString(),
+        availableRoles,
       };
     }
     const tokens = await this.issueTokens(account, { sessionRole });
@@ -341,7 +422,27 @@ export class AuthService {
     return {
       requiresTwoFactor: false,
       ...tokens,
+      availableRoles,
     };
+  }
+
+  async selectRole(refreshToken: string, role: AccountRole) {
+    const tokenHash = this.hashToken(refreshToken);
+    const stored = await this.prisma.refreshToken.findUnique({
+      where: { tokenHash },
+      include: { account: true },
+    });
+    if (!stored || stored.expiresAt < new Date()) {
+      throw new UnauthorizedException('Refresh token inválido o expirado');
+    }
+    if (stored.account.status !== AccountStatus.ACTIVE) {
+      throw new UnauthorizedException('Account disabled');
+    }
+    const sessionRole = await this.resolveSessionRole(stored.account, role);
+    await this.prisma.refreshToken.delete({ where: { tokenHash } });
+    const tokens = await this.issueTokens(stored.account, { sessionRole });
+    const availableRoles = await this.getAvailableRoles(stored.account);
+    return { requiresTwoFactor: false as const, ...tokens, availableRoles };
   }
 
   async registerCollaborator(dto: RegisterCollaboratorDto) {
@@ -1392,11 +1493,15 @@ export class AuthService {
       const existing = await this.prisma.account.findUnique({
         where: { email: normalizedEmail },
       });
-      const allowDoctorToPatient =
-        Boolean(existing) &&
-        existing?.role === AccountRole.DOCTOR &&
-        entry.role === AccountRole.PATIENT;
-      if (existing && existing.role !== entry.role && !allowDoctorToPatient) {
+      const hasRoleProfileGoogle = existing && existing.role !== entry.role
+        ? await this.prisma.accountRoleProfile.findUnique({
+            where: { accountId_role: { accountId: existing.id, role: entry.role } },
+          })
+        : null;
+      const allowRoleSwitchGoogle =
+        (Boolean(existing) && existing?.role === AccountRole.DOCTOR && entry.role === AccountRole.PATIENT) ||
+        Boolean(hasRoleProfileGoogle);
+      if (existing && existing.role !== entry.role && !allowRoleSwitchGoogle) {
         throw new ConflictException('Email ya registrado con otro rol');
       }
       let account = existing;
@@ -1427,8 +1532,8 @@ export class AuthService {
       }
 
       const sessionRole =
-        allowDoctorToPatient && account?.role === AccountRole.DOCTOR
-          ? AccountRole.PATIENT
+        (existing && existing.role !== entry.role && allowRoleSwitchGoogle)
+          ? entry.role
           : account.role;
       const tokens = await this.issueTokens(account, { sessionRole });
       await this.recordLoginHistory(account, sessionRole, LoginEventSource.OAUTH_GOOGLE, meta);
@@ -1515,11 +1620,15 @@ export class AuthService {
     const existing = await this.prisma.account.findUnique({
       where: { email: normalizedEmail },
     });
-    const allowDoctorToPatient =
-      Boolean(existing) &&
-      existing?.role === AccountRole.DOCTOR &&
-      entry.role === AccountRole.PATIENT;
-    if (existing && existing.role !== entry.role && !allowDoctorToPatient) {
+    const hasRoleProfileApple = existing && existing.role !== entry.role
+      ? await this.prisma.accountRoleProfile.findUnique({
+          where: { accountId_role: { accountId: existing.id, role: entry.role } },
+        })
+      : null;
+    const allowRoleSwitchApple =
+      (Boolean(existing) && existing?.role === AccountRole.DOCTOR && entry.role === AccountRole.PATIENT) ||
+      Boolean(hasRoleProfileApple);
+    if (existing && existing.role !== entry.role && !allowRoleSwitchApple) {
       throw new ConflictException('Email ya registrado con otro rol');
     }
     let account = existing;
@@ -1550,8 +1659,8 @@ export class AuthService {
     }
 
     const sessionRole =
-      allowDoctorToPatient && account?.role === AccountRole.DOCTOR
-        ? AccountRole.PATIENT
+      (existing && existing.role !== entry.role && allowRoleSwitchApple)
+        ? entry.role
         : account.role;
     const tokens = await this.issueTokens(account, { sessionRole });
     await this.recordLoginHistory(account, sessionRole, LoginEventSource.OAUTH_APPLE, meta);
@@ -1643,10 +1752,22 @@ export class AuthService {
         accountForSession = await this.ensurePatientSubjectId(account);
         sessionSubjectId = accountForSession.subjectId ?? null;
       } else {
-        sessionSubjectId = await this.resolvePatientIdForSession(
-          account,
-          sessionSubjectId,
-        );
+        // Buscar en role profiles si existe un perfil de paciente
+        const patientProfile = await this.prisma.accountRoleProfile.findUnique({
+          where: { accountId_role: { accountId: account.id, role: AccountRole.PATIENT } },
+        });
+        if (patientProfile?.subjectId) {
+          sessionSubjectId = patientProfile.subjectId;
+        } else {
+          sessionSubjectId = await this.resolvePatientIdForSession(account, sessionSubjectId);
+          // Persistir el patientId en el profile para futuras sesiones
+          if (sessionSubjectId && patientProfile) {
+            await this.prisma.accountRoleProfile.update({
+              where: { accountId_role: { accountId: account.id, role: AccountRole.PATIENT } },
+              data: { subjectId: sessionSubjectId },
+            });
+          }
+        }
       }
       if (sessionSubjectId) {
         payload.patientId = sessionSubjectId;
@@ -1659,15 +1780,36 @@ export class AuthService {
       if (doctorId) {
         payload.doctorId = doctorId;
       }
-      payload.onboardingRequired =
-        account.onboardingStatus !== OnboardingStatus.COMPLETE;
-    } else if (sessionRole === AccountRole.CLINIC) {
-      if (account.subjectId) {
-        payload.clinicId = account.subjectId;
-        payload.subjectId = account.subjectId;
+      // Leer onboardingStatus del profile si el rol principal no es DOCTOR
+      let doctorOnboardingStatus: OnboardingStatus;
+      if (account.role === AccountRole.DOCTOR) {
+        doctorOnboardingStatus = account.onboardingStatus;
+      } else {
+        const doctorProfile = await this.prisma.accountRoleProfile.findUnique({
+          where: { accountId_role: { accountId: account.id, role: AccountRole.DOCTOR } },
+        });
+        doctorOnboardingStatus = doctorProfile?.onboardingStatus ?? OnboardingStatus.PENDING;
       }
-      payload.onboardingRequired =
-        account.onboardingStatus !== OnboardingStatus.COMPLETE;
+      payload.onboardingRequired = doctorOnboardingStatus !== OnboardingStatus.COMPLETE;
+    } else if (sessionRole === AccountRole.CLINIC) {
+      // Leer subjectId y onboardingStatus del profile si el rol principal no es CLINIC
+      let clinicSubjectId: string | null = null;
+      let clinicOnboardingStatus: OnboardingStatus;
+      if (account.role === AccountRole.CLINIC) {
+        clinicSubjectId = account.subjectId ?? null;
+        clinicOnboardingStatus = account.onboardingStatus;
+      } else {
+        const clinicProfile = await this.prisma.accountRoleProfile.findUnique({
+          where: { accountId_role: { accountId: account.id, role: AccountRole.CLINIC } },
+        });
+        clinicSubjectId = clinicProfile?.subjectId ?? null;
+        clinicOnboardingStatus = clinicProfile?.onboardingStatus ?? OnboardingStatus.PENDING;
+      }
+      if (clinicSubjectId) {
+        payload.clinicId = clinicSubjectId;
+        payload.subjectId = clinicSubjectId;
+      }
+      payload.onboardingRequired = clinicOnboardingStatus !== OnboardingStatus.COMPLETE;
     } else if (sessionRole === AccountRole.COLLABORATOR) {
       if (account.role !== AccountRole.COLLABORATOR) {
         throw new UnauthorizedException('Account disabled');
@@ -3284,17 +3426,30 @@ export class AuthService {
     });
   }
 
-  private resolveSessionRole(account: Account, requestedRole?: AccountRole) {
+  private async resolveSessionRole(account: Account, requestedRole?: AccountRole) {
     if (!requestedRole) {
       return account.role;
     }
     if (requestedRole === account.role) {
       return requestedRole;
     }
-    if (requestedRole === AccountRole.PATIENT && account.role === AccountRole.DOCTOR) {
+    // Verificar si el rol solicitado existe como perfil secundario
+    const profile = await this.prisma.accountRoleProfile.findUnique({
+      where: { accountId_role: { accountId: account.id, role: requestedRole } },
+    });
+    if (profile) {
       return requestedRole;
     }
     throw new BadRequestException('Rol no permitido para esta cuenta');
+  }
+
+  private async getAvailableRoles(account: Account): Promise<AccountRole[]> {
+    const profiles = await this.prisma.accountRoleProfile.findMany({
+      where: { accountId: account.id },
+      select: { role: true },
+    });
+    const roles = new Set<AccountRole>([account.role, ...profiles.map((p) => p.role)]);
+    return Array.from(roles);
   }
 
   private async resolvePatientIdForSession(
