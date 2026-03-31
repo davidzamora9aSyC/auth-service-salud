@@ -10,6 +10,7 @@ import { randomBytes, randomUUID, createHash } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service';
 import { InviteStatus } from '@prisma/client';
 import { CreateDoctorOnboardingInviteDto } from './dto/create-doctor-onboarding-invite.dto';
+import { CreatePublicDoctorDto } from './dto/create-public-doctor.dto';
 import { RabbitmqService } from './rabbitmq.service';
 
 type PrefillProfile = {
@@ -191,6 +192,66 @@ export class AdminOnboardingService {
     return {
       inviteToken,
       expiresAt: expiresAt.toISOString(),
+      doctorId,
+    };
+  }
+
+  async createPublicDoctor(dto: CreatePublicDoctorDto) {
+    const trimmedFirstName = dto.firstName?.trim();
+    const trimmedLastName = dto.lastName?.trim();
+
+    if (!trimmedFirstName || !trimmedLastName) {
+      throw new BadRequestException('Nombre y apellido son obligatorios');
+    }
+
+    const profile = this.normalizeProfile((dto.profile ?? {}) as PrefillProfile);
+    if (!profile.specialties || profile.specialties.length < 1) {
+      throw new BadRequestException('Selecciona al menos una especialidad');
+    }
+
+    const doctorId = randomUUID();
+    const authUserId = `prefill-${randomUUID()}`;
+    const normalizedEmail = this.buildNoContactEmail(trimmedFirstName, trimmedLastName, doctorId);
+
+    await this.createPrefillDoctor({
+      doctorId,
+      authUserId,
+      email: normalizedEmail,
+      phoneNumber: null,
+      firstName: trimmedFirstName,
+      lastName: trimmedLastName,
+    });
+
+    const address = (dto.address ?? {}) as PrefillAddress;
+    const agenda = (dto.agenda ?? {}) as PrefillAgenda;
+    const services = (dto.services ?? []) as PrefillService[];
+
+    if (Object.keys(profile).length) {
+      await this.saveProfileDraft(doctorId, profile);
+    }
+
+    let agendaId: string | null = null;
+    if (address.city && address.address) {
+      const locationId = await this.upsertLocation(doctorId, {
+        ...address,
+        isPrimary: true,
+      });
+      if (locationId) {
+        agendaId = await this.getAgendaIdForLocation(locationId);
+      }
+    }
+
+    if (agendaId && agenda?.workingHours?.length) {
+      await this.replaceWorkingHours(doctorId, agendaId, agenda.workingHours);
+    }
+
+    if (agendaId && services.length) {
+      await this.replaceServices(doctorId, agendaId, services);
+    }
+
+    return {
+      doctorId,
+      email: normalizedEmail,
     };
   }
 
@@ -360,6 +421,21 @@ export class AdminOnboardingService {
       const body = await response.text().catch(() => '');
       throw new BadRequestException(`No se pudo guardar el perfil: ${body}`);
     }
+  }
+
+  private buildNoContactEmail(firstName: string, lastName: string, doctorId: string) {
+    const normalize = (value: string) =>
+      value
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-zA-Z0-9]+/g, '.')
+        .replace(/\.+/g, '.')
+        .replace(/^\.|\.$/g, '')
+        .toLowerCase();
+    const safeFirst = normalize(firstName) || 'doctor';
+    const safeLast = normalize(lastName) || 'nocontact';
+    const suffix = doctorId.replace(/-/g, '').slice(0, 6);
+    return `${safeFirst}.${safeLast}+nocontact.${suffix}@meudoc.co`;
   }
 
   private async upsertLocation(doctorId: string, address: PrefillAddress & { isPrimary?: boolean }) {

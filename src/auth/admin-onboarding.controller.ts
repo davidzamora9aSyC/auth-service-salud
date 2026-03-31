@@ -1,6 +1,7 @@
 import { Body, Controller, Get, Headers, Param, Post, UnauthorizedException } from '@nestjs/common';
 import { AdminOnboardingService } from './admin-onboarding.service';
 import { CreateDoctorOnboardingInviteDto } from './dto/create-doctor-onboarding-invite.dto';
+import { CreatePublicDoctorDto } from './dto/create-public-doctor.dto';
 
 @Controller()
 export class AdminOnboardingController {
@@ -16,6 +17,18 @@ export class AdminOnboardingController {
       throw new UnauthorizedException('No autorizado');
     }
     return this.onboarding.createInvite(dto);
+  }
+
+  @Post('admin/doctor-onboarding/prefill-only')
+  createPublicDoctor(
+    @Body() dto: CreatePublicDoctorDto,
+    @Headers('x-role') role?: string,
+  ) {
+    const normalizedRole = role?.toUpperCase();
+    if (normalizedRole !== 'ADMIN' && normalizedRole !== 'SYSTEM') {
+      throw new UnauthorizedException('No autorizado');
+    }
+    return this.onboarding.createPublicDoctor(dto);
   }
 
   @Post('admin/doctor-onboarding/invites/:token/resend')
