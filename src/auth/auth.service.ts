@@ -3238,10 +3238,17 @@ export class AuthService {
       try {
         const response = await fetch(`${base}/patients/search?phone=${encodeURIComponent(phoneNumber)}`, { headers });
         if (response.ok) {
-          const data = (await response.json()) as { items?: Array<{ id: string; authUserId?: string | null }> };
-          const match = data.items?.[0];
+          const data = (await response.json()) as { items?: Array<{ id: string; authUserId?: string | null; contacts?: Array<{ email?: string | null }> }> };
+          const lowerEmail = email.toLowerCase();
+          const emailMatch = data.items?.find((item) =>
+            item.contacts?.some((contact) => (contact.email ?? '').toLowerCase() === lowerEmail),
+          );
+          const match = emailMatch ?? data.items?.[0];
           if (match?.id) {
-            return { patientId: match.id, authUserId: match.authUserId ?? null };
+            if (emailMatch) {
+              return { patientId: match.id, authUserId: match.authUserId ?? null };
+            }
+            // If phone matched but email doesn't, prefer email search below.
           }
         }
       } catch {
