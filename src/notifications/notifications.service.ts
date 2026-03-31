@@ -358,6 +358,115 @@ export class NotificationsService {
     }
   }
 
+  async sendDoctorOnboardingWelcomeEmail(input: { email: string; name: string }) {
+    const baseUrl =
+      this.config.get<string>('NOTIFICATIONS_SERVICE_URL') ??
+      'http://communication-service:3006/communicationms';
+    if (!baseUrl) {
+      this.logger.warn('NOTIFICATIONS_SERVICE_URL no esta configurado');
+      return;
+    }
+
+    const endpoint = `${baseUrl.replace(/\/$/, '')}/email/messages`;
+    const subject = 'Bienvenido a MeuDoc Pro';
+
+    const supportEmail =
+      this.config.get<string>('SUPPORT_EMAIL') ?? 'comunicaciones@meudoc.co';
+    const portalUrl =
+      this.config.get<string>('DOCTOR_PORTAL_URL') ?? 'https://meudoc.co';
+    const headerImageUrl =
+      this.config.get<string>('WELCOME_EMAIL_HEADER_IMAGE_URL') ??
+      this.config.get<string>('NOTIFICATIONS_BRAND_IMAGE_URL') ??
+      '';
+
+    const safeName = this.escapeHtml(input.name);
+    const safeSupport = this.escapeHtml(supportEmail);
+    const safePortal = this.escapeHtml(portalUrl);
+
+    const text = [
+      `Hola ${input.name},`,
+      '',
+      'Tu perfil profesional en MeuDoc ya esta activo.',
+      'Ya puedes gestionar tu agenda, pacientes y reportes desde tu panel.',
+      '',
+      `Ingresa aqui: ${portalUrl}`,
+      '',
+      'Si necesitas ayuda, escribenos a:',
+      supportEmail,
+      '',
+      'Equipo MeuDoc',
+    ].join('\n');
+
+    const html = `
+      <div style="margin:0;padding:0;background:#eef2f7;font-family:Arial,Helvetica,sans-serif;color:#0f172a;">
+        <div style="background:linear-gradient(135deg,#0f766e 0%,#0ea5e9 55%,#6366f1 100%);padding:28px 20px;">
+          <div style="max-width:680px;margin:0 auto;">
+            <p style="margin:0;color:#e0f2fe;font-size:12px;letter-spacing:1.5px;text-transform:uppercase;">MeuDoc Pro</p>
+            <h1 style="margin:8px 0 0 0;color:#ffffff;font-size:28px;line-height:1.2;">Tu perfil ya esta activo</h1>
+            <p style="margin:8px 0 0 0;color:#e0f2fe;font-size:15px;">Todo listo para empezar a recibir pacientes.</p>
+          </div>
+        </div>
+        <div style="max-width:680px;margin:0 auto;padding:0 20px 28px;">
+          <div style="margin-top:-24px;background:#ffffff;border:1px solid #e2e8f0;border-radius:16px;overflow:hidden;box-shadow:0 12px 24px rgba(15,23,42,0.08);">
+            ${
+              headerImageUrl
+                ? `<img src="${this.escapeHtml(headerImageUrl)}" alt="MeuDoc" style="width:100%;max-height:220px;object-fit:cover;display:block;" />`
+                : ''
+            }
+            <div style="padding:28px;">
+              <p style="margin:0 0 12px 0;font-size:16px;">Hola <strong>${safeName}</strong>,</p>
+              <p style="margin:0 0 16px 0;font-size:15px;color:#1e293b;">Tu perfil profesional en MeuDoc ya esta activo. Desde tu panel puedes gestionar tu agenda, pacientes y reportes.</p>
+              <div style="display:flex;gap:12px;flex-wrap:wrap;margin:0 0 18px 0;">
+                <div style="flex:1 1 180px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:12px 14px;">
+                  <p style="margin:0 0 6px 0;font-weight:700;font-size:13px;color:#0f172a;">Agenda en vivo</p>
+                  <p style="margin:0;font-size:12px;color:#475569;">Controla tu disponibilidad y horarios.</p>
+                </div>
+                <div style="flex:1 1 180px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:12px 14px;">
+                  <p style="margin:0 0 6px 0;font-weight:700;font-size:13px;color:#0f172a;">Pacientes</p>
+                  <p style="margin:0;font-size:12px;color:#475569;">Accede a historial y seguimientos.</p>
+                </div>
+                <div style="flex:1 1 180px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:12px;padding:12px 14px;">
+                  <p style="margin:0 0 6px 0;font-weight:700;font-size:13px;color:#0f172a;">Reportes</p>
+                  <p style="margin:0;font-size:12px;color:#475569;">Visualiza tu rendimiento en minutos.</p>
+                </div>
+              </div>
+              <a href="${safePortal}" style="display:inline-block;background:#0f766e;color:#ffffff;text-decoration:none;padding:12px 18px;border-radius:12px;font-weight:700;">Entrar a MeuDoc</a>
+              <p style="margin:18px 0 0 0;font-size:12px;color:#64748b;">Si necesitas ayuda, escribenos a ${safeSupport}.</p>
+            </div>
+          </div>
+          <p style="margin:18px 0 0 0;text-align:center;font-size:11px;color:#94a3b8;">Equipo MeuDoc</p>
+        </div>
+      </div>
+    `.trim();
+
+    const payload: EmailPayload = {
+      to: input.email,
+      templateKey: 'DOCTOR_ONBOARDING_WELCOME_EMAIL',
+      subject,
+      text,
+      html,
+      metadata: {
+        flow: 'doctor-onboarding-complete',
+      },
+    };
+
+    try {
+      await firstValueFrom(
+        this.http.post(endpoint, payload, {
+          timeout:
+            this.config.get<number>('NOTIFICATIONS_TIMEOUT_MS') ?? 5000,
+        }),
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Error desconocido';
+      this.logger.error(
+        `Fallo el envio del correo de bienvenida a ${input.email}: ${message}`,
+        error as Error,
+      );
+    }
+  }
+
   async sendAccountDeletionWhatsapp(input: {
     phoneNumber: string;
     name: string;

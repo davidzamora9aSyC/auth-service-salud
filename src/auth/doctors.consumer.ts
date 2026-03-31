@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/commo
 import { ConfigService } from '@nestjs/config';
 import { Channel, Connection, ConsumeMessage, connect } from 'amqplib';
 import { PrismaService } from '../prisma/prisma.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import { AccountRole, OnboardingStatus } from '@prisma/client';
 
 @Injectable()
@@ -13,6 +14,7 @@ export class DoctorsConsumer implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly config: ConfigService,
     private readonly prisma: PrismaService,
+    private readonly notifications: NotificationsService,
   ) {}
 
   async onModuleInit() {
@@ -114,10 +116,53 @@ export class DoctorsConsumer implements OnModuleInit, OnModuleDestroy {
         this.logger.warn(`No se actualizo onboarding para ${authUserId}`);
       }
 
+      const account = await this.prisma.account.findFirst({
+        where: {
+          id: authUserId,
+          role: AccountRole.DOCTOR,
+        },
+        select: {
+          email: true,
+        },
+      });
+
+      const destinationEmail = account?.email?.trim().toLowerCase();
+      if (destinationEmail) {
+        try {
+          const name =
+            (await this.fetchDoctorNameByAuthUserId(authUserId)) ?? 'Especialista';
+          await this.notifications.sendDoctorOnboardingWelcomeEmail({
+            email: destinationEmail,
+            name,
+          });
+        } catch (error) {
+          this.logger.warn(
+            `No se pudo enviar bienvenida por correo a ${destinationEmail}: ${error instanceof Error ? error.message : error}`,
+          );
+        }
+      }
+
       this.channel.ack(msg);
     } catch (error) {
       this.logger.error('Error procesando evento', error as Error);
       this.channel.ack(msg);
+    }
+  }
+
+  private async fetchDoctorNameByAuthUserId(authUserId: string) {
+    const base =
+      this.config.get<string>('DOCTORS_INTERNAL_BASE_URL') ??
+      'http://doctors-service:3009/doctorsms';
+    try {
+      const response = await fetch(
+        `${base.replace(/\/$/, '')}/doctors/me?authUserId=${encodeURIComponent(authUserId)}`,
+        { headers: { 'x-role': 'SYSTEM' } },
+      );
+      if (!response.ok) return null;
+      const data = (await response.json()) as { fullName?: string | null };
+      return data.fullName?.trim() || null;
+    } catch {
+      return null;
     }
   }
 }
