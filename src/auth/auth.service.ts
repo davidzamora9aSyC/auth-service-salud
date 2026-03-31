@@ -2964,6 +2964,165 @@ export class AuthService {
     };
   }
 
+  async adminListAccounts(query: { page?: number; limit?: number; role?: string; q?: string }) {
+    const page = Math.max(1, Number(query.page ?? 1));
+    const limit = Math.min(Math.max(Number(query.limit ?? 20), 1), 100);
+    const skip = (page - 1) * limit;
+    const role = query.role?.toUpperCase()?.trim() || '';
+    const q = query.q?.trim() || '';
+
+    const where: Prisma.AccountWhereInput = {
+      deletedAt: null,
+    };
+
+    if (role) {
+      if (Object.values(AccountRole).includes(role as AccountRole)) {
+        where.role = role as AccountRole;
+      }
+    }
+
+    if (q) {
+      where.OR = [
+        { email: { contains: q, mode: 'insensitive' } },
+        { phoneNumber: { contains: q } },
+        { id: { equals: q } },
+        { doctorId: { equals: q } },
+        { subjectId: { equals: q } },
+      ];
+    }
+
+    const [items, total] = await this.prisma.$transaction([
+      this.prisma.account.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+        select: {
+          id: true,
+          email: true,
+          phoneNumber: true,
+          role: true,
+          status: true,
+          subjectId: true,
+          doctorId: true,
+          createdAt: true,
+          updatedAt: true,
+          deletedAt: true,
+        },
+      }),
+      this.prisma.account.count({ where }),
+    ]);
+
+    return {
+      items,
+      page,
+      limit,
+      total,
+    };
+  }
+
+  async adminGetAccount(id: string) {
+    const account = await this.prisma.account.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        email: true,
+        phoneNumber: true,
+        role: true,
+        status: true,
+        subjectId: true,
+        doctorId: true,
+        onboardingStatus: true,
+        twoFactorEnabled: true,
+        createdAt: true,
+        updatedAt: true,
+        deletedAt: true,
+      },
+    });
+
+    if (!account) {
+      throw new NotFoundException('Cuenta no encontrada');
+    }
+
+    return account;
+  }
+
+  async adminUpdateAccount(id: string, dto: { email?: string; phoneNumber?: string }) {
+    const account = await this.prisma.account.findUnique({ where: { id } });
+    if (!account) {
+      throw new NotFoundException('Cuenta no encontrada');
+    }
+    if (account.deletedAt) {
+      throw new BadRequestException('Cuenta eliminada');
+    }
+
+    const nextEmail = dto.email?.trim().toLowerCase();
+    const nextPhone = dto.phoneNumber?.trim() || null;
+
+    if (nextEmail && nextEmail !== account.email.toLowerCase()) {
+      const existing = await this.prisma.account.findUnique({ where: { email: nextEmail } });
+      if (existing && existing.id !== account.id) {
+        throw new ConflictException('El correo ya esta en uso');
+      }
+    }
+
+    if (nextPhone && nextPhone !== account.phoneNumber) {
+      const existing = await this.prisma.account.findUnique({ where: { phoneNumber: nextPhone } });
+      if (existing && existing.id !== account.id) {
+        throw new ConflictException('El telefono ya esta en uso');
+      }
+    }
+
+    const updated = await this.prisma.account.update({
+      where: { id },
+      data: {
+        email: nextEmail ?? account.email,
+        phoneNumber: nextPhone || null,
+      },
+      select: {
+        id: true,
+        email: true,
+        phoneNumber: true,
+        role: true,
+        status: true,
+        subjectId: true,
+        doctorId: true,
+        onboardingStatus: true,
+        twoFactorEnabled: true,
+        createdAt: true,
+        updatedAt: true,
+        deletedAt: true,
+      },
+    });
+
+    return updated;
+  }
+
+  async adminDeleteAccount(
+    id: string,
+    dto: { confirmEmail: string },
+    requesterId: string | null,
+    meta?: RequestMeta,
+  ) {
+    const account = await this.prisma.account.findUnique({ where: { id } });
+    if (!account) {
+      throw new NotFoundException('Cuenta no encontrada');
+    }
+    if (account.deletedAt) {
+      throw new BadRequestException('Cuenta eliminada');
+    }
+    if (requesterId && account.id === requesterId) {
+      throw new BadRequestException('No puedes eliminar tu propia cuenta');
+    }
+
+    const normalizedConfirm = dto.confirmEmail.trim().toLowerCase();
+    if (normalizedConfirm !== account.email.toLowerCase()) {
+      throw new BadRequestException('El correo no coincide');
+    }
+
+    return this.executeAccountDeletion(account, AccountDeletionChannel.EMAIL, meta);
+  }
+
   private hashToken(token: string) {
     return createHash('sha256').update(token).digest('hex');
   }
