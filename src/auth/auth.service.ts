@@ -52,6 +52,7 @@ import { SimulateUserRegisteredDto } from './dto/simulate-user-registered.dto';
 import { BootstrapAdminDto } from './dto/bootstrap-admin.dto';
 import { AccountDeletionStartDto } from './dto/account-deletion-start.dto';
 import { AccountDeletionConfirmDto } from './dto/account-deletion-confirm.dto';
+import { AdminOnboardingService } from './admin-onboarding.service';
 
 type RequestMeta = {
   ip?: string;
@@ -101,12 +102,14 @@ export class AuthService {
   private readonly usersBaseUrl: string;
   private readonly doctorsBaseUrl: string;
   private readonly clinicsInternalBaseUrl: string;
+  private readonly tokenDebug: boolean;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
     private readonly notifications: NotificationsService,
     private readonly rabbitmq: RabbitmqService,
+    private readonly adminOnboarding: AdminOnboardingService,
   ) {
     const inlinePrivateKey = this.config.get<string>('JWT_PRIVATE_KEY');
     if (inlinePrivateKey?.trim()) {
@@ -148,6 +151,7 @@ export class AuthService {
       this.config.get<string>('RECOVERY_MAX_ATTEMPTS', '5'),
       10,
     );
+    this.tokenDebug = this.config.get<string>('AUTH_DEBUG_TOKENS') === 'true';
     this.accountDeletionCodeTtl = parseInt(
       this.config.get<string>('ACCOUNT_DELETION_CODE_TTL', `${this.recoveryCodeTtl}`),
       10,
@@ -221,12 +225,23 @@ export class AuthService {
     if (dto.role === AccountRole.ADMIN) {
       throw new BadRequestException('No esta permitido registrar cuentas ADMIN por este endpoint');
     }
-    const inviteToken = dto.inviteToken?.trim();
-    if (inviteToken && dto.role !== AccountRole.DOCTOR) {
-      throw new BadRequestException('inviteToken solo aplica para registro de medicos');
-    }
-    const normalizedEmail = dto.email.trim().toLowerCase();
-    const normalizedPhone = this.normalizePhoneNumber(dto.phoneNumber);
+      const inviteToken = dto.inviteToken?.trim();
+      if (inviteToken && dto.role !== AccountRole.DOCTOR) {
+        throw new BadRequestException('inviteToken solo aplica para registro de medicos');
+      }
+      const normalizedEmail = dto.email.trim().toLowerCase();
+      const normalizedPhone = this.normalizePhoneNumber(dto.phoneNumber);
+      let invite: { doctorId: string } | null = null;
+      if (inviteToken && dto.role === AccountRole.DOCTOR) {
+        try {
+          invite = await this.adminOnboarding.resolveInviteForRegister(inviteToken, normalizedEmail);
+        } catch (error) {
+          if (!(error instanceof NotFoundException)) {
+            throw error;
+          }
+        }
+      }
+      const isAdminInvite = Boolean(invite);
     const firstName = dto.firstName?.trim() || undefined;
     const lastName = dto.lastName?.trim() || undefined;
     const existing = await this.prisma.account.findUnique({
@@ -238,7 +253,7 @@ export class AuthService {
       if (!passwordOk) {
         throw new ConflictException('El email ya esta registrado');
       }
-      return this.addRoleToAccount(existing, dto, firstName, lastName, inviteToken);
+      return this.addRoleToAccount(existing, dto, firstName, lastName, inviteToken, invite?.doctorId, isAdminInvite);
     }
     const existingPhone = await this.prisma.account.findUnique({
       where: { phoneNumber: normalizedPhone },
@@ -250,8 +265,8 @@ export class AuthService {
     const passwordHash = await argon2.hash(dto.password + salt, {
       type: argon2.argon2id,
     });
-    const doctorId =
-      dto.role === AccountRole.DOCTOR ? randomUUID() : null;
+      const doctorId =
+        dto.role === AccountRole.DOCTOR ? (invite?.doctorId ?? randomUUID()) : null;
     const onboardingStatus =
       dto.role === AccountRole.DOCTOR || dto.role === AccountRole.CLINIC
         ? OnboardingStatus.PENDING
@@ -283,14 +298,14 @@ export class AuthService {
       }
       throw error;
     }
-    if (account.role === AccountRole.DOCTOR && inviteToken) {
-      try {
-        await this.completeClinicDoctorInviteRegistration(account, inviteToken);
-      } catch (error) {
-        await this.prisma.account.delete({ where: { id: account.id } }).catch(() => undefined);
-        throw error;
+      if (account.role === AccountRole.DOCTOR && inviteToken && !isAdminInvite) {
+        try {
+          await this.completeClinicDoctorInviteRegistration(account, inviteToken);
+        } catch (error) {
+          await this.prisma.account.delete({ where: { id: account.id } }).catch(() => undefined);
+          throw error;
+        }
       }
-    }
     if (account.role === AccountRole.PATIENT) {
       if (!firstName || !lastName) {
         await this.prisma.account.delete({ where: { id: account.id } });
@@ -307,10 +322,13 @@ export class AuthService {
         throw error;
       }
     }
-    await this.publishUserRegisteredEvent(account, {
-      firstName,
-      lastName,
-    });
+      await this.publishUserRegisteredEvent(account, {
+        firstName,
+        lastName,
+      });
+      if (inviteToken && invite) {
+        await this.adminOnboarding.markInviteAccepted(inviteToken, account.id);
+      }
     await this.recordIdentityReuse(account, normalizedEmail, normalizedPhone);
     return this.issueTokens(account);
   }
@@ -321,6 +339,8 @@ export class AuthService {
     firstName?: string,
     lastName?: string,
     inviteToken?: string,
+    inviteDoctorId?: string | null,
+    isAdminInvite?: boolean,
   ) {
     if (account.status !== AccountStatus.ACTIVE) {
       throw new UnauthorizedException('Account disabled');
@@ -351,7 +371,10 @@ export class AuthService {
         },
       });
     } else if (dto.role === AccountRole.DOCTOR) {
-      const doctorId = randomUUID();
+      if (isAdminInvite && !inviteDoctorId) {
+        throw new BadRequestException('Invitacion invalida');
+      }
+      const doctorId = inviteDoctorId ?? randomUUID();
       await this.prisma.accountRoleProfile.create({
         data: {
           accountId: account.id,
@@ -368,7 +391,7 @@ export class AuthService {
         });
         account = { ...account, doctorId };
       }
-      if (inviteToken) {
+      if (inviteToken && !isAdminInvite) {
         await this.completeClinicDoctorInviteRegistration({ ...account }, inviteToken);
       }
     } else if (dto.role === AccountRole.CLINIC) {
@@ -3484,6 +3507,16 @@ export class AuthService {
       include: { account: true },
     });
     if (!stored || stored.expiresAt < new Date()) {
+      if (this.tokenDebug) {
+        this.logger.warn({
+          message: 'Refresh token invalid',
+          found: Boolean(stored),
+          now: new Date().toISOString(),
+          expiresAt: stored?.expiresAt?.toISOString() ?? null,
+          accountId: stored?.accountId ?? null,
+          tokenHashPrefix: hash.slice(0, 10),
+        });
+      }
       throw new UnauthorizedException('Invalid refresh token');
     }
     return stored;

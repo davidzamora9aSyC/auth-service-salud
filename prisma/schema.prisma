@@ -340,6 +340,25 @@ model CollaboratorInviteAgenda {
   @@index([agendaId])
 }
 
+model DoctorOnboardingInvite {
+  id                String       @id @default(uuid())
+  doctorId          String       @unique
+  authUserId        String?
+  email             String
+  phoneNumber       String?
+  firstName         String?
+  lastName          String?
+  tokenHash         String       @unique
+  status            InviteStatus @default(PENDING)
+  preferredPlanCode String?
+  expiresAt         DateTime
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+
+  @@index([email])
+  @@index([doctorId, status])
+}
+
 model RefreshToken {
   id        String   @id @default(uuid())
   account   Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)

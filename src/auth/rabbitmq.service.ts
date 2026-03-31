@@ -11,6 +11,8 @@ type AuthEventPayload = {
   phoneNumber?: string;
   firstName?: string;
   lastName?: string;
+  inviteToken?: string;
+  preferredPlanCode?: string;
 };
 
 type DoctorEventPayload = {
@@ -57,9 +59,9 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
   }
 
   async publishAuthEvent(event: {
-    type: 'AuthUserRegistered';
+    type: 'AuthUserRegistered' | 'DoctorOnboardingInviteCreated';
     routingKey: string;
-    data: AuthEventPayload;
+    data: Partial<AuthEventPayload>;
     correlationId?: string;
   }) {
     if (!this.channel) {
@@ -74,15 +76,21 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
       correlationId: event.correlationId,
       data: event.data,
     };
-    this.channel.publish(
-      this.authExchange,
-      event.routingKey,
-      Buffer.from(JSON.stringify(payload)),
-      {
-        persistent: true,
-        contentType: 'application/json',
-      },
-    );
+    try {
+      this.channel.publish(
+        this.authExchange,
+        event.routingKey,
+        Buffer.from(JSON.stringify(payload)),
+        {
+          persistent: true,
+          contentType: 'application/json',
+        },
+      );
+    } catch (error) {
+      this.logger.warn(
+        `No se pudo publicar evento ${event.type} (${event.routingKey}): ${error instanceof Error ? error.message : error}`,
+      );
+    }
   }
 
   async publishDoctorEvent(event: {
