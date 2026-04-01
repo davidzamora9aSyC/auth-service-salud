@@ -323,6 +323,15 @@ export class AdminOnboardingService {
   async resolveInviteForRegister(token: string, normalizedEmail: string) {
     const invite = await this.findInviteByToken(token);
     if (invite.status !== InviteStatus.PENDING) {
+      if (invite.status === InviteStatus.ACCEPTED) {
+        throw new BadRequestException('Invitacion ya fue aceptada');
+      }
+      if (invite.status === InviteStatus.REVOKED) {
+        throw new BadRequestException('Invitacion revocada');
+      }
+      if (invite.status === InviteStatus.EXPIRED) {
+        throw new BadRequestException('Invitacion expirada');
+      }
       throw new BadRequestException('Invitacion invalida');
     }
     if (invite.expiresAt < new Date()) {
