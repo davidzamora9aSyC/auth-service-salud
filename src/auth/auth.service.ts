@@ -3142,18 +3142,24 @@ export class AuthService {
     const firstName = profile?.firstName?.trim();
     const lastName = profile?.lastName?.trim();
 
+    const payload = {
+      authUserId: account.id,
+      role: account.role,
+      doctorId: account.doctorId ?? undefined,
+      email: account.email,
+      phoneNumber: account.phoneNumber ?? undefined,
+      firstName: firstName || undefined,
+      lastName: lastName || undefined,
+    };
+
+    this.logger.log(
+      `[auth.user_registered] publish -> ${JSON.stringify(payload)}`,
+    );
+
     await this.rabbitmq.publishAuthEvent({
       type: 'AuthUserRegistered',
       routingKey: 'auth.user_registered',
-      data: {
-        authUserId: account.id,
-        role: account.role,
-        doctorId: account.doctorId ?? undefined,
-        email: account.email,
-        phoneNumber: account.phoneNumber ?? undefined,
-        firstName: firstName || undefined,
-        lastName: lastName || undefined,
-      },
+      data: payload,
     });
   }
 

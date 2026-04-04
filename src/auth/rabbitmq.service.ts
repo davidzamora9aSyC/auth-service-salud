@@ -65,6 +65,9 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
     correlationId?: string;
   }) {
     if (!this.channel) {
+      this.logger.warn(
+        `RabbitMQ channel no disponible. Evento omitido: ${event.type} (${event.routingKey})`,
+      );
       return;
     }
     const payload = {
@@ -77,6 +80,11 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
       data: event.data,
     };
     try {
+      this.logger.log(
+        `Publicando evento ${event.type} -> ${event.routingKey} (${this.authExchange}) payload=${JSON.stringify(
+          payload,
+        )}`,
+      );
       this.channel.publish(
         this.authExchange,
         event.routingKey,
