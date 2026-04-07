@@ -2424,6 +2424,9 @@ export class AuthService {
 
       logs.push(
         await this.runDeletionStep('doctors', async () => {
+          const specialties = Number(
+            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorSpecialty" WHERE "doctorId" = ${doctorId}`,
+          );
           const diseases = Number(
             await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorDisease" WHERE "doctorId" = ${doctorId}`,
           );
@@ -2478,6 +2481,7 @@ export class AuthService {
                 "profileImageId" = NULL,
                 "gender" = NULL,
                 "rethusVerified" = FALSE,
+                "status" = CAST('INACTIVE' AS "doctors"."DoctorStatus"),
                 "reviewsCount" = 0,
                 "reviewsAverage" = 0,
                 "updatedAt" = ${deletedAt}
@@ -2485,6 +2489,7 @@ export class AuthService {
             `,
           );
           return {
+            specialties,
             diseases,
             locationPaymentMethods,
             locationNews,

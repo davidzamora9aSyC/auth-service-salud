@@ -11,6 +11,14 @@
     volumes:
       - meusalud-auth-db:/var/lib/postgresql/data
 
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
   auth-service:
     image: ${DOCKERHUB_USERNAME:-local}/meusalud-auth-service-salud:${IMAGE_TAG:-latest}
     build: .
@@ -199,11 +207,26 @@
       APPOINTMENTS_INTERNAL_BASE_URL: http://appointments-service:3010/appointmentsms
       USERS_INTERNAL_BASE_URL: http://users-service:3008/usersms
       DOCTORS_INTERNAL_BASE_URL: http://doctors-service:3009/doctorsms
+      IMAGES_INTERNAL_BASE_URL: http://images-service:3019/imagesms
     ports:
       - "3024:3024"
     depends_on:
       - db
       - appointments-service
+      - redis
+
+  support-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-support-service:${IMAGE_TAG:-latest}
+    build:
+      context: ../support-service
+    env_file:
+      - ../support-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=support
+    ports:
+      - "3027:3027"
+    depends_on:
+      - db
 
   questions-service:
     image: ${DOCKERHUB_USERNAME:-local}/meusalud-questions-service:${IMAGE_TAG:-latest}
@@ -285,6 +308,7 @@
       AI_BASE_URL: http://ai-assistant-service:3030
       GATEWAY_AI_DEBUG: "true"
       QUESTIONS_BASE_URL: http://questions-service:3026
+      SUPPORT_BASE_URL: http://support-service:3027
     ports:
       - "3020:3020"
     depends_on:
@@ -295,6 +319,7 @@
       - appointments-service
       - reviews-service
       - messages-service
+      - support-service
       - questions-service
       - services-service
       - availability-service
@@ -304,6 +329,7 @@
       - consents-service
       - analytics-service
       - images-service
+      - redis
 
   search-service:
     image: ${DOCKERHUB_USERNAME:-local}/meusalud-search-service:${IMAGE_TAG:-latest}
@@ -426,4 +452,5 @@ volumes:
   meusalud-auth-db:
   meili_data:
   minio_data:
+  redis_data:
 
