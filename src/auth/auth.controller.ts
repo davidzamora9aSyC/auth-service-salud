@@ -83,19 +83,53 @@ export class AuthController {
     return this.authService.getLoginHistory(authUserId, safeLimit);
   }
 
+  @Get('2fa')
+  getTwoFactorStatus(@Headers('x-auth-user-id') authUserId?: string) {
+    if (!authUserId) {
+      throw new UnauthorizedException('Token requerido');
+    }
+    return this.authService.getTwoFactorStatus(authUserId);
+  }
+
   @Post('2fa/setup')
-  setupTwoFactor(@Body() dto: TwoFactorSetupDto) {
-    return this.authService.setupTwoFactor(dto);
+  setupTwoFactor(
+    @Body() dto: TwoFactorSetupDto,
+    @Headers('x-auth-user-id') authUserId?: string,
+  ) {
+    if (!authUserId) {
+      throw new UnauthorizedException('Token requerido');
+    }
+    return this.authService.setupTwoFactor(authUserId, dto);
   }
 
   @Post('2fa/activate')
-  activateTwoFactor(@Body() dto: TwoFactorCodeDto) {
-    return this.authService.confirmTwoFactor(dto);
+  activateTwoFactor(
+    @Body() dto: TwoFactorCodeDto,
+    @Headers('x-auth-user-id') authUserId?: string,
+  ) {
+    if (!authUserId) {
+      throw new UnauthorizedException('Token requerido');
+    }
+    return this.authService.confirmTwoFactor(authUserId, dto);
+  }
+
+  @Post('2fa/disable/start')
+  startDisableTwoFactor(@Headers('x-auth-user-id') authUserId?: string) {
+    if (!authUserId) {
+      throw new UnauthorizedException('Token requerido');
+    }
+    return this.authService.startDisableTwoFactor(authUserId);
   }
 
   @Delete('2fa')
-  disableTwoFactor(@Body() dto: TwoFactorCodeDto) {
-    return this.authService.disableTwoFactor(dto);
+  disableTwoFactor(
+    @Body() dto: TwoFactorCodeDto,
+    @Headers('x-auth-user-id') authUserId?: string,
+  ) {
+    if (!authUserId) {
+      throw new UnauthorizedException('Token requerido');
+    }
+    return this.authService.disableTwoFactor(authUserId, dto);
   }
 
   @Post('recovery/start')

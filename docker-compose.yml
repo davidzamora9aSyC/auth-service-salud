@@ -25,6 +25,8 @@
     env_file:
       - .env
       - .env.local
+    environment:
+      TWO_FACTOR_WHATSAPP_TEMPLATE_KEY: MFA_LOGIN
     ports:
       - "3000:3000"
     volumes:
@@ -68,6 +70,7 @@
       WELCOME_TEMPLATE_DOCTOR: bienvenida_doctor
       WELCOME_TEMPLATE_CLINIC: bienvenida_clinica
       META_TEMPLATE_LANGUAGE_CODE: es_CO
+      META_TEMPLATE_MFA_LOGIN: restablecer_contrasena
     ports:
       - "3006:3006"
     depends_on:

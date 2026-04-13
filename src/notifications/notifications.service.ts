@@ -115,6 +115,51 @@ export class NotificationsService {
     }
   }
 
+  async sendTwoFactorWhatsapp(input: {
+    phoneNumber: string;
+    name: string;
+    code: string;
+    ttlSeconds?: number;
+  }) {
+    const baseUrl =
+      this.config.get<string>('NOTIFICATIONS_SERVICE_URL') ??
+      'http://communication-service:3006/communicationms';
+    if (!baseUrl) {
+      this.logger.warn('NOTIFICATIONS_SERVICE_URL no esta configurado');
+      return;
+    }
+    const endpoint = `${baseUrl.replace(/\/$/, '')}/internal/whatsapp/send-template`;
+    const templateKey =
+      this.config.get<string>('TWO_FACTOR_WHATSAPP_TEMPLATE_KEY') ??
+      'MFA_LOGIN';
+
+    const payload: WhatsappPayload = {
+      to_e164: input.phoneNumber,
+      template_code: templateKey,
+      variables: {
+        name: input.name,
+        code: input.code,
+        ttl: String(input.ttlSeconds ?? ''),
+      },
+    };
+
+    try {
+      await firstValueFrom(
+        this.http.post(endpoint, payload, {
+          timeout:
+            this.config.get<number>('NOTIFICATIONS_TIMEOUT_MS') ?? 5000,
+        }),
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'Error desconocido';
+      this.logger.error(
+        `Fallo el envio del WhatsApp de MFA a ${input.phoneNumber}: ${message}`,
+        error as Error,
+      );
+    }
+  }
+
   async sendPasswordRecoveryEmail(input: {
     email: string;
     name: string;
@@ -132,7 +177,7 @@ export class NotificationsService {
 
     const endpoint = `${baseUrl.replace(/\/$/, '')}/email/messages`;
     const expiresMinutes = Math.max(1, Math.ceil((input.ttlSeconds ?? 600) / 60));
-    const subject = 'Recuperacion de contrasena | MeuDoc';
+    const subject = 'Recuperacion de contraseña | MeuDoc';
 
     const supportEmail =
       this.config.get<string>('SUPPORT_EMAIL') ?? 'comunicaciones@meudoc.co';
@@ -155,7 +200,7 @@ export class NotificationsService {
     const text = [
       `Hola ${input.name},`,
       '',
-      'Recibimos una solicitud para cambiar la contrasena de tu cuenta en MeuDoc.',
+      'Recibimos una solicitud para cambiar la contraseña de tu cuenta en MeuDoc.',
       `Tu codigo de recuperacion es: ${input.code}`,
       `Este codigo vence en ${expiresMinutes} minuto(s).`,
       '',
@@ -177,9 +222,9 @@ export class NotificationsService {
               : ''
           }
           <div style="padding:24px;">
-            <h1 style="margin:0 0 12px 0;font-size:24px;line-height:1.25;">Recuperar contrasena</h1>
+            <h1 style="margin:0 0 12px 0;font-size:24px;line-height:1.25;">Recuperar contraseña</h1>
             <p style="margin:0 0 10px 0;font-size:15px;">Hola <strong>${safeName}</strong>,</p>
-            <p style="margin:0 0 10px 0;font-size:15px;">Recibimos una solicitud para cambiar la contrasena de tu cuenta en MeuDoc.</p>
+            <p style="margin:0 0 10px 0;font-size:15px;">Recibimos una solicitud para cambiar la contraseña de tu cuenta en MeuDoc.</p>
             <p style="margin:0 0 12px 0;font-size:15px;">Tu codigo de recuperacion es:</p>
             <div style="display:inline-block;background:#0f172a;color:#ffffff;padding:10px 14px;border-radius:10px;font-size:24px;font-weight:700;letter-spacing:4px;">${safeCode}</div>
             <p style="margin:12px 0 0 0;font-size:14px;">Este codigo vence en <strong>${safeMinutes} minuto(s)</strong>.</p>

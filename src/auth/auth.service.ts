@@ -19,6 +19,7 @@ import {
   LoginEventSource,
   OnboardingStatus,
   Prisma,
+  TwoFactorChallengePurpose,
   TwoFactorMethod,
 } from '@prisma/client';
 import { readFileSync } from 'node:fs';
@@ -431,11 +432,27 @@ export class AuthService {
       throw new BadRequestException('No hay perfil de doctor para esta cuenta');
     }
     const availableRoles = await this.getAvailableRoles(account);
-    if (account.twoFactorEnabled && account.twoFactorSecret) {
-      const challenge = await this.createTwoFactorChallenge(account.id, sessionRole);
+    if (account.twoFactorEnabled) {
+      const method = this.resolveTwoFactorMethod(account);
+      const challenge = await this.createTwoFactorChallenge(account, {
+        sessionRole,
+        method,
+        purpose: TwoFactorChallengePurpose.LOGIN,
+        destination: method === TwoFactorMethod.WHATSAPP ? account.phoneNumber : null,
+        generateCode: method === TwoFactorMethod.WHATSAPP,
+      });
+      if (method === TwoFactorMethod.WHATSAPP) {
+        await this.sendWhatsAppTwoFactorCode(account, challenge);
+      }
       return {
         requiresTwoFactor: true,
         challengeId: challenge.id,
+        method,
+        channel: method === TwoFactorMethod.WHATSAPP ? 'phone' : 'authenticator',
+        destinationMasked:
+          method === TwoFactorMethod.WHATSAPP && challenge.destination
+            ? this.maskDestination(AccountVerificationChannel.WHATSAPP, challenge.destination)
+            : null,
         expiresAt: challenge.expiresAt.toISOString(),
         availableRoles,
       };
@@ -715,14 +732,19 @@ export class AuthService {
       !challenge ||
       challenge.expiresAt < new Date() ||
       challenge.resolved ||
-      !challenge.account.twoFactorSecret
+      challenge.purpose !== TwoFactorChallengePurpose.LOGIN
     ) {
       throw new UnauthorizedException('Challenge expired');
     }
-    const valid = authenticator.check(
-      dto.code,
-      challenge.account.twoFactorSecret,
-    );
+    const method = challenge.method ?? this.resolveTwoFactorMethod(challenge.account);
+    const secret = challenge.account.twoFactorSecret;
+    let valid = false;
+    if (method === TwoFactorMethod.WHATSAPP) {
+      valid = Boolean(challenge.codeHash) &&
+        this.hashToken(dto.code) === challenge.codeHash;
+    } else if (secret) {
+      valid = authenticator.check(dto.code, secret);
+    }
     if (!valid) {
       throw new UnauthorizedException('Invalid code');
     }
@@ -1698,28 +1720,99 @@ export class AuthService {
     return { redirect: null, payload: tokens };
   }
 
-  async setupTwoFactor(dto: TwoFactorSetupDto) {
-    if (dto.method && dto.method !== TwoFactorMethod.TOTP) {
-      throw new BadRequestException('Unsupported two-factor method');
-    }
-    const { account } = await this.findRefreshToken(dto.refreshToken);
-    const secret = authenticator.generateSecret();
-    await this.prisma.account.update({
-      where: { id: account.id },
-      data: {
-        pendingTwoFactorSecret: secret,
-      },
-    });
-    const issuer = this.config.get<string>('MFA_ISSUER', 'MeuSalud');
+  async getTwoFactorStatus(authUserId: string) {
+    const account = await this.findAccountById(authUserId);
+    const method = account.twoFactorEnabled
+      ? this.resolveTwoFactorMethod(account)
+      : null;
     return {
-      secret,
-      otpAuthUrl: authenticator.keyuri(account.email, issuer, secret),
-      method: TwoFactorMethod.TOTP,
+      enabled: account.twoFactorEnabled,
+      method,
+      phoneNumberMasked: account.phoneNumber
+        ? this.maskDestination(AccountVerificationChannel.WHATSAPP, account.phoneNumber)
+        : null,
+      hasAuthenticatorApp: Boolean(account.twoFactorSecret),
     };
   }
 
-  async confirmTwoFactor(dto: TwoFactorCodeDto) {
-    const { account } = await this.findRefreshToken(dto.refreshToken);
+  async setupTwoFactor(authUserId: string, dto: TwoFactorSetupDto) {
+    const account = await this.findAccountById(authUserId);
+    if (dto.method === TwoFactorMethod.TOTP) {
+      const secret = authenticator.generateSecret();
+      await this.prisma.account.update({
+        where: { id: account.id },
+        data: {
+          pendingTwoFactorSecret: secret,
+        },
+      });
+      const issuer = this.config.get<string>('MFA_ISSUER', 'MeuSalud');
+      return {
+        method: TwoFactorMethod.TOTP,
+        secret,
+        otpAuthUrl: authenticator.keyuri(account.email, issuer, secret),
+        challengeId: null,
+        expiresAt: null,
+        destinationMasked: null,
+      };
+    }
+    if (!account.phoneNumber) {
+      throw new BadRequestException('No hay WhatsApp disponible');
+    }
+    const challenge = await this.createTwoFactorChallenge(account, {
+      method: TwoFactorMethod.WHATSAPP,
+      purpose: TwoFactorChallengePurpose.SETUP,
+      destination: account.phoneNumber,
+      generateCode: true,
+    });
+    await this.sendWhatsAppTwoFactorCode(account, challenge);
+    return {
+      method: TwoFactorMethod.WHATSAPP,
+      secret: null,
+      otpAuthUrl: null,
+      challengeId: challenge.id,
+      expiresAt: challenge.expiresAt.toISOString(),
+      destinationMasked: this.maskDestination(AccountVerificationChannel.WHATSAPP, account.phoneNumber),
+    };
+  }
+
+  async confirmTwoFactor(authUserId: string, dto: TwoFactorCodeDto) {
+    const account = await this.findAccountById(authUserId);
+    if (dto.challengeId) {
+      const challenge = await this.prisma.twoFactorChallenge.findUnique({
+        where: { id: dto.challengeId },
+      });
+      if (
+        !challenge ||
+        challenge.accountId !== account.id ||
+        challenge.purpose !== TwoFactorChallengePurpose.SETUP ||
+        challenge.method !== TwoFactorMethod.WHATSAPP ||
+        challenge.expiresAt < new Date() ||
+        challenge.resolved ||
+        !challenge.codeHash
+      ) {
+        throw new UnauthorizedException('Challenge expired');
+      }
+      if (this.hashToken(dto.code) !== challenge.codeHash) {
+        throw new UnauthorizedException('Invalid code');
+      }
+      await this.prisma.$transaction([
+        this.prisma.twoFactorChallenge.update({
+          where: { id: challenge.id },
+          data: { resolved: true },
+        }),
+        this.prisma.account.update({
+          where: { id: account.id },
+          data: {
+            twoFactorEnabled: true,
+            twoFactorMethod: TwoFactorMethod.WHATSAPP,
+            twoFactorSecret: null,
+            pendingTwoFactorSecret: null,
+          },
+        }),
+      ]);
+      return { twoFactorEnabled: true, method: TwoFactorMethod.WHATSAPP };
+    }
+
     if (!account.pendingTwoFactorSecret) {
       throw new BadRequestException('No pending setup');
     }
@@ -1731,24 +1824,86 @@ export class AuthService {
       data: {
         twoFactorSecret: account.pendingTwoFactorSecret,
         twoFactorEnabled: true,
+        twoFactorMethod: TwoFactorMethod.TOTP,
         pendingTwoFactorSecret: null,
       },
     });
-    return { twoFactorEnabled: true };
+    return { twoFactorEnabled: true, method: TwoFactorMethod.TOTP };
   }
 
-  async disableTwoFactor(dto: TwoFactorCodeDto) {
-    const { account } = await this.findRefreshToken(dto.refreshToken);
-    if (!account.twoFactorEnabled || !account.twoFactorSecret) {
+  async startDisableTwoFactor(authUserId: string) {
+    const account = await this.findAccountById(authUserId);
+    if (!account.twoFactorEnabled) {
       throw new BadRequestException('Two-factor is not enabled');
     }
-    if (!authenticator.check(dto.code, account.twoFactorSecret)) {
-      throw new UnauthorizedException('Invalid code');
+    const method = this.resolveTwoFactorMethod(account);
+    if (method !== TwoFactorMethod.WHATSAPP) {
+      return {
+        method,
+        challengeId: null,
+        expiresAt: null,
+        destinationMasked: null,
+      };
+    }
+    if (!account.phoneNumber) {
+      throw new BadRequestException('No hay WhatsApp disponible');
+    }
+    const challenge = await this.createTwoFactorChallenge(account, {
+      method: TwoFactorMethod.WHATSAPP,
+      purpose: TwoFactorChallengePurpose.DISABLE,
+      destination: account.phoneNumber,
+      generateCode: true,
+    });
+    await this.sendWhatsAppTwoFactorCode(account, challenge);
+    return {
+      method,
+      challengeId: challenge.id,
+      expiresAt: challenge.expiresAt.toISOString(),
+      destinationMasked: this.maskDestination(AccountVerificationChannel.WHATSAPP, account.phoneNumber),
+    };
+  }
+
+  async disableTwoFactor(authUserId: string, dto: TwoFactorCodeDto) {
+    const account = await this.findAccountById(authUserId);
+    if (!account.twoFactorEnabled) {
+      throw new BadRequestException('Two-factor is not enabled');
+    }
+    const method = this.resolveTwoFactorMethod(account);
+    if (method === TwoFactorMethod.WHATSAPP) {
+      if (!dto.challengeId) {
+        throw new BadRequestException('challengeId es requerido');
+      }
+      const challenge = await this.prisma.twoFactorChallenge.findUnique({
+        where: { id: dto.challengeId },
+      });
+      if (
+        !challenge ||
+        challenge.accountId !== account.id ||
+        challenge.purpose !== TwoFactorChallengePurpose.DISABLE ||
+        challenge.method !== TwoFactorMethod.WHATSAPP ||
+        challenge.expiresAt < new Date() ||
+        challenge.resolved ||
+        !challenge.codeHash
+      ) {
+        throw new UnauthorizedException('Challenge expired');
+      }
+      if (this.hashToken(dto.code) !== challenge.codeHash) {
+        throw new UnauthorizedException('Invalid code');
+      }
+      await this.prisma.twoFactorChallenge.update({
+        where: { id: challenge.id },
+        data: { resolved: true },
+      });
+    } else {
+      if (!account.twoFactorSecret || !authenticator.check(dto.code, account.twoFactorSecret)) {
+        throw new UnauthorizedException('Invalid code');
+      }
     }
     await this.prisma.account.update({
       where: { id: account.id },
       data: {
         twoFactorEnabled: false,
+        twoFactorMethod: null,
         twoFactorSecret: null,
         pendingTwoFactorSecret: null,
       },
@@ -1756,7 +1911,7 @@ export class AuthService {
     await this.prisma.twoFactorChallenge.deleteMany({
       where: { accountId: account.id },
     });
-    return { twoFactorEnabled: false };
+    return { twoFactorEnabled: false, method: null };
   }
 
   private async issueTokens(
@@ -1888,6 +2043,7 @@ export class AuthService {
       account: {
         id: account.id,
         email: account.email,
+        phoneNumber: account.phoneNumber,
         role: sessionRole,
         subjectId:
           sessionRole === AccountRole.PATIENT
@@ -3609,21 +3765,69 @@ export class AuthService {
     return trimmed;
   }
 
+  private resolveTwoFactorMethod(account: Account) {
+    return account.twoFactorMethod ?? TwoFactorMethod.TOTP;
+  }
+
+  private async findAccountById(authUserId: string) {
+    const account = await this.prisma.account.findUnique({
+      where: { id: authUserId },
+    });
+    if (!account || account.status !== AccountStatus.ACTIVE) {
+      throw new UnauthorizedException('Cuenta no disponible');
+    }
+    if (account.deletedAt) {
+      throw new BadRequestException('La cuenta ya fue eliminada');
+    }
+    return account;
+  }
+
+  private async sendWhatsAppTwoFactorCode(
+    account: Account,
+    challenge: { plainCode?: string | null; destination?: string | null },
+  ) {
+    if (!challenge.destination || !challenge.plainCode || !account.phoneNumber) {
+      throw new BadRequestException('No hay WhatsApp disponible');
+    }
+    const name = await this.resolveRecoveryName(account);
+    await this.notifications.sendTwoFactorWhatsapp({
+      phoneNumber: challenge.destination,
+      name,
+      code: challenge.plainCode,
+      ttlSeconds: this.challengeTtl,
+    });
+  }
+
   private async createTwoFactorChallenge(
-    accountId: string,
-    sessionRole?: AccountRole,
+    account: Account,
+    options?: {
+      sessionRole?: AccountRole;
+      method?: TwoFactorMethod;
+      purpose?: TwoFactorChallengePurpose;
+      destination?: string | null;
+      generateCode?: boolean;
+    },
   ) {
     const id = nanoid(48);
     const expiresAt = new Date(Date.now() + this.challengeTtl * 1000);
-    return this.prisma.twoFactorChallenge.create({
+    const method = options?.method ?? this.resolveTwoFactorMethod(account);
+    const code = options?.generateCode ? this.generateRecoveryCode() : null;
+    const challenge = await this.prisma.twoFactorChallenge.create({
       data: {
         id,
-        accountId,
-        sessionRole,
-        method: TwoFactorMethod.TOTP,
+        accountId: account.id,
+        sessionRole: options?.sessionRole,
+        method,
+        purpose: options?.purpose ?? TwoFactorChallengePurpose.LOGIN,
+        codeHash: code ? this.hashToken(code) : null,
+        destination: options?.destination ?? null,
         expiresAt,
       },
     });
+    return {
+      ...challenge,
+      plainCode: code,
+    };
   }
 
   private async resolveSessionRole(account: Account, requestedRole?: AccountRole) {

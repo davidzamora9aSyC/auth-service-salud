@@ -22,6 +22,13 @@ enum AccountStatus {
 
 enum TwoFactorMethod {
   TOTP
+  WHATSAPP
+}
+
+enum TwoFactorChallengePurpose {
+  LOGIN
+  SETUP
+  DISABLE
 }
 
 enum OnboardingStatus {
@@ -86,6 +93,7 @@ model Account {
   onboardingStatus       OnboardingStatus      @default(COMPLETE)
   status                 AccountStatus         @default(ACTIVE)
   twoFactorEnabled       Boolean               @default(false)
+  twoFactorMethod        TwoFactorMethod?
   twoFactorSecret        String?
   pendingTwoFactorSecret String?
   deletedAt              DateTime?
@@ -371,14 +379,17 @@ model RefreshToken {
 }
 
 model TwoFactorChallenge {
-  id        String           @id
-  account   Account          @relation(fields: [accountId], references: [id], onDelete: Cascade)
-  accountId String
+  id          String                   @id
+  account     Account                  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId   String
   sessionRole AccountRole?
-  method    TwoFactorMethod
-  expiresAt DateTime
-  resolved  Boolean          @default(false)
-  createdAt DateTime         @default(now())
+  method      TwoFactorMethod
+  purpose     TwoFactorChallengePurpose @default(LOGIN)
+  codeHash    String?
+  destination String?
+  expiresAt   DateTime
+  resolved    Boolean                  @default(false)
+  createdAt   DateTime                 @default(now())
 }
 
 model PasswordRecovery {
