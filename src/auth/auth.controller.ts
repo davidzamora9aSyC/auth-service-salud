@@ -22,6 +22,8 @@ import { PasswordChangeStartDto } from './dto/password-change-start.dto';
 import { PhoneChangeStartDto } from './dto/phone-change-start.dto';
 import { PhoneChangeVerifyDto } from './dto/phone-change-verify.dto';
 import { PhoneChangeCompleteDto } from './dto/phone-change-complete.dto';
+import { RegisterMeuredDto } from './dto/register-meured.dto';
+import { SelectProductAccessDto } from './dto/select-product-access.dto';
 
 @Controller('auth')
 export class AuthController {
@@ -30,6 +32,11 @@ export class AuthController {
   @Post('register')
   register(@Body() dto: RegisterDto) {
     return this.authService.register(dto);
+  }
+
+  @Post('register/meured')
+  registerMeured(@Body() dto: RegisterMeuredDto) {
+    return this.authService.registerMeured(dto);
   }
 
   @Post('register/collaborator')
@@ -63,6 +70,19 @@ export class AuthController {
   @Post('select-role')
   selectRole(@Body() dto: SelectRoleDto) {
     return this.authService.selectRole(dto.refreshToken, dto.role);
+  }
+
+  @Get('product-access/me')
+  productAccessMe(@Headers('x-auth-user-id') authUserId?: string) {
+    if (!authUserId) {
+      throw new UnauthorizedException('Token requerido');
+    }
+    return this.authService.listProductAccess(authUserId);
+  }
+
+  @Post('product-access/select')
+  selectProductAccess(@Body() dto: SelectProductAccessDto) {
+    return this.authService.selectProductAccess(dto);
   }
 
   @Post('logout')

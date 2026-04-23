@@ -13,6 +13,30 @@ enum AccountRole {
   CLINIC
   COLLABORATOR
   ADMIN
+  MEMBER
+}
+
+enum ProductCode {
+  MEUDOC_PRO
+  PATIENT_PORTAL
+  MEUDOC_ADMIN
+  MEURED
+}
+
+enum ProductRole {
+  DOCTOR
+  RESEARCHER
+  STUDENT
+  MEDICAL_ENTITY
+  ENTITY_ADMIN
+  ADMIN
+}
+
+enum ProductAccessStatus {
+  ACTIVE
+  PENDING
+  SUSPENDED
+  DISABLED
 }
 
 enum AccountStatus {
@@ -115,8 +139,27 @@ model Account {
   createdClinicMemberships ClinicDoctorMembership[] @relation("ClinicMembershipCreatedBy")
   createdClinicDoctorInvites ClinicDoctorInvite[]   @relation("ClinicDoctorInviteCreatedBy")
   roleProfiles           AccountRoleProfile[]
+  productAccesses        AccountProductAccess[]
 
   @@index([subjectId, role])
+}
+
+model AccountProductAccess {
+  id        String              @id @default(uuid())
+  accountId String
+  product   ProductCode
+  role      ProductRole
+  subjectId String?
+  status    ProductAccessStatus @default(ACTIVE)
+  createdAt DateTime            @default(now())
+  updatedAt DateTime            @updatedAt
+
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([accountId, product, role])
+  @@index([accountId])
+  @@index([product, role])
+  @@index([subjectId])
 }
 
 model AccountRoleProfile {
@@ -373,6 +416,9 @@ model RefreshToken {
   accountId String
   sessionRole AccountRole?
   sessionSubjectId String?
+  activeProduct ProductCode?
+  activeProductRole ProductRole?
+  productSubjectId String?
   tokenHash String   @unique
   expiresAt DateTime
   createdAt DateTime @default(now())

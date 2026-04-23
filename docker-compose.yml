@@ -231,6 +231,20 @@
     depends_on:
       - db
 
+  meured-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-meured-service:${IMAGE_TAG:-latest}
+    build:
+      context: ../meured-service
+    env_file:
+      - ../meured-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=meured
+      PORT: 3032
+    ports:
+      - "3032:3032"
+    depends_on:
+      - db
+
   questions-service:
     image: ${DOCKERHUB_USERNAME:-local}/meusalud-questions-service:${IMAGE_TAG:-latest}
     build:
@@ -289,6 +303,25 @@
     depends_on:
       - db
 
+  interoperability-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-interoperability-service:${IMAGE_TAG:-latest}
+    build:
+      context: ../interoperability-service
+    env_file:
+      - ../interoperability-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=interoperability
+      USERS_INTERNAL_BASE_URL: http://users-service:3008/usersms
+      DOCTORS_INTERNAL_BASE_URL: http://doctors-service:3009/doctorsms
+      APPOINTMENTS_INTERNAL_BASE_URL: http://appointments-service:3010/appointmentsms
+    ports:
+      - "3031:3031"
+    depends_on:
+      - db
+      - users-service
+      - doctors-service
+      - appointments-service
+
   meili:
     image: getmeili/meilisearch:v1.10
     restart: unless-stopped
@@ -312,6 +345,7 @@
       GATEWAY_AI_DEBUG: "true"
       QUESTIONS_BASE_URL: http://questions-service:3026
       SUPPORT_BASE_URL: http://support-service:3027
+      MEURED_BASE_URL: http://meured-service:3032
     ports:
       - "3020:3020"
     depends_on:
@@ -323,10 +357,12 @@
       - reviews-service
       - messages-service
       - support-service
+      - meured-service
       - questions-service
       - services-service
       - availability-service
       - templates-service
+      - interoperability-service
       - communication-service
       - reminders-service
       - consents-service

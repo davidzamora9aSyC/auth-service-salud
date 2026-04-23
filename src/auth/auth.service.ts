@@ -19,6 +19,9 @@ import {
   LoginEventSource,
   OnboardingStatus,
   Prisma,
+  ProductAccessStatus,
+  ProductCode,
+  ProductRole,
   TwoFactorChallengePurpose,
   TwoFactorMethod,
 } from '@prisma/client';
@@ -54,6 +57,8 @@ import { BootstrapAdminDto } from './dto/bootstrap-admin.dto';
 import { AccountDeletionStartDto } from './dto/account-deletion-start.dto';
 import { AccountDeletionConfirmDto } from './dto/account-deletion-confirm.dto';
 import { AdminOnboardingService } from './admin-onboarding.service';
+import { RegisterMeuredDto } from './dto/register-meured.dto';
+import { SelectProductAccessDto } from './dto/select-product-access.dto';
 
 type RequestMeta = {
   ip?: string;
@@ -66,6 +71,14 @@ type DeletionOperationLog = {
   ok: boolean;
   operations?: Record<string, number>;
   error?: string;
+};
+
+type ProductAccessContext = {
+  id: string;
+  product: ProductCode;
+  role: ProductRole;
+  subjectId?: string | null;
+  status: ProductAccessStatus;
 };
 
 @Injectable()
@@ -226,6 +239,9 @@ export class AuthService {
     if (dto.role === AccountRole.ADMIN) {
       throw new BadRequestException('No esta permitido registrar cuentas ADMIN por este endpoint');
     }
+    if (dto.role === AccountRole.MEMBER) {
+      throw new BadRequestException('Use el flujo de registro de MeuRed');
+    }
       const inviteToken = dto.inviteToken?.trim();
       if (inviteToken && dto.role !== AccountRole.DOCTOR) {
         throw new BadRequestException('inviteToken solo aplica para registro de medicos');
@@ -330,8 +346,111 @@ export class AuthService {
       if (inviteToken && invite) {
         await this.adminOnboarding.markInviteAccepted(inviteToken, account.id);
       }
+    await this.ensureLegacyProductAccess(account);
     await this.recordIdentityReuse(account, normalizedEmail, normalizedPhone);
-    return this.issueTokens(account);
+    const tokens = await this.issueTokens(account);
+    const availableProductAccess = await this.getAvailableProductAccess(account.id);
+    return { ...tokens, availableProductAccess };
+  }
+
+  async registerMeured(dto: RegisterMeuredDto) {
+    if (
+      dto.role !== ProductRole.DOCTOR &&
+      dto.role !== ProductRole.RESEARCHER &&
+      dto.role !== ProductRole.STUDENT &&
+      dto.role !== ProductRole.MEDICAL_ENTITY
+    ) {
+      throw new BadRequestException('Rol MeuRed no soportado');
+    }
+
+    const normalizedEmail = dto.email.trim().toLowerCase();
+    const normalizedPhone = dto.phoneNumber ? this.normalizePhoneNumber(dto.phoneNumber) : null;
+    let account = await this.prisma.account.findUnique({
+      where: { email: normalizedEmail },
+    });
+
+    if (account) {
+      if (!(await argon2.verify(account.passwordHash, dto.password + account.salt))) {
+        throw new ConflictException('El email ya esta registrado');
+      }
+      if (account.status !== AccountStatus.ACTIVE) {
+        throw new UnauthorizedException('Account disabled');
+      }
+      if (normalizedPhone && account.phoneNumber && account.phoneNumber !== normalizedPhone) {
+        throw new ConflictException('El telefono no coincide con la cuenta existente');
+      }
+      if (normalizedPhone && !account.phoneNumber) {
+        account = await this.prisma.account.update({
+          where: { id: account.id },
+          data: { phoneNumber: normalizedPhone },
+        });
+      }
+    } else {
+      if (!normalizedPhone) {
+        throw new BadRequestException('El telefono es obligatorio para crear una cuenta MeuRed');
+      }
+      const existingPhone = await this.prisma.account.findUnique({
+        where: { phoneNumber: normalizedPhone },
+      });
+      if (existingPhone) {
+        throw new ConflictException('El numero de telefono ya esta registrado');
+      }
+      const salt = randomBytes(24).toString('hex');
+      const passwordHash = await argon2.hash(dto.password + salt, {
+        type: argon2.argon2id,
+      });
+      account = await this.prisma.account.create({
+        data: {
+          email: normalizedEmail,
+          passwordHash,
+          salt,
+          role: AccountRole.MEMBER,
+          subjectId: null,
+          phoneNumber: normalizedPhone,
+          doctorId: null,
+          onboardingStatus: OnboardingStatus.COMPLETE,
+        },
+      });
+      await this.recordIdentityReuse(account, normalizedEmail, normalizedPhone);
+    }
+
+    const productAccess = await this.prisma.accountProductAccess.upsert({
+      where: {
+        accountId_product_role: {
+          accountId: account.id,
+          product: ProductCode.MEURED,
+          role: dto.role,
+        },
+      },
+      create: {
+        accountId: account.id,
+        product: ProductCode.MEURED,
+        role: dto.role,
+        subjectId: randomUUID(),
+        status: ProductAccessStatus.ACTIVE,
+      },
+      update: {
+        status: ProductAccessStatus.ACTIVE,
+      },
+    });
+
+    const availableProductAccess = await this.getAvailableProductAccess(account.id);
+    if (account.twoFactorEnabled) {
+      return this.buildTwoFactorRequiredResponse(account, {
+        sessionRole: account.role,
+        availableProductAccess,
+      });
+    }
+
+    const tokens = await this.issueTokens(account, {
+      sessionRole: account.role,
+      productAccess,
+    });
+    return {
+      requiresTwoFactor: false as const,
+      ...tokens,
+      availableProductAccess,
+    };
   }
 
   private async addRoleToAccount(
@@ -395,6 +514,7 @@ export class AuthService {
       if (inviteToken && !isAdminInvite) {
         await this.completeClinicDoctorInviteRegistration({ ...account }, inviteToken);
       }
+      await this.ensureProductAccess(account.id, ProductCode.MEUDOC_PRO, ProductRole.DOCTOR, doctorId);
     } else if (dto.role === AccountRole.CLINIC) {
       await this.prisma.accountRoleProfile.create({
         data: {
@@ -403,6 +523,7 @@ export class AuthService {
           onboardingStatus: OnboardingStatus.PENDING,
         },
       });
+      await this.ensureProductAccess(account.id, ProductCode.MEUDOC_PRO, ProductRole.MEDICAL_ENTITY, null);
     } else {
       throw new BadRequestException('Rol no soportado para registro multi-rol');
     }
@@ -410,7 +531,18 @@ export class AuthService {
     const updatedAccount = await this.prisma.account.findUniqueOrThrow({
       where: { id: account.id },
     });
-    return this.issueTokens(updatedAccount, { sessionRole: dto.role });
+    const availableRoles = await this.getAvailableRoles(updatedAccount);
+    const availableProductAccess = await this.getAvailableProductAccess(updatedAccount.id);
+    if (updatedAccount.twoFactorEnabled) {
+      return this.buildTwoFactorRequiredResponse(updatedAccount, {
+        sessionRole: dto.role,
+        availableRoles,
+        availableProductAccess,
+      });
+    }
+
+    const tokens = await this.issueTokens(updatedAccount, { sessionRole: dto.role });
+    return { ...tokens, availableRoles, availableProductAccess };
   }
 
   async login(dto: LoginDto, meta?: RequestMeta) {
@@ -433,36 +565,19 @@ export class AuthService {
     }
     const availableRoles = await this.getAvailableRoles(account);
     if (account.twoFactorEnabled) {
-      const method = this.resolveTwoFactorMethod(account);
-      const challenge = await this.createTwoFactorChallenge(account, {
+      return this.buildTwoFactorRequiredResponse(account, {
         sessionRole,
-        method,
-        purpose: TwoFactorChallengePurpose.LOGIN,
-        destination: method === TwoFactorMethod.WHATSAPP ? account.phoneNumber : null,
-        generateCode: method === TwoFactorMethod.WHATSAPP,
-      });
-      if (method === TwoFactorMethod.WHATSAPP) {
-        await this.sendWhatsAppTwoFactorCode(account, challenge);
-      }
-      return {
-        requiresTwoFactor: true,
-        challengeId: challenge.id,
-        method,
-        channel: method === TwoFactorMethod.WHATSAPP ? 'phone' : 'authenticator',
-        destinationMasked:
-          method === TwoFactorMethod.WHATSAPP && challenge.destination
-            ? this.maskDestination(AccountVerificationChannel.WHATSAPP, challenge.destination)
-            : null,
-        expiresAt: challenge.expiresAt.toISOString(),
         availableRoles,
-      };
+      });
     }
     const tokens = await this.issueTokens(account, { sessionRole });
     await this.recordLoginHistory(account, sessionRole, LoginEventSource.PASSWORD, meta);
+    const availableProductAccess = await this.getAvailableProductAccess(account.id);
     return {
       requiresTwoFactor: false,
       ...tokens,
       availableRoles,
+      availableProductAccess,
     };
   }
 
@@ -482,7 +597,50 @@ export class AuthService {
     await this.prisma.refreshToken.delete({ where: { tokenHash } });
     const tokens = await this.issueTokens(stored.account, { sessionRole });
     const availableRoles = await this.getAvailableRoles(stored.account);
-    return { requiresTwoFactor: false as const, ...tokens, availableRoles };
+    const availableProductAccess = await this.getAvailableProductAccess(stored.account.id);
+    return { requiresTwoFactor: false as const, ...tokens, availableRoles, availableProductAccess };
+  }
+
+  async listProductAccess(authUserId: string) {
+    return this.getAvailableProductAccess(authUserId);
+  }
+
+  async selectProductAccess(dto: SelectProductAccessDto) {
+    const tokenHash = this.hashToken(dto.refreshToken);
+    const stored = await this.prisma.refreshToken.findUnique({
+      where: { tokenHash },
+      include: { account: true },
+    });
+    if (!stored || stored.expiresAt < new Date()) {
+      throw new UnauthorizedException('Refresh token invalido o expirado');
+    }
+    if (stored.account.status !== AccountStatus.ACTIVE) {
+      throw new UnauthorizedException('Account disabled');
+    }
+
+    const productAccess = await this.prisma.accountProductAccess.findFirst({
+      where: {
+        accountId: stored.account.id,
+        product: dto.product,
+        role: dto.role,
+        ...(dto.accessId ? { id: dto.accessId } : {}),
+      },
+    });
+    if (!productAccess || productAccess.status === ProductAccessStatus.DISABLED) {
+      throw new BadRequestException('Acceso de producto no disponible');
+    }
+
+    await this.prisma.refreshToken.delete({ where: { tokenHash } });
+    const tokens = await this.issueTokens(stored.account, {
+      sessionRole: stored.account.role,
+      productAccess,
+    });
+    const availableProductAccess = await this.getAvailableProductAccess(stored.account.id);
+    return {
+      requiresTwoFactor: false as const,
+      ...tokens,
+      availableProductAccess,
+    };
   }
 
   async registerCollaborator(dto: RegisterCollaboratorDto) {
@@ -605,6 +763,11 @@ export class AuthService {
       return accountRecord;
     });
 
+    if (account.twoFactorEnabled) {
+      return this.buildTwoFactorRequiredResponse(account, {
+        sessionRole: account.role,
+      });
+    }
     return this.issueTokens(account);
   }
 
@@ -767,12 +930,25 @@ export class AuthService {
   }
 
   async refresh(refreshToken: string) {
-    const { account, sessionRole, sessionSubjectId } = await this.findRefreshToken(refreshToken);
+    const { account, sessionRole, sessionSubjectId, activeProduct, activeProductRole, productSubjectId } =
+      await this.findRefreshToken(refreshToken);
     await this.revokeRefreshToken(refreshToken);
-    return this.issueTokens(account, {
+    const tokens = await this.issueTokens(account, {
       sessionRole: sessionRole ?? account.role,
       sessionSubjectId: sessionSubjectId ?? undefined,
+      productAccess:
+        activeProduct && activeProductRole
+          ? {
+              id: '',
+              product: activeProduct,
+              role: activeProductRole,
+              subjectId: productSubjectId,
+              status: ProductAccessStatus.ACTIVE,
+          }
+          : undefined,
     });
+    const availableProductAccess = await this.getAvailableProductAccess(account.id);
+    return { ...tokens, availableProductAccess };
   }
 
   async logout(refreshToken: string) {
@@ -1916,7 +2092,12 @@ export class AuthService {
 
   private async issueTokens(
     account: Account,
-    options?: { scope?: string; sessionRole?: AccountRole; sessionSubjectId?: string | null },
+    options?: {
+      scope?: string;
+      sessionRole?: AccountRole;
+      sessionSubjectId?: string | null;
+      productAccess?: ProductAccessContext | null;
+    },
   ) {
     const sessionRole = options?.sessionRole ?? account.role;
     let sessionSubjectId = options?.sessionSubjectId ?? null;
@@ -2017,6 +2198,17 @@ export class AuthService {
     if (options?.scope) {
       payload.scope = options.scope;
     }
+    if (options?.productAccess) {
+      payload.activeProduct = options.productAccess.product;
+      payload.activeProductRole = options.productAccess.role;
+      if (options.productAccess.id) {
+        payload.productAccessId = options.productAccess.id;
+      }
+      if (options.productAccess.subjectId) {
+        payload.productSubjectId = options.productAccess.subjectId;
+      }
+      payload.productAccessStatus = options.productAccess.status;
+    }
     const signOptions: SignOptions = {
       algorithm: 'RS256',
       expiresIn: this.accessTtl,
@@ -2031,6 +2223,9 @@ export class AuthService {
         accountId: account.id,
         sessionRole,
         sessionSubjectId: sessionSubjectId ?? undefined,
+        activeProduct: options?.productAccess?.product,
+        activeProductRole: options?.productAccess?.role,
+        productSubjectId: options?.productAccess?.subjectId ?? undefined,
         tokenHash: refreshTokenHash,
         expiresAt: refreshExpiresAt,
       },
@@ -2058,6 +2253,9 @@ export class AuthService {
         clinicId:
           sessionRole === AccountRole.CLINIC ? account.subjectId : null,
         onboardingStatus: account.onboardingStatus,
+        activeProduct: options?.productAccess?.product ?? null,
+        activeProductRole: options?.productAccess?.role ?? null,
+        productSubjectId: options?.productAccess?.subjectId ?? null,
       },
     };
   }
@@ -2511,9 +2709,6 @@ export class AuthService {
           const addresses = Number(
             await this.prisma.$executeRaw`DELETE FROM "users"."PatientAddress" WHERE "patientId" = ${patientId}`,
           );
-          const documents = Number(
-            await this.prisma.$executeRaw`DELETE FROM "users"."PatientDocument" WHERE "patientId" = ${patientId}`,
-          );
           const preference = Number(
             await this.prisma.$executeRaw`DELETE FROM "users"."PatientPreference" WHERE "patientId" = ${patientId}`,
           );
@@ -2554,7 +2749,6 @@ export class AuthService {
             insurers,
             contacts,
             addresses,
-            documents,
             preference,
             patientUpdated,
           };
@@ -3471,8 +3665,8 @@ export class AuthService {
       },
       body: JSON.stringify({
         authUserId: account.id,
-        firstName,
-        lastName,
+        firstGivenName: firstName,
+        firstFamilyName: lastName,
         fullName,
         contact: {
           email: account.email,
@@ -3830,6 +4024,40 @@ export class AuthService {
     };
   }
 
+  private async buildTwoFactorRequiredResponse(
+    account: Account,
+    options: {
+      sessionRole?: AccountRole;
+      availableRoles?: AccountRole[];
+      availableProductAccess?: Awaited<ReturnType<AuthService['getAvailableProductAccess']>>;
+    } = {},
+  ) {
+    const method = this.resolveTwoFactorMethod(account);
+    const challenge = await this.createTwoFactorChallenge(account, {
+      sessionRole: options.sessionRole,
+      method,
+      purpose: TwoFactorChallengePurpose.LOGIN,
+      destination: method === TwoFactorMethod.WHATSAPP ? account.phoneNumber : null,
+      generateCode: method === TwoFactorMethod.WHATSAPP,
+    });
+    if (method === TwoFactorMethod.WHATSAPP) {
+      await this.sendWhatsAppTwoFactorCode(account, challenge);
+    }
+    return {
+      requiresTwoFactor: true as const,
+      challengeId: challenge.id,
+      method,
+      channel: method === TwoFactorMethod.WHATSAPP ? 'phone' as const : 'authenticator' as const,
+      destinationMasked:
+        method === TwoFactorMethod.WHATSAPP && challenge.destination
+          ? this.maskDestination(AccountVerificationChannel.WHATSAPP, challenge.destination)
+          : null,
+      expiresAt: challenge.expiresAt.toISOString(),
+      ...(options.availableRoles ? { availableRoles: options.availableRoles } : {}),
+      ...(options.availableProductAccess ? { availableProductAccess: options.availableProductAccess } : {}),
+    };
+  }
+
   private async resolveSessionRole(account: Account, requestedRole?: AccountRole) {
     if (!requestedRole) {
       return account.role;
@@ -3854,6 +4082,56 @@ export class AuthService {
     });
     const roles = new Set<AccountRole>([account.role, ...profiles.map((p) => p.role)]);
     return Array.from(roles);
+  }
+
+  private async getAvailableProductAccess(accountId: string) {
+    return this.prisma.accountProductAccess.findMany({
+      where: {
+        accountId,
+        status: { not: ProductAccessStatus.DISABLED },
+      },
+      orderBy: [{ product: 'asc' }, { role: 'asc' }],
+    });
+  }
+
+  private async ensureProductAccess(
+    accountId: string,
+    product: ProductCode,
+    role: ProductRole,
+    subjectId?: string | null,
+  ) {
+    return this.prisma.accountProductAccess.upsert({
+      where: {
+        accountId_product_role: {
+          accountId,
+          product,
+          role,
+        },
+      },
+      create: {
+        accountId,
+        product,
+        role,
+        subjectId: subjectId ?? null,
+        status: ProductAccessStatus.ACTIVE,
+      },
+      update: {
+        subjectId: subjectId ?? undefined,
+        status: ProductAccessStatus.ACTIVE,
+      },
+    });
+  }
+
+  private async ensureLegacyProductAccess(account: Account) {
+    if (account.role === AccountRole.DOCTOR && account.doctorId) {
+      await this.ensureProductAccess(account.id, ProductCode.MEUDOC_PRO, ProductRole.DOCTOR, account.doctorId);
+    }
+    if (account.role === AccountRole.CLINIC && account.subjectId) {
+      await this.ensureProductAccess(account.id, ProductCode.MEUDOC_PRO, ProductRole.MEDICAL_ENTITY, account.subjectId);
+    }
+    if (account.role === AccountRole.ADMIN) {
+      await this.ensureProductAccess(account.id, ProductCode.MEUDOC_ADMIN, ProductRole.ADMIN, null);
+    }
   }
 
   private async resolvePatientIdForSession(
