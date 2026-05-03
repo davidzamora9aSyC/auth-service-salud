@@ -91,7 +91,7 @@
       RABBITMQ_EXCHANGE_AI: ai.events
       GATEWAY_BASE_URL: http://meusaludgateway:3020
       AUTH_INTERNAL_BASE_URL: http://auth-service:3000/authms
-      AI_MODEL: gpt-5-mini
+      AI_MODEL: gpt-5.1
       AI_DEBUG_LOGS: "true"
       AI_USAGE_PRICE_INPUT: 0
       AI_USAGE_PRICE_OUTPUT: 0
@@ -240,10 +240,100 @@
     environment:
       DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=meured
       PORT: 3032
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
+      RABBITMQ_EXCHANGE_MEURED: meured.events
+      RABBITMQ_QUEUE_STATS: meured.q.stats
+      INTERNAL_API_KEY: local-internal-meured
     ports:
       - "3032:3032"
     depends_on:
       - db
+
+  meured-graph-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-meured-graph-service:${IMAGE_TAG:-latest}
+    build:
+      context: ../meured-graph-service
+    env_file:
+      - ../meured-graph-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=meured_graph
+      PORT: 3033
+      INTERNAL_API_KEY: local-internal-meured
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
+      RABBITMQ_EXCHANGE_MEURED: meured.events
+    ports:
+      - "3033:3033"
+    depends_on:
+      - db
+
+  meured-content-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-meured-content-service:${IMAGE_TAG:-latest}
+    build:
+      context: ../meured-content-service
+    env_file:
+      - ../meured-content-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=meured_content
+      PORT: 3034
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
+      RABBITMQ_EXCHANGE_MEURED: meured.events
+    ports:
+      - "3034:3034"
+    depends_on:
+      - db
+
+  meured-jobs-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-meured-jobs-service:${IMAGE_TAG:-latest}
+    build:
+      context: ../meured-jobs-service
+    env_file:
+      - ../meured-jobs-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=meured_jobs
+      PORT: 3035
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
+      RABBITMQ_EXCHANGE_MEURED: meured.events
+    ports:
+      - "3035:3035"
+    depends_on:
+      - db
+
+  meured-events-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-meured-events-service:${IMAGE_TAG:-latest}
+    build:
+      context: ../meured-events-service
+    env_file:
+      - ../meured-events-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=meured_events
+      PORT: 3036
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
+      RABBITMQ_EXCHANGE_MEURED: meured.events
+    ports:
+      - "3036:3036"
+    depends_on:
+      - db
+
+  meured-feed-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-meured-feed-service:${IMAGE_TAG:-latest}
+    build:
+      context: ../meured-feed-service
+    env_file:
+      - ../meured-feed-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=meured_feed
+      PORT: 3037
+      REDIS_URL: redis://redis:6379
+      GRAPH_BASE_URL: http://meured-graph-service:3033
+      INTERNAL_GRAPH_API_KEY: local-internal-meured
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
+      RABBITMQ_EXCHANGE_MEURED: meured.events
+      RABBITMQ_QUEUE_FEED: meured.q.feed
+    ports:
+      - "3037:3037"
+    depends_on:
+      - db
+      - redis
 
   questions-service:
     image: ${DOCKERHUB_USERNAME:-local}/meusalud-questions-service:${IMAGE_TAG:-latest}
@@ -346,10 +436,16 @@
       QUESTIONS_BASE_URL: http://questions-service:3026
       SUPPORT_BASE_URL: http://support-service:3027
       MEURED_BASE_URL: http://meured-service:3032
+      MEURED_GRAPH_BASE_URL: http://meured-graph-service:3033
+      MEURED_CONTENT_BASE_URL: http://meured-content-service:3034
+      MEURED_JOBS_BASE_URL: http://meured-jobs-service:3035
+      MEURED_EVENTS_BASE_URL: http://meured-events-service:3036
+      MEURED_FEED_BASE_URL: http://meured-feed-service:3037
     ports:
       - "3020:3020"
     depends_on:
       - auth-service
+      - ai-assistant-service
       - clinics-service
       - users-service
       - doctors-service
@@ -358,6 +454,11 @@
       - messages-service
       - support-service
       - meured-service
+      - meured-graph-service
+      - meured-content-service
+      - meured-jobs-service
+      - meured-events-service
+      - meured-feed-service
       - questions-service
       - services-service
       - availability-service
