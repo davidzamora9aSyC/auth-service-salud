@@ -1,45 +1,45 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Channel, Connection, ConsumeMessage, connect } from 'amqplib';
-import { AccountRole, OnboardingStatus } from '@prisma/client';
-import { PrismaService } from '../prisma/prisma.service';
+import { ProductRole } from '@prisma/client';
+import { AuthService } from './auth.service';
 
 @Injectable()
-export class ClinicsConsumer implements OnModuleInit, OnModuleDestroy {
-  private readonly logger = new Logger(ClinicsConsumer.name);
+export class EmployerMemberActivatedConsumer implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(EmployerMemberActivatedConsumer.name);
   private connection: Connection | null = null;
   private channel: Channel | null = null;
 
   constructor(
     private readonly config: ConfigService,
-    private readonly prisma: PrismaService,
+    private readonly authService: AuthService,
   ) {}
 
   async onModuleInit() {
     const url = this.config.get<string>('RABBITMQ_URL');
     if (!url) {
-      this.logger.warn('RABBITMQ_URL no configurado, consumer de clinicas deshabilitado');
+      this.logger.warn('RABBITMQ_URL no configurado, consumer employer member deshabilitado');
       return;
     }
 
     const queue =
-      this.config.get<string>('RABBITMQ_QUEUE_AUTH_CLINICS') ??
-      'auth.q.clinics';
+      this.config.get<string>('RABBITMQ_QUEUE_AUTH_EMPLOYER_MEMBERS') ??
+      'auth.q.employer_members';
     const exchange =
-      this.config.get<string>('RABBITMQ_EXCHANGE_CLINICS') ??
-      'clinics.events';
+      this.config.get<string>('RABBITMQ_EXCHANGE_EMPLOYERS') ??
+      'employers.events';
 
     try {
       this.connection = await connect(url);
       this.channel = await this.connection.createChannel();
       await this.channel.assertExchange(exchange, 'topic', { durable: true });
       await this.channel.assertQueue(queue, { durable: true });
-      await this.channel.bindQueue(queue, exchange, 'clinics.profile_completed');
+      await this.channel.bindQueue(queue, exchange, 'employers.member.activated');
       await this.channel.prefetch(5);
       await this.channel.consume(queue, (msg) => this.handleMessage(msg), {
         noAck: false,
       });
-      this.logger.log(`Escuchando ${queue}`);
+      this.logger.log(`Escuchando ${queue} (employers.member.activated)`);
     } catch (error) {
       this.logger.error('No se pudo conectar a RabbitMQ', error as Error);
     }
@@ -61,37 +61,33 @@ export class ClinicsConsumer implements OnModuleInit, OnModuleDestroy {
         data?: Record<string, unknown>;
       };
 
-      if (payload.type !== 'ClinicProfileCompleted') {
+      if (payload.type !== 'EmployerMemberActivated') {
         this.channel.ack(msg);
         return;
       }
 
       const authUserId = String(payload.data?.authUserId ?? '');
-      const clinicId = String(payload.data?.clinicId ?? '');
-      if (!authUserId || !clinicId) {
+      const employerId = String(payload.data?.employerId ?? '');
+      const productRole = String(payload.data?.productRole ?? ProductRole.EMPLOYER_BILLING);
+      if (!authUserId || !employerId) {
         this.channel.ack(msg);
         return;
       }
 
-      const completed = {
-        onboardingStatus: OnboardingStatus.COMPLETE,
-        subjectId: clinicId,
-      };
+      const role =
+        productRole === ProductRole.EMPLOYER_ADMIN
+          ? ProductRole.EMPLOYER_ADMIN
+          : ProductRole.EMPLOYER_BILLING;
 
-      await this.prisma.$transaction([
-        this.prisma.accountRoleProfile.updateMany({
-          where: { accountId: authUserId, role: AccountRole.CLINIC },
-          data: completed,
-        }),
-        this.prisma.account.updateMany({
-          where: { id: authUserId, role: AccountRole.CLINIC },
-          data: completed,
-        }),
-      ]);
+      await this.authService.grantEmployerAccess({
+        accountId: authUserId,
+        employerId,
+        productRole: role,
+      });
 
       this.channel.ack(msg);
     } catch (error) {
-      this.logger.error('Error procesando evento de clinica', error as Error);
+      this.logger.error('Error procesando EmployerMemberActivated', error as Error);
       this.channel.ack(msg);
     }
   }

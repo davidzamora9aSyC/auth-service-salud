@@ -1,11 +1,24 @@
-import { Body, Controller, Get, Headers, Param, Post, UnauthorizedException } from '@nestjs/common';
+import { Body, Controller, Get, Headers, Param, Post, Query, UnauthorizedException } from '@nestjs/common';
 import { AdminOnboardingService } from './admin-onboarding.service';
 import { CreateDoctorOnboardingInviteDto } from './dto/create-doctor-onboarding-invite.dto';
 import { CreatePublicDoctorDto } from './dto/create-public-doctor.dto';
+import { AdminListDoctorOnboardingInvitesDto } from './dto/admin-list-doctor-onboarding-invites.dto';
 
 @Controller()
 export class AdminOnboardingController {
   constructor(private readonly onboarding: AdminOnboardingService) {}
+
+  @Get('admin/doctor-onboarding/invites')
+  listInvites(
+    @Query() query: AdminListDoctorOnboardingInvitesDto,
+    @Headers('x-role') role?: string,
+  ) {
+    const normalizedRole = role?.toUpperCase();
+    if (normalizedRole !== 'ADMIN' && normalizedRole !== 'SYSTEM') {
+      throw new UnauthorizedException('No autorizado');
+    }
+    return this.onboarding.listInvites(query);
+  }
 
   @Post('admin/doctor-onboarding/invites')
   createInvite(

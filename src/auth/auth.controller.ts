@@ -5,6 +5,11 @@ import { AuthService } from './auth.service';
 import { RegisterDto } from './dto/register.dto';
 import { LoginDto } from './dto/login.dto';
 import { RegisterCollaboratorDto } from './dto/register-collaborator.dto';
+import { CreateEmployerInviteAccountDto } from './dto/create-employer-invite-account.dto';
+import { CreatePatientInviteAccountDto } from './dto/create-patient-invite-account.dto';
+import { EmailExistsDto } from './dto/email-exists.dto';
+import { LinkPatientAffiliateInviteDto } from './dto/link-patient-affiliate-invite.dto';
+import { GrantEmployerAccessDto } from './dto/grant-employer-access.dto';
 import { VerifyTwoFactorDto } from './dto/verify-two-factor.dto';
 import { RefreshTokenDto } from './dto/refresh-token.dto';
 import { TwoFactorSetupDto } from './dto/two-factor-setup.dto';
@@ -270,6 +275,67 @@ export class AuthController {
       throw new UnauthorizedException('No autorizado');
     }
     return this.authService.checkPhoneAvailability(dto);
+  }
+
+  @Post('internal/employer-invite/accounts')
+  createEmployerInviteAccount(
+    @Body() dto: CreateEmployerInviteAccountDto,
+    @Headers('x-internal-service-token') internalToken?: string,
+  ) {
+    this.assertInternalServiceToken(internalToken);
+    return this.authService.createEmployerInviteAccount(dto);
+  }
+
+  @Post('internal/employer-member/verify-or-create')
+  verifyOrCreateEmployerMember(
+    @Body() dto: CreateEmployerInviteAccountDto,
+    @Headers('x-internal-service-token') internalToken?: string,
+  ) {
+    this.assertInternalServiceToken(internalToken);
+    return this.authService.verifyOrCreateEmployerMemberForInvite(dto);
+  }
+
+  @Post('internal/patient/verify-or-create')
+  verifyOrCreatePatient(
+    @Body() dto: CreatePatientInviteAccountDto,
+    @Headers('x-internal-service-token') internalToken?: string,
+  ) {
+    this.assertInternalServiceToken(internalToken);
+    return this.authService.verifyOrCreatePatientForInvite(dto);
+  }
+
+  @Post('internal/accounts/email-exists')
+  emailExists(
+    @Body() dto: EmailExistsDto,
+    @Headers('x-internal-service-token') internalToken?: string,
+  ) {
+    this.assertInternalServiceToken(internalToken);
+    return this.authService.accountExistsByEmail(dto.email);
+  }
+
+  @Post('internal/patient/link-affiliate-invite')
+  linkPatientAffiliateInvite(
+    @Body() dto: LinkPatientAffiliateInviteDto,
+    @Headers('x-internal-service-token') internalToken?: string,
+  ) {
+    this.assertInternalServiceToken(internalToken);
+    return this.authService.linkPatientForAffiliateInvite(dto);
+  }
+
+  @Post('internal/employer-access/grant')
+  grantEmployerAccess(
+    @Body() dto: GrantEmployerAccessDto,
+    @Headers('x-internal-service-token') internalToken?: string,
+  ) {
+    this.assertInternalServiceToken(internalToken);
+    return this.authService.grantEmployerAccess(dto);
+  }
+
+  private assertInternalServiceToken(token?: string) {
+    const expected = process.env.INTERNAL_SERVICE_TOKEN;
+    if (expected && token !== expected) {
+      throw new UnauthorizedException('No autorizado');
+    }
   }
 
   @Get('oauth/google')

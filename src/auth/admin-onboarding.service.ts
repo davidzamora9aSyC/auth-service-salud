@@ -12,6 +12,8 @@ import { InviteStatus } from '@prisma/client';
 import { CreateDoctorOnboardingInviteDto } from './dto/create-doctor-onboarding-invite.dto';
 import { CreatePublicDoctorDto } from './dto/create-public-doctor.dto';
 import { RabbitmqService } from './rabbitmq.service';
+import { AdminListDoctorOnboardingInvitesDto } from './dto/admin-list-doctor-onboarding-invites.dto';
+import type { DoctorOnboardingInviteAdminListResponse, DoctorOnboardingInviteOnboardingInfo } from './types/doctor-onboarding-invite-admin.types';
 
 type PrefillProfile = {
   firstName?: string;
@@ -61,6 +63,7 @@ type PrefillService = {
 @Injectable()
 export class AdminOnboardingService {
   private readonly doctorsBaseUrl: string;
+  private readonly doctorsInternalBaseUrl: string;
   private readonly availabilityBaseUrl: string;
   private readonly servicesBaseUrl: string;
   private readonly inviteTtlMs: number;
@@ -73,6 +76,8 @@ export class AdminOnboardingService {
     this.doctorsBaseUrl =
       this.config.get<string>('DOCTORS_BASE_URL') ??
       'http://doctors-service:3009/doctorsms';
+    this.doctorsInternalBaseUrl =
+      this.config.get<string>('DOCTORS_INTERNAL_BASE_URL') ?? this.doctorsBaseUrl;
     this.availabilityBaseUrl =
       this.config.get<string>('AVAILABILITY_BASE_URL') ??
       'http://availability-service:3012/availabilityms';
@@ -83,6 +88,58 @@ export class AdminOnboardingService {
       this.config.get<string>('DOCTOR_ONBOARDING_INVITE_TTL_MS', '1209600000'),
       10,
     ); // 14 dias por defecto
+  }
+
+  async listInvites(query: AdminListDoctorOnboardingInvitesDto): Promise<DoctorOnboardingInviteAdminListResponse> {
+    const page = query.page && query.page > 0 ? query.page : 1;
+    const limit = query.limit && query.limit > 0 ? Math.min(query.limit, 100) : 50;
+    const skip = (page - 1) * limit;
+    const q = (query.q ?? '').trim().toLowerCase();
+
+    const where = q
+      ? {
+          OR: [
+            { email: { contains: q, mode: 'insensitive' as const } },
+            { firstName: { contains: q, mode: 'insensitive' as const } },
+            { lastName: { contains: q, mode: 'insensitive' as const } },
+            { phoneNumber: { contains: q, mode: 'insensitive' as const } },
+            { doctorId: { contains: q, mode: 'insensitive' as const } },
+          ],
+        }
+      : {};
+
+    const [items, total] = await Promise.all([
+      this.prisma.doctorOnboardingInvite.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+      }),
+      this.prisma.doctorOnboardingInvite.count({ where }),
+    ]);
+
+    const doctorIds = Array.from(new Set(items.map((it) => it.doctorId).filter(Boolean)));
+    const onboardingByDoctorId = await this.fetchOnboardingInfoByDoctorIds(doctorIds);
+
+    return {
+      items: items.map((it) => ({
+        id: it.id,
+        doctorId: it.doctorId,
+        email: it.email,
+        phoneNumber: it.phoneNumber ?? null,
+        firstName: it.firstName ?? null,
+        lastName: it.lastName ?? null,
+        status: it.status,
+        preferredPlanCode: it.preferredPlanCode ?? null,
+        expiresAt: it.expiresAt.toISOString(),
+        createdAt: it.createdAt.toISOString(),
+        updatedAt: it.updatedAt.toISOString(),
+        onboarding: onboardingByDoctorId.get(it.doctorId) ?? null,
+      })),
+      page,
+      limit,
+      total,
+    };
   }
 
   async createInvite(dto: CreateDoctorOnboardingInviteDto) {
@@ -566,5 +623,38 @@ export class AdminOnboardingService {
         }),
       });
     }
+  }
+
+  private async fetchOnboardingInfoByDoctorIds(doctorIds: string[]) {
+    const map = new Map<string, DoctorOnboardingInviteOnboardingInfo>();
+    if (!doctorIds.length) return map;
+
+    try {
+      const url = `${this.doctorsInternalBaseUrl.replace(/\/$/, '')}/internal/doctors/onboarding/steps`;
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-role': 'SYSTEM' },
+        body: JSON.stringify({ doctorIds }),
+      });
+      if (!response.ok) {
+        return map;
+      }
+      const data = (await response.json()) as {
+        items?: Array<{ doctorId: string; status?: string | null; profileStatus?: string | null; onboardingStep?: string | null }>;
+      };
+      for (const item of data.items ?? []) {
+        if (!item?.doctorId) continue;
+        map.set(String(item.doctorId), {
+          doctorId: String(item.doctorId),
+          status: item.status ?? null,
+          profileStatus: item.profileStatus ?? null,
+          onboardingStep: item.onboardingStep ?? null,
+        });
+      }
+    } catch {
+      return map;
+    }
+
+    return map;
   }
 }

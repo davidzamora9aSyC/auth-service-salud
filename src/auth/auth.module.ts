@@ -9,11 +9,23 @@ import { NotificationsModule } from '../notifications/notifications.module';
 import { RabbitmqService } from './rabbitmq.service';
 import { DoctorsConsumer } from './doctors.consumer';
 import { ClinicsConsumer } from './clinics.consumer';
+import { EmployersConsumer } from './employers.consumer';
+import { EmployerMemberActivatedConsumer } from './employer-member-activated.consumer';
 import { AdminOnboardingService } from './admin-onboarding.service';
+import { EmployersHttpClient } from './employers-http.client';
 
 @Module({
   imports: [PrismaModule, NotificationsModule],
   controllers: [AuthController, OAuthController, AdminOnboardingController, AdminAccountsController],
-  providers: [AuthService, RabbitmqService, DoctorsConsumer, ClinicsConsumer, AdminOnboardingService],
+  providers: [
+    AuthService,
+    RabbitmqService,
+    DoctorsConsumer,
+    ClinicsConsumer,
+    EmployersConsumer,
+    EmployerMemberActivatedConsumer,
+    AdminOnboardingService,
+    EmployersHttpClient,
+  ],
 })
 export class AuthModule {}

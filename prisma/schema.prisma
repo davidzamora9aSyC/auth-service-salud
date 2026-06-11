@@ -11,6 +11,7 @@ enum AccountRole {
   PATIENT
   DOCTOR
   CLINIC
+  EMPLOYER
   COLLABORATOR
   ADMIN
   MEMBER
@@ -21,6 +22,7 @@ enum ProductCode {
   PATIENT_PORTAL
   MEUDOC_ADMIN
   MEURED
+  MEUDOC_EMPLOYER
 }
 
 enum ProductRole {
@@ -30,6 +32,8 @@ enum ProductRole {
   MEDICAL_ENTITY
   ENTITY_ADMIN
   ADMIN
+  EMPLOYER_ADMIN
+  EMPLOYER_BILLING
 }
 
 enum ProductAccessStatus {
@@ -114,6 +118,7 @@ model Account {
   role                   AccountRole
   subjectId              String?
   doctorId               String?               @unique
+  employerId             String?               @unique
   onboardingStatus       OnboardingStatus      @default(COMPLETE)
   status                 AccountStatus         @default(ACTIVE)
   twoFactorEnabled       Boolean               @default(false)

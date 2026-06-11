@@ -1,12 +1,12 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Channel, Connection, ConsumeMessage, connect } from 'amqplib';
-import { AccountRole, OnboardingStatus } from '@prisma/client';
+import { AccountRole, OnboardingStatus, ProductCode, ProductRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 
 @Injectable()
-export class ClinicsConsumer implements OnModuleInit, OnModuleDestroy {
-  private readonly logger = new Logger(ClinicsConsumer.name);
+export class EmployersConsumer implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(EmployersConsumer.name);
   private connection: Connection | null = null;
   private channel: Channel | null = null;
 
@@ -18,23 +18,23 @@ export class ClinicsConsumer implements OnModuleInit, OnModuleDestroy {
   async onModuleInit() {
     const url = this.config.get<string>('RABBITMQ_URL');
     if (!url) {
-      this.logger.warn('RABBITMQ_URL no configurado, consumer de clinicas deshabilitado');
+      this.logger.warn('RABBITMQ_URL no configurado, consumer de empresas deshabilitado');
       return;
     }
 
     const queue =
-      this.config.get<string>('RABBITMQ_QUEUE_AUTH_CLINICS') ??
-      'auth.q.clinics';
+      this.config.get<string>('RABBITMQ_QUEUE_AUTH_EMPLOYERS') ??
+      'auth.q.employers';
     const exchange =
-      this.config.get<string>('RABBITMQ_EXCHANGE_CLINICS') ??
-      'clinics.events';
+      this.config.get<string>('RABBITMQ_EXCHANGE_EMPLOYERS') ??
+      'employers.events';
 
     try {
       this.connection = await connect(url);
       this.channel = await this.connection.createChannel();
       await this.channel.assertExchange(exchange, 'topic', { durable: true });
       await this.channel.assertQueue(queue, { durable: true });
-      await this.channel.bindQueue(queue, exchange, 'clinics.profile_completed');
+      await this.channel.bindQueue(queue, exchange, 'employers.profile_completed');
       await this.channel.prefetch(5);
       await this.channel.consume(queue, (msg) => this.handleMessage(msg), {
         noAck: false,
@@ -61,37 +61,46 @@ export class ClinicsConsumer implements OnModuleInit, OnModuleDestroy {
         data?: Record<string, unknown>;
       };
 
-      if (payload.type !== 'ClinicProfileCompleted') {
+      if (payload.type !== 'EmployerProfileCompleted') {
         this.channel.ack(msg);
         return;
       }
 
       const authUserId = String(payload.data?.authUserId ?? '');
-      const clinicId = String(payload.data?.clinicId ?? '');
-      if (!authUserId || !clinicId) {
+      const employerId = String(payload.data?.employerId ?? '');
+      if (!authUserId || !employerId) {
         this.channel.ack(msg);
         return;
       }
 
       const completed = {
         onboardingStatus: OnboardingStatus.COMPLETE,
-        subjectId: clinicId,
+        subjectId: employerId,
       };
 
       await this.prisma.$transaction([
         this.prisma.accountRoleProfile.updateMany({
-          where: { accountId: authUserId, role: AccountRole.CLINIC },
+          where: { accountId: authUserId, role: AccountRole.EMPLOYER },
           data: completed,
         }),
         this.prisma.account.updateMany({
-          where: { id: authUserId, role: AccountRole.CLINIC },
+          where: { id: authUserId, role: AccountRole.EMPLOYER },
           data: completed,
         }),
       ]);
 
+      await this.prisma.accountProductAccess.updateMany({
+        where: {
+          accountId: authUserId,
+          product: ProductCode.MEUDOC_EMPLOYER,
+          role: ProductRole.EMPLOYER_ADMIN,
+        },
+        data: { subjectId: employerId },
+      });
+
       this.channel.ack(msg);
     } catch (error) {
-      this.logger.error('Error procesando evento de clinica', error as Error);
+      this.logger.error('Error procesando evento de empresa', error as Error);
       this.channel.ack(msg);
     }
   }

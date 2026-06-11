@@ -5,7 +5,7 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { createHash, randomBytes } from 'node:crypto';
-import { CollaboratorStatus, InviteStatus } from '@prisma/client';
+import { AccountRole, CollaboratorStatus, InviteStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateCollaboratorInviteDto } from './dto/create-collaborator-invite.dto';
 import { UpdateCollaboratorDto } from './dto/update-collaborator.dto';
@@ -30,6 +30,16 @@ export class CollaboratorsService implements OnModuleInit {
     const normalizedPhone = dto.phoneNumber
       ? this.normalizePhoneNumber(dto.phoneNumber)
       : null;
+
+    const existingAccount = await this.prisma.account.findUnique({
+      where: { email: normalizedEmail },
+      select: { role: true },
+    });
+    if (existingAccount?.role === AccountRole.DOCTOR) {
+      throw new BadRequestException(
+        'No se puede invitar como colaborador a un doctor ya registrado',
+      );
+    }
     const permissions = await this.resolvePermissions(dto.permissions);
     const token = this.generateToken();
     const tokenHash = this.hashToken(token);

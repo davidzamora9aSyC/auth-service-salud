@@ -27,6 +27,11 @@
       - .env.local
     environment:
       TWO_FACTOR_WHATSAPP_TEMPLATE_KEY: MFA_LOGIN
+      RABBITMQ_EXCHANGE_EMPLOYERS: employers.events
+      RABBITMQ_QUEUE_AUTH_EMPLOYERS: auth.q.employers
+      RABBITMQ_QUEUE_AUTH_EMPLOYER_MEMBERS: auth.q.employer_members
+      EMPLOYERS_BASE_URL: http://employers-service:3041/employersms
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-dev-internal-employers-token}
     ports:
       - "3000:3000"
     volumes:
@@ -63,8 +68,10 @@
       DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=notification
       RABBITMQ_QUEUE_AUTH: comms.q.auth
       RABBITMQ_QUEUE_QUESTIONS: comms.q.questions
+      RABBITMQ_QUEUE_EMPLOYERS: comms.q.employers
       RABBITMQ_EXCHANGE_AUTH: auth.events
       RABBITMQ_EXCHANGE_QUESTIONS: questions.events
+      RABBITMQ_EXCHANGE_EMPLOYERS: employers.events
       RABBITMQ_EXCHANGE_COMMUNICATION: communication.events
       WELCOME_TEMPLATE_PATIENT: bienvenida_pacientes
       WELCOME_TEMPLATE_DOCTOR: bienvenida_doctor
@@ -174,10 +181,13 @@
       USERS_INTERNAL_BASE_URL: http://users-service:3008/usersms
       IMAGES_INTERNAL_BASE_URL: http://images-service:3019/imagesms
       REMINDERS_INTERNAL_BASE_URL: http://reminders-service:3021/remindersms
+      COMPANYCARE_INTERNAL_BASE_URL: http://company-care-service:3052/companycarems
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-dev-internal-employers-token}
     ports:
       - "3010:3010"
     depends_on:
       - db
+      - company-care-service
 
   reviews-service:
     image: ${DOCKERHUB_USERNAME:-local}/meusalud-reviews-service:${IMAGE_TAG:-latest}
@@ -431,6 +441,7 @@
     environment:
       CORS_ALLOWED_ORIGINS: http://localhost:3000,http://localhost:3001,http://localhost:5173,http://localhost:3007,https://front-meu-salud.vercel.app,http://192.168.1.7:3007,https://hamulate-lakenya-contributively.ngrok-free.dev
       CLINICS_BASE_URL: http://clinics-service:3025
+      INVOICING_BASE_URL: http://invoicing-service:3040
       AI_BASE_URL: http://ai-assistant-service:3030
       GATEWAY_AI_DEBUG: "true"
       QUESTIONS_BASE_URL: http://questions-service:3026
@@ -441,6 +452,9 @@
       MEURED_JOBS_BASE_URL: http://meured-jobs-service:3035
       MEURED_EVENTS_BASE_URL: http://meured-events-service:3036
       MEURED_FEED_BASE_URL: http://meured-feed-service:3037
+      EMPLOYERS_BASE_URL: http://employers-service:3041
+      COMPANYCARE_BASE_URL: http://company-care-service:3052
+      COMPANYANALYTICS_BASE_URL: http://company-analytics-service:3053
     ports:
       - "3020:3020"
     depends_on:
@@ -453,12 +467,14 @@
       - reviews-service
       - messages-service
       - support-service
+      - invoicing-service
       - meured-service
       - meured-graph-service
       - meured-content-service
       - meured-jobs-service
       - meured-events-service
       - meured-feed-service
+      - employers-service
       - questions-service
       - services-service
       - availability-service
@@ -468,6 +484,8 @@
       - reminders-service
       - consents-service
       - analytics-service
+      - company-care-service
+      - company-analytics-service
       - images-service
       - redis
 
@@ -482,6 +500,45 @@
     depends_on:
       - meili
       - meusaludgateway
+
+  employers-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-employers-service:${IMAGE_TAG:-latest}
+    build:
+      context: ../employers-service
+    env_file:
+      - ../employers-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=employers
+      PORT: 3041
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
+      RABBITMQ_EXCHANGE_AUTH: auth.events
+      RABBITMQ_EXCHANGE_EMPLOYERS: employers.events
+      RABBITMQ_QUEUE_EMPLOYERS_AUTH: employers.q.auth
+      AUTH_INTERNAL_BASE_URL: http://auth-service:3000/authms
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-dev-internal-employers-token}
+      COMMUNICATION_INTERNAL_BASE_URL: http://communication-service:3006/communicationms
+      # Enlaces públicos de invitación (WhatsApp/correo). En prod: Infisical (PUBLIC_APP_BASE_URL o vars dedicadas).
+      # En local: apunta al host donde corre React (vite PORT, típicamente 3000) o tu túnel ngrok.
+      EMPLOYER_INVITE_PUBLIC_BASE_URL: ${EMPLOYER_INVITE_PUBLIC_BASE_URL:-http://localhost:3000}
+      EMPLOYER_EMPLOYEE_AFFILIATE_INVITE_PUBLIC_BASE_URL: ${EMPLOYER_EMPLOYEE_AFFILIATE_INVITE_PUBLIC_BASE_URL:-${EMPLOYER_INVITE_PUBLIC_BASE_URL:-http://localhost:3000}}
+      EMPLOYER_MEMBER_INVITE_PUBLIC_BASE_URL: ${EMPLOYER_MEMBER_INVITE_PUBLIC_BASE_URL:-${EMPLOYER_INVITE_PUBLIC_BASE_URL:-http://localhost:3000}}
+      # Paso 2 (admins): se definirá una plantilla nueva más adelante.
+      # Si queda vacío, el envío por WhatsApp responderá "Plantilla de WhatsApp no configurada".
+      EMPLOYER_ADMIN_INVITE_WA_TEMPLATE_NAME: ${EMPLOYER_ADMIN_INVITE_WA_TEMPLATE_NAME:-invitacion_miembrosadmin_empresas}
+      EMPLOYER_ADMIN_INVITE_WA_LANGUAGE_CODE: ${EMPLOYER_ADMIN_INVITE_WA_LANGUAGE_CODE:-es_CO}
+      # {{1}} recipientName (derivado del email), {{2}} employerName, {{3}} employerName
+      EMPLOYER_ADMIN_INVITE_WA_BODY_PARAM_KEYS: ${EMPLOYER_ADMIN_INVITE_WA_BODY_PARAM_KEYS:-recipientName,employerName,employerName}
+      EMPLOYER_ADMIN_INVITE_WA_BUTTON_URL_PARAM_INDEX: ${EMPLOYER_ADMIN_INVITE_WA_BUTTON_URL_PARAM_INDEX:-0}
+      # Paso 3 (empleados afiliados): usa la plantilla Meta ya creada.
+      EMPLOYER_EMPLOYEE_AFFILIATE_INVITE_WA_TEMPLATE_NAME: ${EMPLOYER_EMPLOYEE_AFFILIATE_INVITE_WA_TEMPLATE_NAME:-invitacion_miembro_empresas}
+      EMPLOYER_EMPLOYEE_AFFILIATE_INVITE_WA_LANGUAGE_CODE: ${EMPLOYER_EMPLOYEE_AFFILIATE_INVITE_WA_LANGUAGE_CODE:-es_CO}
+      EMPLOYER_EMPLOYEE_AFFILIATE_INVITE_WA_BODY_PARAM_KEYS: ${EMPLOYER_EMPLOYEE_AFFILIATE_INVITE_WA_BODY_PARAM_KEYS:-employeeFirstName,employerName}
+      EMPLOYER_EMPLOYEE_AFFILIATE_INVITE_WA_BUTTON_URL_PARAM_INDEX: ${EMPLOYER_EMPLOYEE_AFFILIATE_INVITE_WA_BUTTON_URL_PARAM_INDEX:-0}
+    ports:
+      - "3041:3041"
+    depends_on:
+      - db
+      - auth-service
 
   subscriptions-service:
     image: ${DOCKERHUB_USERNAME:-local}/meusalud-subscriptions-service:${IMAGE_TAG:-latest}
@@ -518,6 +575,24 @@
     depends_on:
       - db
 
+  invoicing-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-invoicing-service:${IMAGE_TAG:-latest}
+    build:
+      context: ../invoicing-service
+    env_file:
+      - ../invoicing-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=invoicing
+      PORT: 3040
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
+      S3_ENDPOINT: http://minio:9000
+      S3_PUBLIC_ENDPOINT: http://localhost:9000
+    ports:
+      - "3040:3040"
+    depends_on:
+      - db
+      - minio
+  
   analytics-service:
     image: ${DOCKERHUB_USERNAME:-local}/meusalud-analytics-service:${IMAGE_TAG:-latest}
     build:
@@ -537,6 +612,48 @@
       - "3015:3015"
     depends_on:
       - db
+
+  company-care-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-company-care-service:${IMAGE_TAG:-latest}
+    build:
+      context: ../company-care-service
+    env_file:
+      - ../company-care-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=companycare
+      PORT: 3052
+      EMPLOYERS_INTERNAL_BASE_URL: http://employers-service:3041/employersms
+      COMPANYANALYTICS_INTERNAL_BASE_URL: http://company-analytics-service:3053/companyanalyticsms
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-dev-internal-employers-token}
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
+      RABBITMQ_EXCHANGE_APPOINTMENTS: appointments.events
+      RABBITMQ_QUEUE_COMPANY_CARE: companycare.q.events
+    ports:
+      - "3052:3052"
+    depends_on:
+      - db
+      - employers-service
+
+  company-analytics-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-company-analytics-service:${IMAGE_TAG:-latest}
+    build:
+      context: ../company-analytics-service
+    env_file:
+      - ../company-analytics-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=companyanalytics
+      PORT: 3053
+      RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
+      RABBITMQ_EXCHANGE_APPOINTMENTS: appointments.events
+      RABBITMQ_EXCHANGE_REVIEWS: reviews.events
+      RABBITMQ_QUEUE_COMPANY_ANALYTICS: companyanalytics.q.events
+      COMPANYCARE_INTERNAL_BASE_URL: http://company-care-service:3052/companycarems
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-dev-internal-employers-token}
+    ports:
+      - "3053:3053"
+    depends_on:
+      - db
+      - company-care-service
 
   images-service:
     image: ${DOCKERHUB_USERNAME:-local}/meusalud-images-service:${IMAGE_TAG:-latest}

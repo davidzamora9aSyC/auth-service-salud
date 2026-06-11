@@ -57,6 +57,11 @@ import { BootstrapAdminDto } from './dto/bootstrap-admin.dto';
 import { AccountDeletionStartDto } from './dto/account-deletion-start.dto';
 import { AccountDeletionConfirmDto } from './dto/account-deletion-confirm.dto';
 import { AdminOnboardingService } from './admin-onboarding.service';
+import { EmployersHttpClient } from './employers-http.client';
+import { CreateEmployerInviteAccountDto } from './dto/create-employer-invite-account.dto';
+import { CreatePatientInviteAccountDto } from './dto/create-patient-invite-account.dto';
+import { LinkPatientAffiliateInviteDto } from './dto/link-patient-affiliate-invite.dto';
+import { GrantEmployerAccessDto } from './dto/grant-employer-access.dto';
 import { RegisterMeuredDto } from './dto/register-meured.dto';
 import { SelectProductAccessDto } from './dto/select-product-access.dto';
 
@@ -124,6 +129,7 @@ export class AuthService {
     private readonly notifications: NotificationsService,
     private readonly rabbitmq: RabbitmqService,
     private readonly adminOnboarding: AdminOnboardingService,
+    private readonly employersHttp: EmployersHttpClient,
   ) {
     const inlinePrivateKey = this.config.get<string>('JWT_PRIVATE_KEY');
     if (inlinePrivateKey?.trim()) {
@@ -243,6 +249,11 @@ export class AuthService {
       throw new BadRequestException('Use el flujo de registro de MeuRed');
     }
       const inviteToken = dto.inviteToken?.trim();
+      if (inviteToken && dto.role === AccountRole.EMPLOYER) {
+        throw new BadRequestException(
+          'Para unirte a una empresa existente usa el enlace de invitacion del portal empresa',
+        );
+      }
       if (inviteToken && dto.role !== AccountRole.DOCTOR) {
         throw new BadRequestException('inviteToken solo aplica para registro de medicos');
       }
@@ -284,10 +295,31 @@ export class AuthService {
     });
       const doctorId =
         dto.role === AccountRole.DOCTOR ? (invite?.doctorId ?? randomUUID()) : null;
+      const employerId = dto.role === AccountRole.EMPLOYER ? randomUUID() : null;
     const onboardingStatus =
-      dto.role === AccountRole.DOCTOR || dto.role === AccountRole.CLINIC
+      dto.role === AccountRole.DOCTOR ||
+      dto.role === AccountRole.CLINIC ||
+      dto.role === AccountRole.EMPLOYER
         ? OnboardingStatus.PENDING
         : OnboardingStatus.COMPLETE;
+
+    if (dto.role === AccountRole.EMPLOYER) {
+      const companyName = dto.companyName?.trim();
+      const taxId = dto.taxId?.trim();
+      if (!companyName || !taxId) {
+        throw new BadRequestException(
+          'Datos de empresa requeridos para registrar una nueva organizacion',
+        );
+      }
+      await this.employersHttp.prepareFounder({
+        employerId: employerId!,
+        displayName: companyName,
+        taxId,
+        email: normalizedEmail,
+        phoneNumber: normalizedPhone,
+      });
+    }
+
     let account: Account;
     try {
       account = await this.prisma.account.create({
@@ -299,10 +331,14 @@ export class AuthService {
           subjectId: dto.subjectId ?? null,
           phoneNumber: normalizedPhone,
           doctorId,
+          employerId,
           onboardingStatus,
         },
       });
     } catch (error) {
+      if (employerId) {
+        await this.employersHttp.rollbackFounder(employerId).catch(() => undefined);
+      }
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
         const targets = Array.isArray(error.meta?.target) ? error.meta.target : [];
         if (targets.includes('email')) {
@@ -314,6 +350,20 @@ export class AuthService {
         throw new ConflictException('La cuenta ya existe');
       }
       throw error;
+    }
+
+    if (dto.role === AccountRole.EMPLOYER && employerId) {
+      try {
+        await this.ensureLegacyProductAccess(account);
+        await this.employersHttp.finalizeFounder({
+          employerId,
+          authUserId: account.id,
+        });
+      } catch (error) {
+        await this.prisma.account.delete({ where: { id: account.id } }).catch(() => undefined);
+        await this.employersHttp.rollbackFounder(employerId).catch(() => undefined);
+        throw error;
+      }
     }
       if (account.role === AccountRole.DOCTOR && inviteToken && !isAdminInvite) {
         try {
@@ -342,6 +392,8 @@ export class AuthService {
       await this.publishUserRegisteredEvent(account, {
         firstName,
         lastName,
+        companyName: dto.companyName,
+        taxId: dto.taxId,
       });
       if (inviteToken && invite) {
         await this.adminOnboarding.markInviteAccepted(inviteToken, account.id);
@@ -524,6 +576,63 @@ export class AuthService {
         },
       });
       await this.ensureProductAccess(account.id, ProductCode.MEUDOC_PRO, ProductRole.MEDICAL_ENTITY, null);
+    } else if (dto.role === AccountRole.EMPLOYER) {
+      if (!dto.companyName?.trim() || !dto.taxId?.trim()) {
+        throw new BadRequestException(
+          'Datos de empresa requeridos para registrar una nueva organizacion',
+        );
+      }
+      if (account.employerId) {
+        throw new ConflictException('Esta cuenta ya administra una empresa');
+      }
+      const existingEmployerProfile = await this.prisma.accountRoleProfile.findUnique({
+        where: { accountId_role: { accountId: account.id, role: AccountRole.EMPLOYER } },
+      });
+      if (existingEmployerProfile?.subjectId) {
+        throw new ConflictException('Esta cuenta ya pertenece a un portal de empresa');
+      }
+      const employerId = randomUUID();
+      await this.employersHttp.prepareFounder({
+        employerId,
+        displayName: dto.companyName.trim(),
+        taxId: dto.taxId.trim(),
+        email: account.email,
+        phoneNumber: account.phoneNumber ?? undefined,
+      });
+      try {
+        await this.prisma.accountRoleProfile.create({
+          data: {
+            accountId: account.id,
+            role: AccountRole.EMPLOYER,
+            subjectId: employerId,
+            onboardingStatus: OnboardingStatus.PENDING,
+          },
+        });
+        await this.prisma.account.update({
+          where: { id: account.id },
+          data: { employerId },
+        });
+        account = { ...account, employerId };
+        await this.ensureProductAccess(
+          account.id,
+          ProductCode.MEUDOC_EMPLOYER,
+          ProductRole.EMPLOYER_ADMIN,
+          employerId,
+        );
+        await this.employersHttp.finalizeFounder({
+          employerId,
+          authUserId: account.id,
+        });
+        await this.publishUserRegisteredEvent(account, {
+          firstName,
+          lastName,
+          companyName: dto.companyName,
+          taxId: dto.taxId,
+        });
+      } catch (error) {
+        await this.employersHttp.rollbackFounder(employerId).catch(() => undefined);
+        throw error;
+      }
     } else {
       throw new BadRequestException('Rol no soportado para registro multi-rol');
     }
@@ -562,6 +671,14 @@ export class AuthService {
     const sessionRole = await this.resolveSessionRole(account, dto.role);
     if (sessionRole === AccountRole.DOCTOR && !account.doctorId) {
       throw new BadRequestException('No hay perfil de doctor para esta cuenta');
+    }
+    if (sessionRole === AccountRole.EMPLOYER && !account.employerId) {
+      const employerProfile = await this.prisma.accountRoleProfile.findUnique({
+        where: { accountId_role: { accountId: account.id, role: AccountRole.EMPLOYER } },
+      });
+      if (!employerProfile?.subjectId) {
+        throw new BadRequestException('No hay perfil de empresa para esta cuenta');
+      }
     }
     const availableRoles = await this.getAvailableRoles(account);
     if (account.twoFactorEnabled) {
@@ -687,10 +804,13 @@ export class AuthService {
       if (!validPassword) {
         throw new UnauthorizedException('Invalid credentials');
       }
-      if (existing.role !== AccountRole.COLLABORATOR) {
+      if (existing.role === AccountRole.DOCTOR) {
         throw new ConflictException(
-          'El email ya esta registrado con otro tipo de cuenta',
+          'El email ya esta registrado como doctor y no puede aceptar invitaciones de colaborador',
         );
+      }
+      if (existing.role !== AccountRole.COLLABORATOR && existing.role !== AccountRole.PATIENT) {
+        throw new ConflictException('El email ya esta registrado con otro tipo de cuenta');
       }
       const linkedCollaborator = await this.prisma.collaborator.findUnique({
         where: { accountId: existing.id },
@@ -760,15 +880,331 @@ export class AuthService {
         where: { id: invite.id },
         data: { status: InviteStatus.ACCEPTED },
       });
+
+      if (existing?.role === AccountRole.PATIENT) {
+        await tx.accountRoleProfile.upsert({
+          where: {
+            accountId_role: {
+              accountId: accountRecord.id,
+              role: AccountRole.COLLABORATOR,
+            },
+          },
+          update: {
+            subjectId: null,
+            onboardingStatus: OnboardingStatus.COMPLETE,
+          },
+          create: {
+            accountId: accountRecord.id,
+            role: AccountRole.COLLABORATOR,
+            subjectId: null,
+            onboardingStatus: OnboardingStatus.COMPLETE,
+          },
+        });
+      }
       return accountRecord;
     });
 
     if (account.twoFactorEnabled) {
       return this.buildTwoFactorRequiredResponse(account, {
-        sessionRole: account.role,
+        sessionRole: AccountRole.COLLABORATOR,
+        availableRoles: await this.getAvailableRoles(account),
       });
     }
-    return this.issueTokens(account);
+    return this.issueTokens(account, { sessionRole: AccountRole.COLLABORATOR });
+  }
+
+  async createEmployerInviteAccount(dto: CreateEmployerInviteAccountDto) {
+    const normalizedEmail = dto.email.trim().toLowerCase();
+    const normalizedPhone = dto.phoneNumber
+      ? this.normalizePhoneNumber(dto.phoneNumber)
+      : null;
+
+    const existing = await this.prisma.account.findUnique({
+      where: { email: normalizedEmail },
+    });
+    if (existing) {
+      if (existing.status !== AccountStatus.ACTIVE) {
+        throw new UnauthorizedException('Account disabled');
+      }
+      const validPassword = await argon2.verify(
+        existing.passwordHash,
+        dto.password + existing.salt,
+      );
+      if (!validPassword) {
+        throw new UnauthorizedException('Invalid credentials');
+      }
+      const employerProfile = await this.prisma.accountRoleProfile.findUnique({
+        where: {
+          accountId_role: { accountId: existing.id, role: AccountRole.EMPLOYER },
+        },
+      });
+      if (employerProfile?.subjectId) {
+        throw new ConflictException('Esta cuenta ya pertenece a un portal de empresa');
+      }
+      if (existing.employerId) {
+        throw new ConflictException('Esta cuenta ya administra una empresa');
+      }
+
+      if (normalizedPhone) {
+        const existingPhone = await this.prisma.account.findUnique({
+          where: { phoneNumber: normalizedPhone },
+          select: { id: true },
+        });
+        if (existingPhone && existingPhone.id !== existing.id) {
+          throw new ConflictException('El numero de telefono ya esta registrado');
+        }
+      }
+
+      const account = await this.prisma.account.update({
+        where: { id: existing.id },
+        data: {
+          phoneNumber: normalizedPhone ?? existing.phoneNumber ?? null,
+          onboardingStatus: OnboardingStatus.COMPLETE,
+        },
+      });
+      return { accountId: account.id, email: account.email, created: false };
+    }
+
+    if (normalizedPhone) {
+      const existingPhone = await this.prisma.account.findUnique({
+        where: { phoneNumber: normalizedPhone },
+      });
+      if (existingPhone) {
+        throw new ConflictException('El numero de telefono ya esta registrado');
+      }
+    }
+
+    const salt = randomBytes(24).toString('hex');
+    const passwordHash = await argon2.hash(dto.password + salt, {
+      type: argon2.argon2id,
+    });
+
+    const account = await this.prisma.account.create({
+      data: {
+        email: normalizedEmail,
+        passwordHash,
+        salt,
+        role: AccountRole.EMPLOYER,
+        phoneNumber: normalizedPhone,
+        employerId: null,
+        onboardingStatus: OnboardingStatus.COMPLETE,
+      },
+    });
+
+    await this.recordIdentityReuse(account, normalizedEmail, normalizedPhone ?? '');
+    return { accountId: account.id, email: account.email, created: true };
+  }
+
+  async verifyOrCreateEmployerMemberForInvite(dto: CreateEmployerInviteAccountDto) {
+    const result = await this.createEmployerInviteAccount(dto);
+    return { authUserId: result.accountId, created: result.created };
+  }
+
+  async verifyOrCreatePatientForInvite(dto: CreatePatientInviteAccountDto) {
+    const normalizedEmail = dto.email.trim().toLowerCase();
+    const normalizedPhone = dto.phoneNumber ? this.normalizePhoneNumber(dto.phoneNumber) : null;
+
+    const account = await this.prisma.$transaction(async (tx) => {
+      const existing = await tx.account.findUnique({ where: { email: normalizedEmail } });
+      if (existing) {
+        if (existing.status !== AccountStatus.ACTIVE) {
+          throw new UnauthorizedException('Account disabled');
+        }
+        const validPassword = await argon2.verify(existing.passwordHash, dto.password + existing.salt);
+        if (!validPassword) {
+          throw new ConflictException(
+            'Ya existe una cuenta con este correo. Usa la contraseña de esa cuenta (no es un registro nuevo) o restablécela desde iniciar sesión.',
+          );
+        }
+
+        if (normalizedPhone) {
+          const existingPhone = await tx.account.findUnique({
+            where: { phoneNumber: normalizedPhone },
+            select: { id: true },
+          });
+          if (existingPhone && existingPhone.id !== existing.id) {
+            throw new ConflictException(
+              'El número de teléfono ya está registrado en otra cuenta. Pide a tu empresa reenviar la invitación con otro celular.',
+            );
+          }
+        }
+
+        return tx.account.update({
+          where: { id: existing.id },
+          data: {
+            phoneNumber: normalizedPhone ?? existing.phoneNumber ?? null,
+            onboardingStatus: OnboardingStatus.COMPLETE,
+          },
+        });
+      }
+
+      if (normalizedPhone) {
+        const existingPhone = await tx.account.findUnique({
+          where: { phoneNumber: normalizedPhone },
+        });
+        if (existingPhone) {
+          throw new ConflictException(
+            'El número de teléfono ya está registrado en otra cuenta. Pide a tu empresa reenviar la invitación con otro celular.',
+          );
+        }
+      }
+
+      const salt = randomBytes(24).toString('hex');
+      const passwordHash = await argon2.hash(dto.password + salt, { type: argon2.argon2id });
+      const created = await tx.account.create({
+        data: {
+          email: normalizedEmail,
+          passwordHash,
+          salt,
+          role: AccountRole.PATIENT,
+          phoneNumber: normalizedPhone,
+          employerId: null,
+          onboardingStatus: OnboardingStatus.COMPLETE,
+        },
+      });
+      await this.recordIdentityReuse(created, normalizedEmail, normalizedPhone ?? '');
+      return created;
+    });
+
+    const patientId = await this.linkOrCreatePatientForAccount(account, dto.firstName.trim(), dto.lastName.trim());
+
+    await this.prisma.accountRoleProfile.upsert({
+      where: {
+        accountId_role: {
+          accountId: account.id,
+          role: AccountRole.PATIENT,
+        },
+      },
+      update: {
+        subjectId: patientId,
+        onboardingStatus: OnboardingStatus.COMPLETE,
+      },
+      create: {
+        accountId: account.id,
+        role: AccountRole.PATIENT,
+        subjectId: patientId,
+        onboardingStatus: OnboardingStatus.COMPLETE,
+      },
+    });
+
+    return { authUserId: account.id, patientId };
+  }
+
+  async accountExistsByEmail(email: string) {
+    const normalizedEmail = email.trim().toLowerCase();
+    const existing = await this.prisma.account.findUnique({
+      where: { email: normalizedEmail },
+      select: { id: true, status: true },
+    });
+    return { exists: Boolean(existing && existing.status === AccountStatus.ACTIVE) };
+  }
+
+  /**
+   * Vincula perfil paciente a una cuenta ya existente (invitación empleado afiliado validada en employers-service).
+   * No pide contraseña: la posesión del token de invitación + email de la invitación es la autorización.
+   */
+  async linkPatientForAffiliateInvite(dto: LinkPatientAffiliateInviteDto) {
+    const normalizedEmail = dto.email.trim().toLowerCase();
+    const normalizedPhone = dto.phoneNumber ? this.normalizePhoneNumber(dto.phoneNumber) : null;
+
+    const existing = await this.prisma.account.findUnique({ where: { email: normalizedEmail } });
+    if (!existing) {
+      throw new NotFoundException('No existe una cuenta con este correo');
+    }
+    if (existing.status !== AccountStatus.ACTIVE) {
+      throw new UnauthorizedException('Account disabled');
+    }
+
+    if (normalizedPhone) {
+      const existingPhone = await this.prisma.account.findUnique({
+        where: { phoneNumber: normalizedPhone },
+        select: { id: true },
+      });
+      if (existingPhone && existingPhone.id !== existing.id) {
+        throw new ConflictException(
+          'El número de teléfono ya está registrado en otra cuenta. Pide a tu empresa reenviar la invitación con otro celular.',
+        );
+      }
+    }
+
+    const account = await this.prisma.account.update({
+      where: { id: existing.id },
+      data: {
+        phoneNumber: normalizedPhone ?? existing.phoneNumber ?? null,
+        onboardingStatus: OnboardingStatus.COMPLETE,
+      },
+    });
+
+    const patientId = await this.resolvePatientForAffiliateInvite(
+      account,
+      dto.firstName.trim(),
+      dto.lastName.trim(),
+    );
+
+    await this.prisma.accountRoleProfile.upsert({
+      where: {
+        accountId_role: {
+          accountId: account.id,
+          role: AccountRole.PATIENT,
+        },
+      },
+      update: {
+        subjectId: patientId,
+        onboardingStatus: OnboardingStatus.COMPLETE,
+      },
+      create: {
+        accountId: account.id,
+        role: AccountRole.PATIENT,
+        subjectId: patientId,
+        onboardingStatus: OnboardingStatus.COMPLETE,
+      },
+    });
+
+    return { authUserId: account.id, patientId };
+  }
+
+  async grantEmployerAccess(dto: GrantEmployerAccessDto) {
+    const account = await this.prisma.account.findUnique({
+      where: { id: dto.accountId },
+    });
+    if (!account) {
+      throw new NotFoundException('Cuenta no encontrada');
+    }
+    if (account.status !== AccountStatus.ACTIVE) {
+      throw new UnauthorizedException('Account disabled');
+    }
+
+    await this.prisma.accountRoleProfile.upsert({
+      where: {
+        accountId_role: {
+          accountId: dto.accountId,
+          role: AccountRole.EMPLOYER,
+        },
+      },
+      create: {
+        accountId: dto.accountId,
+        role: AccountRole.EMPLOYER,
+        subjectId: dto.employerId,
+        onboardingStatus: OnboardingStatus.COMPLETE,
+      },
+      update: {
+        subjectId: dto.employerId,
+        onboardingStatus: OnboardingStatus.COMPLETE,
+      },
+    });
+
+    await this.ensureProductAccess(
+      dto.accountId,
+      ProductCode.MEUDOC_EMPLOYER,
+      dto.productRole,
+      dto.employerId,
+    );
+
+    return {
+      accountId: dto.accountId,
+      employerId: dto.employerId,
+      productRole: dto.productRole,
+    };
   }
 
   async publishUserRegisteredTestEvent(dto: SimulateUserRegisteredDto) {
@@ -1733,8 +2169,11 @@ export class AuthService {
         });
         const doctorId =
           entry.role === AccountRole.DOCTOR ? randomUUID() : null;
+        const employerId = entry.role === AccountRole.EMPLOYER ? randomUUID() : null;
         const onboardingStatus =
-          entry.role === AccountRole.DOCTOR || entry.role === AccountRole.CLINIC
+          entry.role === AccountRole.DOCTOR ||
+          entry.role === AccountRole.CLINIC ||
+          entry.role === AccountRole.EMPLOYER
             ? OnboardingStatus.PENDING
             : OnboardingStatus.COMPLETE;
         account = await this.prisma.account.create({
@@ -1746,10 +2185,13 @@ export class AuthService {
             subjectId: profile.sub ?? null,
             phoneNumber: null,
             doctorId,
+            employerId,
             onboardingStatus,
           },
         });
-        await this.publishUserRegisteredEvent(account);
+        await this.publishUserRegisteredEvent(account, {
+          companyName: profile.name?.trim() || normalizedEmail.split('@')[0],
+        });
       }
 
       const sessionRole =
@@ -1860,8 +2302,11 @@ export class AuthService {
       });
       const doctorId =
         entry.role === AccountRole.DOCTOR ? randomUUID() : null;
+      const employerId = entry.role === AccountRole.EMPLOYER ? randomUUID() : null;
       const onboardingStatus =
-        entry.role === AccountRole.DOCTOR || entry.role === AccountRole.CLINIC
+        entry.role === AccountRole.DOCTOR ||
+        entry.role === AccountRole.CLINIC ||
+        entry.role === AccountRole.EMPLOYER
           ? OnboardingStatus.PENDING
           : OnboardingStatus.COMPLETE;
       account = await this.prisma.account.create({
@@ -1873,10 +2318,13 @@ export class AuthService {
           subjectId: decoded.sub ?? null,
           phoneNumber: null,
           doctorId,
+          employerId,
           onboardingStatus,
         },
       });
-      await this.publishUserRegisteredEvent(account);
+      await this.publishUserRegisteredEvent(account, {
+        companyName: normalizedEmail.split('@')[0],
+      });
     }
 
     const sessionRole =
@@ -2101,6 +2549,10 @@ export class AuthService {
   ) {
     const sessionRole = options?.sessionRole ?? account.role;
     let sessionSubjectId = options?.sessionSubjectId ?? null;
+    let clinicSessionSubjectId: string | null = null;
+    let clinicSessionOnboardingStatus: OnboardingStatus = account.onboardingStatus;
+    let employerSessionEmployerId: string | null = null;
+    let employerSessionOnboardingStatus: OnboardingStatus = account.onboardingStatus;
     let accountForSession = account;
     const payload: Record<string, unknown> = {
       sub: account.id,
@@ -2152,26 +2604,44 @@ export class AuthService {
       payload.onboardingRequired = doctorOnboardingStatus !== OnboardingStatus.COMPLETE;
     } else if (sessionRole === AccountRole.CLINIC) {
       // Leer subjectId y onboardingStatus del profile si el rol principal no es CLINIC
-      let clinicSubjectId: string | null = null;
-      let clinicOnboardingStatus: OnboardingStatus;
       if (account.role === AccountRole.CLINIC) {
-        clinicSubjectId = account.subjectId ?? null;
-        clinicOnboardingStatus = account.onboardingStatus;
+        clinicSessionSubjectId = account.subjectId ?? null;
+        clinicSessionOnboardingStatus = account.onboardingStatus;
       } else {
         const clinicProfile = await this.prisma.accountRoleProfile.findUnique({
           where: { accountId_role: { accountId: account.id, role: AccountRole.CLINIC } },
         });
-        clinicSubjectId = clinicProfile?.subjectId ?? null;
-        clinicOnboardingStatus = clinicProfile?.onboardingStatus ?? OnboardingStatus.PENDING;
+        clinicSessionSubjectId = clinicProfile?.subjectId ?? null;
+        clinicSessionOnboardingStatus = clinicProfile?.onboardingStatus ?? OnboardingStatus.PENDING;
       }
-      if (clinicSubjectId) {
-        payload.clinicId = clinicSubjectId;
-        payload.subjectId = clinicSubjectId;
+      if (clinicSessionSubjectId) {
+        payload.clinicId = clinicSessionSubjectId;
+        payload.subjectId = clinicSessionSubjectId;
       }
-      payload.onboardingRequired = clinicOnboardingStatus !== OnboardingStatus.COMPLETE;
+      payload.onboardingRequired = clinicSessionOnboardingStatus !== OnboardingStatus.COMPLETE;
+      sessionSubjectId = clinicSessionSubjectId;
+    } else if (sessionRole === AccountRole.EMPLOYER) {
+      if (account.role === AccountRole.EMPLOYER) {
+        employerSessionEmployerId = account.employerId ?? account.subjectId ?? null;
+        employerSessionOnboardingStatus = account.onboardingStatus;
+      } else {
+        const employerProfile = await this.prisma.accountRoleProfile.findUnique({
+          where: { accountId_role: { accountId: account.id, role: AccountRole.EMPLOYER } },
+        });
+        employerSessionEmployerId = employerProfile?.subjectId ?? null;
+        employerSessionOnboardingStatus = employerProfile?.onboardingStatus ?? OnboardingStatus.PENDING;
+      }
+      if (employerSessionEmployerId) {
+        payload.employerId = employerSessionEmployerId;
+        payload.subjectId = employerSessionEmployerId;
+      }
+      payload.onboardingRequired = employerSessionOnboardingStatus !== OnboardingStatus.COMPLETE;
+      sessionSubjectId = employerSessionEmployerId;
     } else if (sessionRole === AccountRole.COLLABORATOR) {
-      if (account.role !== AccountRole.COLLABORATOR) {
-        throw new UnauthorizedException('Account disabled');
+      if (account.role === AccountRole.DOCTOR) {
+        throw new BadRequestException(
+          'No se permite iniciar sesion como colaborador con una cuenta de doctor',
+        );
       }
       const collaborator = await this.prisma.collaborator.findUnique({
         where: { accountId: account.id },
@@ -2244,15 +2714,24 @@ export class AuthService {
           sessionRole === AccountRole.PATIENT
             ? sessionSubjectId
             : sessionRole === AccountRole.CLINIC
-              ? account.subjectId
-              : null,
+              ? clinicSessionSubjectId
+              : sessionRole === AccountRole.EMPLOYER
+                ? employerSessionEmployerId
+                : null,
         doctorId:
           sessionRole === AccountRole.DOCTOR || sessionRole === AccountRole.COLLABORATOR
             ? (payload.doctorId as string | null | undefined) ?? null
             : null,
         clinicId:
-          sessionRole === AccountRole.CLINIC ? account.subjectId : null,
-        onboardingStatus: account.onboardingStatus,
+          sessionRole === AccountRole.CLINIC ? clinicSessionSubjectId : null,
+        employerId:
+          sessionRole === AccountRole.EMPLOYER ? employerSessionEmployerId : null,
+        onboardingStatus:
+          sessionRole === AccountRole.CLINIC
+            ? clinicSessionOnboardingStatus
+            : sessionRole === AccountRole.EMPLOYER
+              ? employerSessionOnboardingStatus
+              : account.onboardingStatus,
         activeProduct: options?.productAccess?.product ?? null,
         activeProductRole: options?.productAccess?.role ?? null,
         productSubjectId: options?.productAccess?.subjectId ?? null,
@@ -3484,27 +3963,33 @@ export class AuthService {
 
   private async publishUserRegisteredEvent(
     account: Account,
-    profile?: { firstName?: string; lastName?: string },
+    profile?: { firstName?: string; lastName?: string; companyName?: string; taxId?: string },
   ) {
     if (
       account.role !== AccountRole.PATIENT &&
       account.role !== AccountRole.DOCTOR &&
-      account.role !== AccountRole.CLINIC
+      account.role !== AccountRole.CLINIC &&
+      account.role !== AccountRole.EMPLOYER
     ) {
       return;
     }
 
     const firstName = profile?.firstName?.trim();
     const lastName = profile?.lastName?.trim();
+    const companyName = profile?.companyName?.trim();
+    const taxId = profile?.taxId?.trim();
 
     const payload = {
       authUserId: account.id,
       role: account.role,
       doctorId: account.doctorId ?? undefined,
+      employerId: account.employerId ?? undefined,
       email: account.email,
       phoneNumber: account.phoneNumber ?? undefined,
       firstName: firstName || undefined,
       lastName: lastName || undefined,
+      companyName: companyName || undefined,
+      taxId: taxId || undefined,
     };
 
     this.logger.log(
@@ -3522,7 +4007,8 @@ export class AuthService {
     if (
       roleInput === AccountRole.PATIENT ||
       roleInput === AccountRole.DOCTOR ||
-      roleInput === AccountRole.CLINIC
+      roleInput === AccountRole.CLINIC ||
+      roleInput === AccountRole.EMPLOYER
     ) {
       return roleInput;
     }
@@ -3710,23 +4196,68 @@ export class AuthService {
   }
 
   private async findPatientIdByAuthUserId(authUserId: string) {
-    const response = await fetch(
-      `${this.usersBaseUrl.replace(/\/$/, '')}/patients/internal/by-auth-user/${encodeURIComponent(authUserId)}`,
-      {
-        headers: {
-          'x-role': 'SYSTEM',
-        },
-      },
-    );
-
-    if (!response.ok) {
-      const body = await response.text();
-      this.logger.error(`No se pudo consultar paciente por authUserId (status ${response.status}): ${body}`);
+    const patientId = await this.tryFindPatientIdByAuthUserId(authUserId);
+    if (!patientId) {
       throw new ServiceUnavailableException('No se pudo validar el perfil de paciente');
     }
+    return patientId;
+  }
 
-    const data = (await response.json()) as { patientId?: string | null };
-    return data?.patientId ?? null;
+  private async tryFindPatientIdByAuthUserId(authUserId: string): Promise<string | null> {
+    try {
+      const response = await fetch(
+        `${this.usersBaseUrl.replace(/\/$/, '')}/patients/internal/by-auth-user/${encodeURIComponent(authUserId)}`,
+        {
+          headers: {
+            'x-role': 'SYSTEM',
+          },
+        },
+      );
+      if (!response.ok) {
+        return null;
+      }
+      const data = (await response.json()) as { patientId?: string | null };
+      return data?.patientId ?? null;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`No se pudo consultar paciente por authUserId: ${message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Invitación empleado afiliado: no reutilizar pacientes ajenos encontrados solo por teléfono.
+   */
+  private async resolvePatientForAffiliateInvite(
+    account: Account,
+    firstName: string,
+    lastName: string,
+  ): Promise<string> {
+    const existingByAuth = await this.tryFindPatientIdByAuthUserId(account.id);
+    if (existingByAuth) {
+      return existingByAuth;
+    }
+
+    const profile = await this.prisma.accountRoleProfile.findUnique({
+      where: {
+        accountId_role: {
+          accountId: account.id,
+          role: AccountRole.PATIENT,
+        },
+      },
+      select: { subjectId: true },
+    });
+    if (profile?.subjectId) {
+      await this.linkAuthUserToPatient({
+        patientId: profile.subjectId,
+        authUserId: account.id,
+        email: account.email,
+        phoneNumber: account.phoneNumber ?? undefined,
+      });
+      return profile.subjectId;
+    }
+
+    return this.createPatientForAccount(account, firstName, lastName);
   }
 
   private async linkOrCreatePatientForAccount(account: Account, firstName: string, lastName: string) {
@@ -3814,7 +4345,23 @@ export class AuthService {
     });
     if (!response.ok) {
       const body = await response.text();
-      throw new ServiceUnavailableException(`No se pudo vincular el paciente: ${body}`);
+      let message = body;
+      try {
+        const json = JSON.parse(body) as { message?: unknown };
+        const parsed = json?.message;
+        if (typeof parsed === 'string') message = parsed;
+        else if (Array.isArray(parsed) && parsed.length) message = String(parsed[0]);
+      } catch {
+        // keep raw body
+      }
+      if (response.status === 400 || response.status === 422) {
+        throw new BadRequestException(message || 'No se pudo vincular el paciente');
+      }
+      if (response.status === 409) {
+        throw new ConflictException(message || 'El paciente ya tiene una cuenta vinculada');
+      }
+      this.logger.error(`link-auth-user failed (${response.status}): ${body}`);
+      throw new ServiceUnavailableException(message || 'No se pudo vincular el paciente');
     }
   }
 
@@ -4128,6 +4675,14 @@ export class AuthService {
     }
     if (account.role === AccountRole.CLINIC && account.subjectId) {
       await this.ensureProductAccess(account.id, ProductCode.MEUDOC_PRO, ProductRole.MEDICAL_ENTITY, account.subjectId);
+    }
+    if (account.role === AccountRole.EMPLOYER && account.employerId) {
+      await this.ensureProductAccess(
+        account.id,
+        ProductCode.MEUDOC_EMPLOYER,
+        ProductRole.EMPLOYER_ADMIN,
+        account.employerId,
+      );
     }
     if (account.role === AccountRole.ADMIN) {
       await this.ensureProductAccess(account.id, ProductCode.MEUDOC_ADMIN, ProductRole.ADMIN, null);

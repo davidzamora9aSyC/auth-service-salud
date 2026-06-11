@@ -1,5 +1,13 @@
 import { AccountRole } from '@prisma/client';
-import { IsEmail, IsEnum, IsOptional, IsString, Matches, MinLength } from 'class-validator';
+import {
+  IsEmail,
+  IsEnum,
+  IsOptional,
+  IsString,
+  Matches,
+  MinLength,
+  ValidateIf,
+} from 'class-validator';
 
 export class RegisterDto {
   @IsEmail()
@@ -33,4 +41,20 @@ export class RegisterDto {
   @IsOptional()
   @IsString()
   inviteToken?: string;
+
+  @ValidateIf(
+    (o: { role?: AccountRole; inviteToken?: string }) =>
+      o.role === AccountRole.EMPLOYER && !o.inviteToken?.trim(),
+  )
+  @IsString()
+  @MinLength(2, { message: 'companyName is required for employer registration' })
+  companyName?: string;
+
+  @ValidateIf(
+    (o: { role?: AccountRole; inviteToken?: string }) =>
+      o.role === AccountRole.EMPLOYER && !o.inviteToken?.trim(),
+  )
+  @IsString()
+  @MinLength(5, { message: 'taxId is required for employer registration' })
+  taxId?: string;
 }
