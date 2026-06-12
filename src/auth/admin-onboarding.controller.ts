@@ -4,6 +4,14 @@ import { CreateDoctorOnboardingInviteDto } from './dto/create-doctor-onboarding-
 import { CreatePublicDoctorDto } from './dto/create-public-doctor.dto';
 import { AdminListDoctorOnboardingInvitesDto } from './dto/admin-list-doctor-onboarding-invites.dto';
 
+const assertStaffRole = (role?: string) => {
+  const normalizedRole = role?.toUpperCase();
+  if (normalizedRole !== 'ADMIN' && normalizedRole !== 'SYSTEM' && normalizedRole !== 'COMERCIAL') {
+    throw new UnauthorizedException('No autorizado');
+  }
+  return normalizedRole!;
+};
+
 @Controller()
 export class AdminOnboardingController {
   constructor(private readonly onboarding: AdminOnboardingService) {}
@@ -12,36 +20,30 @@ export class AdminOnboardingController {
   listInvites(
     @Query() query: AdminListDoctorOnboardingInvitesDto,
     @Headers('x-role') role?: string,
+    @Headers('x-auth-user-id') authUserId?: string,
   ) {
-    const normalizedRole = role?.toUpperCase();
-    if (normalizedRole !== 'ADMIN' && normalizedRole !== 'SYSTEM') {
-      throw new UnauthorizedException('No autorizado');
-    }
-    return this.onboarding.listInvites(query);
+    assertStaffRole(role);
+    return this.onboarding.listInvites(query, { role: role!.toUpperCase(), authUserId });
   }
 
   @Post('admin/doctor-onboarding/invites')
   createInvite(
     @Body() dto: CreateDoctorOnboardingInviteDto,
     @Headers('x-role') role?: string,
+    @Headers('x-auth-user-id') authUserId?: string,
   ) {
-    const normalizedRole = role?.toUpperCase();
-    if (normalizedRole !== 'ADMIN' && normalizedRole !== 'SYSTEM') {
-      throw new UnauthorizedException('No autorizado');
-    }
-    return this.onboarding.createInvite(dto);
+    assertStaffRole(role);
+    return this.onboarding.createInvite(dto, { role: role!.toUpperCase(), authUserId });
   }
 
   @Post('admin/doctor-onboarding/prefill-only')
   createPublicDoctor(
     @Body() dto: CreatePublicDoctorDto,
     @Headers('x-role') role?: string,
+    @Headers('x-auth-user-id') authUserId?: string,
   ) {
-    const normalizedRole = role?.toUpperCase();
-    if (normalizedRole !== 'ADMIN' && normalizedRole !== 'SYSTEM') {
-      throw new UnauthorizedException('No autorizado');
-    }
-    return this.onboarding.createPublicDoctor(dto);
+    assertStaffRole(role);
+    return this.onboarding.createPublicDoctor(dto, { role: role!.toUpperCase(), authUserId });
   }
 
   @Post('admin/doctor-onboarding/invites/:token/resend')
@@ -49,10 +51,7 @@ export class AdminOnboardingController {
     @Param('token') token: string,
     @Headers('x-role') role?: string,
   ) {
-    const normalizedRole = role?.toUpperCase();
-    if (normalizedRole !== 'ADMIN' && normalizedRole !== 'SYSTEM') {
-      throw new UnauthorizedException('No autorizado');
-    }
+    assertStaffRole(role);
     return this.onboarding.resendInvite(token);
   }
 

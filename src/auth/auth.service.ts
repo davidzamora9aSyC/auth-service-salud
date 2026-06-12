@@ -245,6 +245,9 @@ export class AuthService {
     if (dto.role === AccountRole.ADMIN) {
       throw new BadRequestException('No esta permitido registrar cuentas ADMIN por este endpoint');
     }
+    if (dto.role === AccountRole.COMERCIAL) {
+      throw new BadRequestException('No esta permitido registrar cuentas COMERCIAL por este endpoint');
+    }
     if (dto.role === AccountRole.MEMBER) {
       throw new BadRequestException('Use el flujo de registro de MeuRed');
     }
@@ -1320,6 +1323,87 @@ export class AuthService {
     }
 
     return this.issueTokens(account);
+  }
+
+  async adminCreateCommercialAccount(dto: {
+    email: string;
+    password: string;
+    phoneNumber?: string;
+  }) {
+    const normalizedEmail = dto.email.trim().toLowerCase();
+    const normalizedPhone = dto.phoneNumber
+      ? this.normalizePhoneNumber(dto.phoneNumber)
+      : null;
+
+    const existingByEmail = await this.prisma.account.findUnique({
+      where: { email: normalizedEmail },
+    });
+    if (existingByEmail) {
+      throw new ConflictException('El email ya esta registrado');
+    }
+    if (normalizedPhone) {
+      const existingByPhone = await this.prisma.account.findUnique({
+        where: { phoneNumber: normalizedPhone },
+      });
+      if (existingByPhone) {
+        throw new ConflictException('El numero de telefono ya esta registrado');
+      }
+    }
+
+    const salt = randomBytes(24).toString('hex');
+    const passwordHash = await argon2.hash(dto.password + salt, {
+      type: argon2.argon2id,
+    });
+
+    let account: Account;
+    try {
+      account = await this.prisma.account.create({
+        data: {
+          email: normalizedEmail,
+          passwordHash,
+          salt,
+          role: AccountRole.COMERCIAL,
+          subjectId: null,
+          phoneNumber: normalizedPhone,
+          doctorId: null,
+          onboardingStatus: OnboardingStatus.COMPLETE,
+        },
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        const targets = Array.isArray(error.meta?.target) ? error.meta.target : [];
+        if (targets.includes('email')) {
+          throw new ConflictException('El email ya esta registrado');
+        }
+        if (targets.includes('phoneNumber')) {
+          throw new ConflictException('El numero de telefono ya esta registrado');
+        }
+      }
+      throw error;
+    }
+
+    await this.ensureProductAccess(
+      account.id,
+      ProductCode.MEUDOC_ADMIN,
+      ProductRole.COMERCIAL,
+      null,
+    );
+
+    return {
+      id: account.id,
+      email: account.email,
+      phoneNumber: account.phoneNumber,
+      role: account.role,
+      status: account.status,
+      createdAt: account.createdAt.toISOString(),
+    };
+  }
+
+  async adminListCommercialAccounts(query: { page?: number; limit?: number; q?: string }) {
+    return this.adminListAccounts({
+      ...query,
+      role: AccountRole.COMERCIAL,
+    });
   }
 
   async verifyTwoFactor(dto: VerifyTwoFactorDto, meta?: RequestMeta) {
@@ -4686,6 +4770,9 @@ export class AuthService {
     }
     if (account.role === AccountRole.ADMIN) {
       await this.ensureProductAccess(account.id, ProductCode.MEUDOC_ADMIN, ProductRole.ADMIN, null);
+    }
+    if (account.role === AccountRole.COMERCIAL) {
+      await this.ensureProductAccess(account.id, ProductCode.MEUDOC_ADMIN, ProductRole.COMERCIAL, null);
     }
   }
 

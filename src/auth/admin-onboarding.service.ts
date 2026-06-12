@@ -14,6 +14,12 @@ import { CreatePublicDoctorDto } from './dto/create-public-doctor.dto';
 import { RabbitmqService } from './rabbitmq.service';
 import { AdminListDoctorOnboardingInvitesDto } from './dto/admin-list-doctor-onboarding-invites.dto';
 import type { DoctorOnboardingInviteAdminListResponse, DoctorOnboardingInviteOnboardingInfo } from './types/doctor-onboarding-invite-admin.types';
+import { DoctorReferralsService } from './doctor-referrals.service';
+
+type OnboardingActor = {
+  role?: string;
+  authUserId?: string;
+};
 
 type PrefillProfile = {
   firstName?: string;
@@ -72,6 +78,7 @@ export class AdminOnboardingService {
     private readonly prisma: PrismaService,
     private readonly config: ConfigService,
     private readonly rabbitmq: RabbitmqService,
+    private readonly referrals: DoctorReferralsService,
   ) {
     this.doctorsBaseUrl =
       this.config.get<string>('DOCTORS_BASE_URL') ??
@@ -90,23 +97,33 @@ export class AdminOnboardingService {
     ); // 14 dias por defecto
   }
 
-  async listInvites(query: AdminListDoctorOnboardingInvitesDto): Promise<DoctorOnboardingInviteAdminListResponse> {
+  async listInvites(
+    query: AdminListDoctorOnboardingInvitesDto,
+    actor?: OnboardingActor,
+  ): Promise<DoctorOnboardingInviteAdminListResponse> {
     const page = query.page && query.page > 0 ? query.page : 1;
     const limit = query.limit && query.limit > 0 ? Math.min(query.limit, 100) : 50;
     const skip = (page - 1) * limit;
     const q = (query.q ?? '').trim().toLowerCase();
 
-    const where = q
-      ? {
-          OR: [
-            { email: { contains: q, mode: 'insensitive' as const } },
-            { firstName: { contains: q, mode: 'insensitive' as const } },
-            { lastName: { contains: q, mode: 'insensitive' as const } },
-            { phoneNumber: { contains: q, mode: 'insensitive' as const } },
-            { doctorId: { contains: q, mode: 'insensitive' as const } },
-          ],
-        }
-      : {};
+    const where: {
+      OR?: Array<Record<string, unknown>>;
+      createdByUserId?: string;
+    } = {};
+
+    if (actor?.role === 'COMERCIAL' && actor.authUserId) {
+      where.createdByUserId = actor.authUserId;
+    }
+
+    if (q) {
+      where.OR = [
+        { email: { contains: q, mode: 'insensitive' as const } },
+        { firstName: { contains: q, mode: 'insensitive' as const } },
+        { lastName: { contains: q, mode: 'insensitive' as const } },
+        { phoneNumber: { contains: q, mode: 'insensitive' as const } },
+        { doctorId: { contains: q, mode: 'insensitive' as const } },
+      ];
+    }
 
     const [items, total] = await Promise.all([
       this.prisma.doctorOnboardingInvite.findMany({
@@ -142,7 +159,7 @@ export class AdminOnboardingService {
     };
   }
 
-  async createInvite(dto: CreateDoctorOnboardingInviteDto) {
+  async createInvite(dto: CreateDoctorOnboardingInviteDto, actor?: OnboardingActor) {
     const normalizedEmail = dto.email.trim().toLowerCase();
     const normalizedPhone = dto.phoneNumber?.trim() || null;
     const trimmedFirstName = dto.firstName?.trim();
@@ -217,7 +234,7 @@ export class AdminOnboardingService {
       await this.replaceServices(doctorId, agendaId, services);
     }
 
-    await this.prisma.doctorOnboardingInvite.create({
+    const invite = await this.prisma.doctorOnboardingInvite.create({
       data: {
         doctorId,
         email: normalizedEmail,
@@ -228,8 +245,18 @@ export class AdminOnboardingService {
         status: InviteStatus.PENDING,
         expiresAt,
         preferredPlanCode: dto.planCode ?? null,
+        createdByUserId: actor?.authUserId ?? null,
       },
     });
+
+    if (dto.referralId && actor?.authUserId && actor.role === 'COMERCIAL') {
+      await this.referrals.linkReferralToOnboardingInvite({
+        referralId: dto.referralId,
+        salesRepId: actor.authUserId,
+        doctorId,
+        onboardingInviteId: invite.id,
+      });
+    }
 
     await this.rabbitmq.publishAuthEvent({
       type: 'DoctorOnboardingInviteCreated',
@@ -253,7 +280,7 @@ export class AdminOnboardingService {
     };
   }
 
-  async createPublicDoctor(dto: CreatePublicDoctorDto) {
+  async createPublicDoctor(dto: CreatePublicDoctorDto, _actor?: OnboardingActor) {
     const trimmedFirstName = dto.firstName?.trim();
     const trimmedLastName = dto.lastName?.trim();
 
@@ -368,13 +395,19 @@ export class AdminOnboardingService {
     if (invite.status !== InviteStatus.PENDING) {
       return invite;
     }
-    return this.prisma.doctorOnboardingInvite.update({
+    const updated = await this.prisma.doctorOnboardingInvite.update({
       where: { id: invite.id },
       data: {
         status: InviteStatus.ACCEPTED,
         authUserId,
       },
     });
+    void this.rabbitmq.publishAuthEvent({
+      type: 'DoctorAccountRegistered',
+      routingKey: 'auth.doctor_account_registered',
+      data: { doctorId: updated.doctorId },
+    });
+    return updated;
   }
 
   async resolveInviteForRegister(token: string, normalizedEmail: string) {

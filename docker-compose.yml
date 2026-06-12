@@ -32,6 +32,7 @@
       RABBITMQ_QUEUE_AUTH_EMPLOYER_MEMBERS: auth.q.employer_members
       EMPLOYERS_BASE_URL: http://employers-service:3041/employersms
       INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-dev-internal-employers-token}
+      ANALYTICS_INTERNAL_BASE_URL: http://analytics-service:3015/analyticsms
     ports:
       - "3000:3000"
     volumes:

@@ -14,6 +14,7 @@ enum AccountRole {
   EMPLOYER
   COLLABORATOR
   ADMIN
+  COMERCIAL
   MEMBER
 }
 
@@ -32,8 +33,20 @@ enum ProductRole {
   MEDICAL_ENTITY
   ENTITY_ADMIN
   ADMIN
+  COMERCIAL
   EMPLOYER_ADMIN
   EMPLOYER_BILLING
+}
+
+enum DoctorReferralStatus {
+  NEW
+  IN_CONTACT
+  INTERESTED
+  ONBOARDING_SENT
+  ACCOUNT_CREATED
+  ACTIVE
+  LOST
+  DUPLICATE
 }
 
 enum ProductAccessStatus {
@@ -145,6 +158,7 @@ model Account {
   createdClinicDoctorInvites ClinicDoctorInvite[]   @relation("ClinicDoctorInviteCreatedBy")
   roleProfiles           AccountRoleProfile[]
   productAccesses        AccountProductAccess[]
+  commercialReferrals    DoctorReferral[]       @relation("DoctorReferralSalesRep")
 
   @@index([subjectId, role])
 }
@@ -400,6 +414,7 @@ model DoctorOnboardingInvite {
   id                String       @id @default(uuid())
   doctorId          String       @unique
   authUserId        String?
+  createdByUserId   String?
   email             String
   phoneNumber       String?
   firstName         String?
@@ -413,6 +428,27 @@ model DoctorOnboardingInvite {
 
   @@index([email])
   @@index([doctorId, status])
+  @@index([createdByUserId])
+}
+
+model DoctorReferral {
+  id                 String               @id @default(uuid())
+  salesRepId         String
+  salesRep           Account              @relation("DoctorReferralSalesRep", fields: [salesRepId], references: [id], onDelete: Restrict)
+  fullName           String
+  phoneNumber        String
+  email              String?
+  status             DoctorReferralStatus @default(NEW)
+  statusNote         String?
+  doctorId           String?              @unique
+  onboardingInviteId String?
+  createdAt          DateTime             @default(now())
+  updatedAt          DateTime             @updatedAt
+
+  @@index([salesRepId, status])
+  @@index([phoneNumber])
+  @@index([fullName])
+  @@index([createdAt])
 }
 
 model RefreshToken {

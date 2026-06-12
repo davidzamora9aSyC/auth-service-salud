@@ -59,7 +59,11 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
   }
 
   async publishAuthEvent(event: {
-    type: 'AuthUserRegistered' | 'DoctorOnboardingInviteCreated' | 'EmployerMemberLinked';
+    type:
+      | 'AuthUserRegistered'
+      | 'DoctorOnboardingInviteCreated'
+      | 'EmployerMemberLinked'
+      | 'DoctorAccountRegistered';
     routingKey: string;
     data: Partial<AuthEventPayload> & Record<string, unknown>;
     correlationId?: string;

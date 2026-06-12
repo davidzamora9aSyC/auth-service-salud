@@ -36,4 +36,8 @@ export class CreateDoctorOnboardingInviteDto {
   @IsOptional()
   @IsString()
   planCode?: string;
+
+  @IsOptional()
+  @IsString()
+  referralId?: string;
 }
