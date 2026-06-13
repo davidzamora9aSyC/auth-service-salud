@@ -30,9 +30,13 @@
       RABBITMQ_EXCHANGE_EMPLOYERS: employers.events
       RABBITMQ_QUEUE_AUTH_EMPLOYERS: auth.q.employers
       RABBITMQ_QUEUE_AUTH_EMPLOYER_MEMBERS: auth.q.employer_members
+      RABBITMQ_EXCHANGE_SUBSCRIPTIONS: subscriptions.events
       EMPLOYERS_BASE_URL: http://employers-service:3041/employersms
       INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-dev-internal-employers-token}
       ANALYTICS_INTERNAL_BASE_URL: http://analytics-service:3015/analyticsms
+      PAYMENTS_INTERNAL_BASE_URL: http://payments-service:3014/paymentsms
+      SUBSCRIPTIONS_INTERNAL_BASE_URL: http://subscriptions-service:3013/subscriptionsms
+      SUBSCRIPTIONS_INTERNAL_API_KEY: ""
     ports:
       - "3000:3000"
     volumes:

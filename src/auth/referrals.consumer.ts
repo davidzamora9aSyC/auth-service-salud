@@ -27,15 +27,19 @@ export class ReferralsConsumer implements OnModuleInit, OnModuleDestroy {
       this.config.get<string>('RABBITMQ_EXCHANGE_AUTH') ?? 'auth.events';
     const doctorsExchange =
       this.config.get<string>('RABBITMQ_EXCHANGE_DOCTORS') ?? 'doctors.events';
+    const subscriptionsExchange =
+      this.config.get<string>('RABBITMQ_EXCHANGE_SUBSCRIPTIONS') ?? 'subscriptions.events';
 
     try {
       this.connection = await connect(url);
       this.channel = await this.connection.createChannel();
       await this.channel.assertExchange(authExchange, 'topic', { durable: true });
       await this.channel.assertExchange(doctorsExchange, 'topic', { durable: true });
+      await this.channel.assertExchange(subscriptionsExchange, 'topic', { durable: true });
       await this.channel.assertQueue(queue, { durable: true });
       await this.channel.bindQueue(queue, authExchange, 'auth.doctor_account_registered');
       await this.channel.bindQueue(queue, doctorsExchange, 'doctors.onboarding_completed');
+      await this.channel.bindQueue(queue, subscriptionsExchange, 'subscriptions.activated');
       await this.channel.prefetch(5);
       await this.channel.consume(queue, (msg) => this.handleMessage(msg), { noAck: false });
       this.logger.log(`Escuchando ${queue}`);
@@ -69,6 +73,9 @@ export class ReferralsConsumer implements OnModuleInit, OnModuleDestroy {
         await this.referrals.onDoctorAccountRegistered(doctorId);
       } else if (payload.type === 'DoctorOnboardingCompleted') {
         await this.referrals.onDoctorOnboardingCompleted(doctorId);
+      } else if (payload.type === 'SubscriptionActivated') {
+        const planCode = String(payload.data?.plan ?? '').trim();
+        await this.referrals.onSubscriptionActivated(doctorId, planCode);
       }
     } catch (error) {
       this.logger.warn(

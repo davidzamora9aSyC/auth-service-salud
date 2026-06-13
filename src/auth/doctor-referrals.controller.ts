@@ -76,6 +76,26 @@ export class DoctorReferralsController {
     return this.referrals.updateReferralForCommercial(authUserId!, id, dto);
   }
 
+  @Get('comercial/referrals/:id/metrics')
+  metricsForCommercial(
+    @Param('id') id: string,
+    @Headers('x-role') role?: string,
+    @Headers('x-auth-user-id') authUserId?: string,
+  ) {
+    assertCommercialRole(role, authUserId);
+    return this.referrals.getReferralMetricsForCommercial(authUserId!, id);
+  }
+
+  @Get('comercial/referrals/:id/payments-report')
+  paymentsReportForCommercial(
+    @Param('id') id: string,
+    @Headers('x-role') role?: string,
+    @Headers('x-auth-user-id') authUserId?: string,
+  ) {
+    assertCommercialRole(role, authUserId);
+    return this.referrals.getReferralPaymentsReportForCommercial(authUserId!, id);
+  }
+
   @Get('admin/referrals')
   listForAdmin(@Query() query: ListDoctorReferralsDto, @Headers('x-role') role?: string) {
     assertAdminRole(role);
@@ -86,6 +106,12 @@ export class DoctorReferralsController {
   metricsForAdmin(@Param('id') id: string, @Headers('x-role') role?: string) {
     assertAdminRole(role);
     return this.referrals.getReferralMetricsForAdmin(id);
+  }
+
+  @Get('admin/referrals/:id/payments-report')
+  paymentsReportForAdmin(@Param('id') id: string, @Headers('x-role') role?: string) {
+    assertAdminRole(role);
+    return this.referrals.getReferralPaymentsReportForAdmin(id);
   }
 
   @Get('admin/referrals/:id')

@@ -45,6 +45,7 @@ enum DoctorReferralStatus {
   ONBOARDING_SENT
   ACCOUNT_CREATED
   ACTIVE
+  PAYING_PLAN
   LOST
   DUPLICATE
 }
@@ -438,10 +439,11 @@ model DoctorReferral {
   fullName           String
   phoneNumber        String
   email              String?
-  status             DoctorReferralStatus @default(NEW)
-  statusNote         String?
-  doctorId           String?              @unique
-  onboardingInviteId String?
+  status               DoctorReferralStatus @default(NEW)
+  statusNote           String?
+  subscriptionPlanCode String?
+  doctorId             String?              @unique
+  onboardingInviteId   String?
   createdAt          DateTime             @default(now())
   updatedAt          DateTime             @updatedAt
 

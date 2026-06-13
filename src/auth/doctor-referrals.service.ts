@@ -28,6 +28,12 @@ const STATUSES_BEFORE_ACTIVE: DoctorReferralStatus[] = [
   DoctorReferralStatus.ACCOUNT_CREATED,
 ];
 
+const STATUSES_ELIGIBLE_FOR_PAYING_PLAN: DoctorReferralStatus[] = [
+  DoctorReferralStatus.ACCOUNT_CREATED,
+  DoctorReferralStatus.ACTIVE,
+  DoctorReferralStatus.PAYING_PLAN,
+];
+
 type ReferralActor = {
   role: 'ADMIN' | 'COMERCIAL' | 'SYSTEM';
   authUserId: string;
@@ -36,6 +42,9 @@ type ReferralActor = {
 @Injectable()
 export class DoctorReferralsService {
   private readonly analyticsBaseUrl: string;
+  private readonly paymentsBaseUrl: string;
+  private readonly subscriptionsBaseUrl: string;
+  private readonly subscriptionsInternalApiKey: string;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -44,6 +53,14 @@ export class DoctorReferralsService {
     this.analyticsBaseUrl =
       this.config.get<string>('ANALYTICS_INTERNAL_BASE_URL') ??
       'http://analytics-service:3015/analyticsms';
+    this.paymentsBaseUrl =
+      this.config.get<string>('PAYMENTS_INTERNAL_BASE_URL') ??
+      'http://payments-service:3014/paymentsms';
+    this.subscriptionsBaseUrl =
+      this.config.get<string>('SUBSCRIPTIONS_INTERNAL_BASE_URL') ??
+      'http://subscriptions-service:3013/subscriptionsms';
+    this.subscriptionsInternalApiKey =
+      this.config.get<string>('SUBSCRIPTIONS_INTERNAL_API_KEY') ?? '';
   }
 
   async createReferral(actor: ReferralActor, dto: CreateDoctorReferralDto) {
@@ -123,46 +140,30 @@ export class DoctorReferralsService {
 
   async getReferralMetricsForAdmin(referralId: string) {
     const referral = await this.findReferralOrThrow(referralId);
-    if (!referral.doctorId) {
-      return {
-        referralId: referral.id,
-        doctorId: null,
-        loginCount: 0,
-        appointmentCount: 0,
-        doctorOnboardingStatus: null,
-      };
+    return this.buildReferralMetrics(referral);
+  }
+
+  async getReferralMetricsForCommercial(authUserId: string, referralId: string) {
+    await this.assertCommercialAccount(authUserId);
+    const referral = await this.findReferralOrThrow(referralId);
+    if (referral.salesRepId !== authUserId) {
+      throw new ForbiddenException('No autorizado');
     }
+    return this.buildReferralMetrics(referral);
+  }
 
-    const doctorAccount = await this.prisma.account.findFirst({
-      where: {
-        doctorId: referral.doctorId,
-        role: AccountRole.DOCTOR,
-        deletedAt: null,
-      },
-      select: {
-        id: true,
-        onboardingStatus: true,
-      },
-    });
+  async getReferralPaymentsReportForAdmin(referralId: string) {
+    const referral = await this.findReferralOrThrow(referralId);
+    return this.buildReferralPaymentsReport(referral);
+  }
 
-    const loginCount = doctorAccount
-      ? await this.prisma.loginHistory.count({
-          where: {
-            accountId: doctorAccount.id,
-            role: AccountRole.DOCTOR,
-          },
-        })
-      : 0;
-
-    const appointmentCount = await this.fetchAppointmentCount(referral.doctorId);
-
-    return {
-      referralId: referral.id,
-      doctorId: referral.doctorId,
-      loginCount,
-      appointmentCount,
-      doctorOnboardingStatus: doctorAccount?.onboardingStatus ?? null,
-    };
+  async getReferralPaymentsReportForCommercial(authUserId: string, referralId: string) {
+    await this.assertCommercialAccount(authUserId);
+    const referral = await this.findReferralOrThrow(referralId);
+    if (referral.salesRepId !== authUserId) {
+      throw new ForbiddenException('No autorizado');
+    }
+    return this.buildReferralPaymentsReport(referral);
   }
 
   async linkReferralToOnboardingInvite(input: {
@@ -204,6 +205,28 @@ export class DoctorReferralsService {
       DoctorReferralStatus.ACTIVE,
       STATUSES_BEFORE_ACTIVE,
     );
+  }
+
+  async onSubscriptionActivated(doctorId: string, planCode: string) {
+    const normalizedPlan = planCode.trim();
+    if (!normalizedPlan) {
+      return;
+    }
+
+    const referral = await this.prisma.doctorReferral.findUnique({
+      where: { doctorId },
+    });
+    if (!referral || !STATUSES_ELIGIBLE_FOR_PAYING_PLAN.includes(referral.status)) {
+      return;
+    }
+
+    await this.prisma.doctorReferral.update({
+      where: { id: referral.id },
+      data: {
+        status: DoctorReferralStatus.PAYING_PLAN,
+        subscriptionPlanCode: normalizedPlan,
+      },
+    });
   }
 
   private async listReferrals(
@@ -391,19 +414,12 @@ export class DoctorReferralsService {
       email: referral.email,
       status: referral.status,
       statusNote: referral.statusNote,
+      subscriptionPlanCode: referral.subscriptionPlanCode,
       doctorId: referral.doctorId,
       onboardingInviteId: referral.onboardingInviteId,
       createdAt: referral.createdAt.toISOString(),
       updatedAt: referral.updatedAt.toISOString(),
     };
-  }
-
-  private normalizePhoneNumber(value: string) {
-    const trimmed = value.replace(/[\s.-]/g, '');
-    if (!trimmed.startsWith('+')) {
-      return `+${trimmed}`;
-    }
-    return trimmed;
   }
 
   private async fetchAppointmentCount(doctorId: string) {
@@ -434,5 +450,154 @@ export class DoctorReferralsService {
     } catch {
       return 0;
     }
+  }
+
+  private async buildReferralMetrics(
+    referral: Prisma.DoctorReferralGetPayload<{ include: ReturnType<DoctorReferralsService['referralInclude']> }>,
+  ) {
+    if (!referral.doctorId) {
+      return {
+        referralId: referral.id,
+        doctorId: null,
+        loginCount: 0,
+        appointmentCount: 0,
+        lastLoginAt: null,
+        doctorOnboardingStatus: null,
+      };
+    }
+
+    const doctorAccount = await this.prisma.account.findFirst({
+      where: {
+        doctorId: referral.doctorId,
+        role: AccountRole.DOCTOR,
+        deletedAt: null,
+      },
+      select: {
+        id: true,
+        onboardingStatus: true,
+      },
+    });
+
+    const loginCount = doctorAccount
+      ? await this.prisma.loginHistory.count({
+          where: {
+            accountId: doctorAccount.id,
+            role: AccountRole.DOCTOR,
+          },
+        })
+      : 0;
+
+    const lastLogin = doctorAccount
+      ? await this.prisma.loginHistory.findFirst({
+          where: {
+            accountId: doctorAccount.id,
+            role: AccountRole.DOCTOR,
+          },
+          orderBy: { createdAt: 'desc' },
+          select: { createdAt: true },
+        })
+      : null;
+
+    const appointmentCount = await this.fetchAppointmentCount(referral.doctorId);
+
+    return {
+      referralId: referral.id,
+      doctorId: referral.doctorId,
+      loginCount,
+      appointmentCount,
+      lastLoginAt: lastLogin?.createdAt.toISOString() ?? null,
+      doctorOnboardingStatus: doctorAccount?.onboardingStatus ?? null,
+    };
+  }
+
+  private async buildReferralPaymentsReport(
+    referral: Prisma.DoctorReferralGetPayload<{ include: ReturnType<DoctorReferralsService['referralInclude']> }>,
+  ) {
+    if (!referral.doctorId) {
+      throw new BadRequestException('El referido aun no tiene doctor vinculado');
+    }
+
+    const [payments, subscription] = await Promise.all([
+      this.fetchDoctorPayments(referral.doctorId),
+      this.fetchDoctorSubscription(referral.doctorId),
+    ]);
+
+    return {
+      referralId: referral.id,
+      doctorId: referral.doctorId,
+      referralName: referral.fullName,
+      subscription,
+      payments,
+    };
+  }
+
+  private async fetchDoctorPayments(doctorId: string) {
+    const url = `${this.paymentsBaseUrl.replace(/\/$/, '')}/internal/doctors/${encodeURIComponent(doctorId)}/payments`;
+
+    try {
+      const response = await fetch(url, {
+        headers: {
+          'x-role': 'SYSTEM',
+        },
+      });
+      if (!response.ok) {
+        return [];
+      }
+      return (await response.json()) as Array<{
+        id: string;
+        planCode: string;
+        addonCodes?: string[];
+        amount: number;
+        currency: string;
+        status: string;
+        reference: string;
+        createdAt: string;
+      }>;
+    } catch {
+      return [];
+    }
+  }
+
+  private async fetchDoctorSubscription(doctorId: string) {
+    const url = `${this.subscriptionsBaseUrl.replace(/\/$/, '')}/internal/subscriptions/doctors/${encodeURIComponent(doctorId)}`;
+    const headers: Record<string, string> = {};
+    if (this.subscriptionsInternalApiKey) {
+      headers['x-api-key'] = this.subscriptionsInternalApiKey;
+    }
+
+    try {
+      const response = await fetch(url, { headers });
+      if (response.status === 404) {
+        return null;
+      }
+      if (!response.ok) {
+        return null;
+      }
+      return (await response.json()) as {
+        subscriptionId: string;
+        status: string;
+        isTrial?: boolean;
+        plan: {
+          code: string;
+          name?: string;
+          priceAmount?: number;
+          currency?: string;
+          period?: string;
+        };
+        cancelAtPeriodEnd?: boolean;
+        currentPeriodStart: string | null;
+        currentPeriodEnd: string | null;
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private normalizePhoneNumber(value: string) {
+    const trimmed = value.replace(/[\s.-]/g, '');
+    if (!trimmed.startsWith('+')) {
+      return `+${trimmed}`;
+    }
+    return trimmed;
   }
 }
