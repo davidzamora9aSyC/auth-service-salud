@@ -8,13 +8,14 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { randomBytes, randomUUID, createHash } from 'node:crypto';
 import { PrismaService } from '../prisma/prisma.service';
-import { InviteStatus } from '@prisma/client';
+import { InviteStatus, TrialDurationUnit } from '@prisma/client';
 import { CreateDoctorOnboardingInviteDto } from './dto/create-doctor-onboarding-invite.dto';
 import { CreatePublicDoctorDto } from './dto/create-public-doctor.dto';
 import { RabbitmqService } from './rabbitmq.service';
 import { AdminListDoctorOnboardingInvitesDto } from './dto/admin-list-doctor-onboarding-invites.dto';
 import type { DoctorOnboardingInviteAdminListResponse, DoctorOnboardingInviteOnboardingInfo } from './types/doctor-onboarding-invite-admin.types';
 import { DoctorReferralsService } from './doctor-referrals.service';
+import { UpdateDoctorOnboardingSettingsDto } from './dto/update-doctor-onboarding-settings.dto';
 
 type OnboardingActor = {
   role?: string;
@@ -148,6 +149,8 @@ export class AdminOnboardingService {
         lastName: it.lastName ?? null,
         status: it.status,
         preferredPlanCode: it.preferredPlanCode ?? null,
+        trialDurationValue: it.trialDurationValue ?? null,
+        trialDurationUnit: it.trialDurationUnit ?? null,
         expiresAt: it.expiresAt.toISOString(),
         createdAt: it.createdAt.toISOString(),
         updatedAt: it.updatedAt.toISOString(),
@@ -197,6 +200,11 @@ export class AdminOnboardingService {
     const inviteToken = randomBytes(48).toString('hex');
     const tokenHash = this.hashToken(inviteToken);
     const expiresAt = new Date(Date.now() + this.inviteTtlMs);
+    const settings = await this.getOrCreateSettings();
+    const inviteTrial = {
+      value: settings.inviteTrialDurationValue,
+      unit: settings.inviteTrialDurationUnit,
+    };
 
     await this.createPrefillDoctor({
       doctorId,
@@ -245,6 +253,8 @@ export class AdminOnboardingService {
         status: InviteStatus.PENDING,
         expiresAt,
         preferredPlanCode: dto.planCode ?? null,
+        trialDurationValue: inviteTrial?.value ?? null,
+        trialDurationUnit: inviteTrial?.unit ?? null,
         createdByUserId: actor?.authUserId ?? null,
       },
     });
@@ -270,6 +280,8 @@ export class AdminOnboardingService {
         lastName: trimmedLastName,
         inviteToken,
         preferredPlanCode: dto.planCode ?? undefined,
+        trialDurationValue: inviteTrial?.value,
+        trialDurationUnit: inviteTrial?.unit,
       },
     });
 
@@ -376,6 +388,8 @@ export class AdminOnboardingService {
         lastName: invite.lastName ?? undefined,
         inviteToken: token,
         preferredPlanCode: invite.preferredPlanCode ?? undefined,
+        trialDurationValue: invite.trialDurationValue ?? undefined,
+        trialDurationUnit: invite.trialDurationUnit ?? undefined,
       },
     });
 
@@ -385,9 +399,49 @@ export class AdminOnboardingService {
   async getPreferredPlanByDoctor(doctorId: string) {
     const invite = await this.prisma.doctorOnboardingInvite.findFirst({
       where: { doctorId, status: InviteStatus.ACCEPTED },
-      select: { preferredPlanCode: true },
+      select: {
+        preferredPlanCode: true,
+        trialDurationValue: true,
+        trialDurationUnit: true,
+      },
     });
-    return { planCode: invite?.preferredPlanCode ?? null };
+    return {
+      planCode: invite?.preferredPlanCode ?? null,
+      trialDurationValue: invite?.trialDurationValue ?? null,
+      trialDurationUnit: invite?.trialDurationUnit ?? null,
+    };
+  }
+
+  async getSettings() {
+    const settings = await this.getOrCreateSettings();
+    return {
+      inviteTrialDurationValue: settings.inviteTrialDurationValue,
+      inviteTrialDurationUnit: settings.inviteTrialDurationUnit,
+      updatedAt: settings.updatedAt.toISOString(),
+    };
+  }
+
+  async updateSettings(dto: UpdateDoctorOnboardingSettingsDto, authUserId?: string) {
+    const normalizedUnit = this.normalizeTrialDurationUnit(dto.inviteTrialDurationUnit);
+    const settings = await this.prisma.doctorOnboardingSettings.upsert({
+      where: { id: 'default' },
+      create: {
+        id: 'default',
+        inviteTrialDurationValue: dto.inviteTrialDurationValue,
+        inviteTrialDurationUnit: normalizedUnit,
+        updatedByUserId: authUserId ?? null,
+      },
+      update: {
+        inviteTrialDurationValue: dto.inviteTrialDurationValue,
+        inviteTrialDurationUnit: normalizedUnit,
+        updatedByUserId: authUserId ?? null,
+      },
+    });
+    return {
+      inviteTrialDurationValue: settings.inviteTrialDurationValue,
+      inviteTrialDurationUnit: settings.inviteTrialDurationUnit,
+      updatedAt: settings.updatedAt.toISOString(),
+    };
   }
 
   async markInviteAccepted(token: string, authUserId: string) {
@@ -450,6 +504,31 @@ export class AdminOnboardingService {
 
   private hashToken(token: string) {
     return createHash('sha256').update(token).digest('hex');
+  }
+
+  private normalizeTrialDurationUnit(unit: 'DAY' | 'MONTH'): TrialDurationUnit {
+    const normalizedUnit =
+      unit.trim().toUpperCase() === TrialDurationUnit.DAY
+        ? TrialDurationUnit.DAY
+        : unit.trim().toUpperCase() === TrialDurationUnit.MONTH
+          ? TrialDurationUnit.MONTH
+          : null;
+    if (!normalizedUnit) {
+      throw new BadRequestException('trialDurationUnit debe ser DAY o MONTH');
+    }
+    return normalizedUnit;
+  }
+
+  private async getOrCreateSettings() {
+    return this.prisma.doctorOnboardingSettings.upsert({
+      where: { id: 'default' },
+      create: {
+        id: 'default',
+        inviteTrialDurationValue: 1,
+        inviteTrialDurationUnit: TrialDurationUnit.MONTH,
+      },
+      update: {},
+    });
   }
 
   private normalizeProfile(profile: PrefillProfile) {

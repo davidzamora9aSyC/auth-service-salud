@@ -65,6 +65,21 @@ import { GrantEmployerAccessDto } from './dto/grant-employer-access.dto';
 import { RegisterMeuredDto } from './dto/register-meured.dto';
 import { SelectProductAccessDto } from './dto/select-product-access.dto';
 
+type PatientAdminKpis = {
+  accountId: string;
+  doctorSearchCount: number;
+  avgInteractionsPerTrackedSession: number | null;
+  avgInteractionsPerTrackedSessionLast7Days: number | null;
+  hasConsultation: boolean;
+  appointmentCount: number;
+  lastAppointmentAt: string | null;
+};
+
+type AccountLoginInsights = {
+  loginCount: number;
+  lastLoginAt: string | null;
+};
+
 type RequestMeta = {
   ip?: string;
   forwardedFor?: string;
@@ -299,6 +314,7 @@ export class AuthService {
       const doctorId =
         dto.role === AccountRole.DOCTOR ? (invite?.doctorId ?? randomUUID()) : null;
       const employerId = dto.role === AccountRole.EMPLOYER ? randomUUID() : null;
+    const accountRole = dto.role === AccountRole.PATIENT ? AccountRole.MEMBER : dto.role;
     const onboardingStatus =
       dto.role === AccountRole.DOCTOR ||
       dto.role === AccountRole.CLINIC ||
@@ -330,8 +346,8 @@ export class AuthService {
           email: normalizedEmail,
           passwordHash,
           salt,
-          role: dto.role,
-          subjectId: dto.subjectId ?? null,
+          role: accountRole,
+          subjectId: dto.role === AccountRole.PATIENT ? null : dto.subjectId ?? null,
           phoneNumber: normalizedPhone,
           doctorId,
           employerId,
@@ -376,17 +392,18 @@ export class AuthService {
           throw error;
         }
       }
-    if (account.role === AccountRole.PATIENT) {
+    let sessionProductAccess: ProductAccessContext | null = null;
+    if (dto.role === AccountRole.PATIENT) {
       if (!firstName || !lastName) {
         await this.prisma.account.delete({ where: { id: account.id } });
         throw new BadRequestException('Nombre y apellido son requeridos');
       }
       try {
-        const patientId = await this.linkOrCreatePatientForAccount(account, firstName, lastName);
-        account = await this.prisma.account.update({
-          where: { id: account.id },
-          data: { subjectId: patientId },
+        const patientAccess = await this.provisionPatientAccessForAccount(account, {
+          firstName,
+          lastName,
         });
+        sessionProductAccess = patientAccess.productAccess;
       } catch (error) {
         await this.prisma.account.delete({ where: { id: account.id } }).catch(() => undefined);
         throw error;
@@ -397,13 +414,16 @@ export class AuthService {
         lastName,
         companyName: dto.companyName,
         taxId: dto.taxId,
-      });
+      }, dto.role);
       if (inviteToken && invite) {
         await this.adminOnboarding.markInviteAccepted(inviteToken, account.id);
       }
     await this.ensureLegacyProductAccess(account);
     await this.recordIdentityReuse(account, normalizedEmail, normalizedPhone);
-    const tokens = await this.issueTokens(account);
+    const tokens = await this.issueTokens(account, {
+      sessionRole: dto.role,
+      productAccess: sessionProductAccess ?? undefined,
+    });
     const availableProductAccess = await this.getAvailableProductAccess(account.id);
     return { ...tokens, availableProductAccess };
   }
@@ -532,19 +552,16 @@ export class AuthService {
       throw new ConflictException('Ya tienes una cuenta con este rol');
     }
 
+    let sessionProductAccess: ProductAccessContext | null = null;
     if (dto.role === AccountRole.PATIENT) {
       if (!firstName || !lastName) {
         throw new BadRequestException('Nombre y apellido son requeridos');
       }
-      const patientId = await this.linkOrCreatePatientForAccount(account, firstName, lastName);
-      await this.prisma.accountRoleProfile.create({
-        data: {
-          accountId: account.id,
-          role: AccountRole.PATIENT,
-          subjectId: patientId,
-          onboardingStatus: OnboardingStatus.COMPLETE,
-        },
+      const patientAccess = await this.provisionPatientAccessForAccount(account, {
+        firstName,
+        lastName,
       });
+      sessionProductAccess = patientAccess.productAccess;
     } else if (dto.role === AccountRole.DOCTOR) {
       if (isAdminInvite && !inviteDoctorId) {
         throw new BadRequestException('Invitacion invalida');
@@ -631,7 +648,7 @@ export class AuthService {
           lastName,
           companyName: dto.companyName,
           taxId: dto.taxId,
-        });
+        }, dto.role);
       } catch (error) {
         await this.employersHttp.rollbackFounder(employerId).catch(() => undefined);
         throw error;
@@ -653,7 +670,10 @@ export class AuthService {
       });
     }
 
-    const tokens = await this.issueTokens(updatedAccount, { sessionRole: dto.role });
+    const tokens = await this.issueTokens(updatedAccount, {
+      sessionRole: dto.role,
+      productAccess: sessionProductAccess ?? undefined,
+    });
     return { ...tokens, availableRoles, availableProductAccess };
   }
 
@@ -751,8 +771,9 @@ export class AuthService {
     }
 
     await this.prisma.refreshToken.delete({ where: { tokenHash } });
+    const sessionRole = this.resolveSessionRoleForProductAccess(stored.account, productAccess);
     const tokens = await this.issueTokens(stored.account, {
-      sessionRole: stored.account.role,
+      sessionRole,
       productAccess,
     });
     const availableProductAccess = await this.getAvailableProductAccess(stored.account.id);
@@ -796,6 +817,9 @@ export class AuthService {
     const existing = await this.prisma.account.findUnique({
       where: { email: normalizedEmail },
     });
+    const existingHasPatientRole = existing
+      ? await this.accountHasRole(existing, AccountRole.PATIENT)
+      : false;
     if (existing) {
       if (existing.status !== AccountStatus.ACTIVE) {
         throw new UnauthorizedException('Account disabled');
@@ -812,7 +836,7 @@ export class AuthService {
           'El email ya esta registrado como doctor y no puede aceptar invitaciones de colaborador',
         );
       }
-      if (existing.role !== AccountRole.COLLABORATOR && existing.role !== AccountRole.PATIENT) {
+      if (existing.role !== AccountRole.COLLABORATOR && !existingHasPatientRole) {
         throw new ConflictException('El email ya esta registrado con otro tipo de cuenta');
       }
       const linkedCollaborator = await this.prisma.collaborator.findUnique({
@@ -884,7 +908,7 @@ export class AuthService {
         data: { status: InviteStatus.ACCEPTED },
       });
 
-      if (existing?.role === AccountRole.PATIENT) {
+      if (existingHasPatientRole) {
         await tx.accountRoleProfile.upsert({
           where: {
             accountId_role: {
@@ -1059,7 +1083,7 @@ export class AuthService {
           email: normalizedEmail,
           passwordHash,
           salt,
-          role: AccountRole.PATIENT,
+          role: AccountRole.MEMBER,
           phoneNumber: normalizedPhone,
           employerId: null,
           onboardingStatus: OnboardingStatus.COMPLETE,
@@ -1070,25 +1094,7 @@ export class AuthService {
     });
 
     const patientId = await this.linkOrCreatePatientForAccount(account, dto.firstName.trim(), dto.lastName.trim());
-
-    await this.prisma.accountRoleProfile.upsert({
-      where: {
-        accountId_role: {
-          accountId: account.id,
-          role: AccountRole.PATIENT,
-        },
-      },
-      update: {
-        subjectId: patientId,
-        onboardingStatus: OnboardingStatus.COMPLETE,
-      },
-      create: {
-        accountId: account.id,
-        role: AccountRole.PATIENT,
-        subjectId: patientId,
-        onboardingStatus: OnboardingStatus.COMPLETE,
-      },
-    });
+    await this.provisionPatientAccessForAccount(account, { patientId });
 
     return { authUserId: account.id, patientId };
   }
@@ -1144,24 +1150,7 @@ export class AuthService {
       dto.lastName.trim(),
     );
 
-    await this.prisma.accountRoleProfile.upsert({
-      where: {
-        accountId_role: {
-          accountId: account.id,
-          role: AccountRole.PATIENT,
-        },
-      },
-      update: {
-        subjectId: patientId,
-        onboardingStatus: OnboardingStatus.COMPLETE,
-      },
-      create: {
-        accountId: account.id,
-        role: AccountRole.PATIENT,
-        subjectId: patientId,
-        onboardingStatus: OnboardingStatus.COMPLETE,
-      },
-    });
+    await this.provisionPatientAccessForAccount(account, { patientId });
 
     return { authUserId: account.id, patientId };
   }
@@ -2246,6 +2235,7 @@ export class AuthService {
         throw new ConflictException('Email ya registrado con otro rol');
       }
       let account = existing;
+      let sessionProductAccess: ProductAccessContext | null = null;
       if (!account) {
         const salt = randomBytes(24).toString('hex');
         const passwordHash = await argon2.hash(randomBytes(32).toString('hex') + salt, {
@@ -2265,8 +2255,8 @@ export class AuthService {
             email: normalizedEmail,
             passwordHash,
             salt,
-            role: entry.role,
-            subjectId: profile.sub ?? null,
+            role: entry.role === AccountRole.PATIENT ? AccountRole.MEMBER : entry.role,
+            subjectId: entry.role === AccountRole.PATIENT ? null : profile.sub ?? null,
             phoneNumber: null,
             doctorId,
             employerId,
@@ -2275,14 +2265,27 @@ export class AuthService {
         });
         await this.publishUserRegisteredEvent(account, {
           companyName: profile.name?.trim() || normalizedEmail.split('@')[0],
+        }, entry.role);
+      }
+      if (entry.role === AccountRole.PATIENT) {
+        const googleProfile = profile as { given_name?: string; family_name?: string };
+        const patientAccess = await this.provisionPatientAccessForAccount(account, {
+          firstName: googleProfile.given_name?.trim(),
+          lastName: googleProfile.family_name?.trim(),
         });
+        sessionProductAccess = patientAccess.productAccess;
       }
 
       const sessionRole =
-        (existing && existing.role !== entry.role && allowRoleSwitchGoogle)
-          ? entry.role
-          : account.role;
-      const tokens = await this.issueTokens(account, { sessionRole });
+        entry.role === AccountRole.PATIENT
+          ? AccountRole.PATIENT
+          : (existing && existing.role !== entry.role && allowRoleSwitchGoogle)
+            ? entry.role
+            : account.role;
+      const tokens = await this.issueTokens(account, {
+        sessionRole,
+        productAccess: sessionProductAccess ?? undefined,
+      });
       await this.recordLoginHistory(account, sessionRole, LoginEventSource.OAUTH_GOOGLE, meta);
       const redirect = entry.redirect ?? this.googleSuccessRedirect;
       if (redirect) {
@@ -2379,6 +2382,7 @@ export class AuthService {
       throw new ConflictException('Email ya registrado con otro rol');
     }
     let account = existing;
+    let sessionProductAccess: ProductAccessContext | null = null;
     if (!account) {
       const salt = randomBytes(24).toString('hex');
       const passwordHash = await argon2.hash(randomBytes(32).toString('hex') + salt, {
@@ -2398,8 +2402,8 @@ export class AuthService {
           email: normalizedEmail,
           passwordHash,
           salt,
-          role: entry.role,
-          subjectId: decoded.sub ?? null,
+          role: entry.role === AccountRole.PATIENT ? AccountRole.MEMBER : entry.role,
+          subjectId: entry.role === AccountRole.PATIENT ? null : decoded.sub ?? null,
           phoneNumber: null,
           doctorId,
           employerId,
@@ -2408,14 +2412,23 @@ export class AuthService {
       });
       await this.publishUserRegisteredEvent(account, {
         companyName: normalizedEmail.split('@')[0],
-      });
+      }, entry.role);
+    }
+    if (entry.role === AccountRole.PATIENT) {
+      const patientAccess = await this.provisionPatientAccessForAccount(account);
+      sessionProductAccess = patientAccess.productAccess;
     }
 
     const sessionRole =
-      (existing && existing.role !== entry.role && allowRoleSwitchApple)
-        ? entry.role
-        : account.role;
-    const tokens = await this.issueTokens(account, { sessionRole });
+      entry.role === AccountRole.PATIENT
+        ? AccountRole.PATIENT
+        : (existing && existing.role !== entry.role && allowRoleSwitchApple)
+          ? entry.role
+          : account.role;
+    const tokens = await this.issueTokens(account, {
+      sessionRole,
+      productAccess: sessionProductAccess ?? undefined,
+    });
     await this.recordLoginHistory(account, sessionRole, LoginEventSource.OAUTH_APPLE, meta);
     const redirect = entry.redirect ?? this.appleSuccessRedirect;
     if (redirect) {
@@ -3173,7 +3186,7 @@ export class AuthService {
   ) {
     const logs: DeletionOperationLog[] = [];
     const doctorId = account.doctorId ?? (account.role === AccountRole.DOCTOR ? account.subjectId ?? null : null);
-    const patientId = account.role === AccountRole.PATIENT ? account.subjectId ?? null : null;
+    const patientId = await this.findPatientIdByAuthUserId(account.id);
     const deletedAt = new Date();
     const identitySnapshot = await this.buildIdentitySnapshot(account, doctorId, patientId);
 
@@ -3752,41 +3765,39 @@ export class AuthService {
       }),
     );
 
-    if (account.role === AccountRole.DOCTOR || account.role === AccountRole.PATIENT) {
-      const subjectType =
-        account.role === AccountRole.DOCTOR ? 'DOCTOR' : 'PATIENT';
-      const subjectId = account.role === AccountRole.DOCTOR ? doctorId : patientId;
-      if (subjectId) {
-        logs.push(
-          await this.runDeletionStep('consents', async () => {
-            const consents = Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "consents"."Consent"
-                WHERE "subjectType" = CAST(${subjectType} AS "consents"."SubjectType")
-                  AND "subjectId" = ${subjectId}
-              `,
-            );
-            const deletionTasks = Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "consents"."DeletionTask"
-                WHERE "deletionRequestId" IN (
-                  SELECT "id" FROM "consents"."DataDeletionRequest"
-                  WHERE "subjectType" = CAST(${subjectType} AS "consents"."SubjectType")
-                    AND "subjectId" = ${subjectId}
-                )
-              `,
-            );
-            const deletionRequests = Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "consents"."DataDeletionRequest"
-                WHERE "subjectType" = CAST(${subjectType} AS "consents"."SubjectType")
-                  AND "subjectId" = ${subjectId}
-              `,
-            );
-            return { consents, deletionTasks, deletionRequests };
-          }),
-        );
-      }
+    for (const consentSubject of [
+      doctorId ? { subjectType: 'DOCTOR' as const, subjectId: doctorId } : null,
+      patientId ? { subjectType: 'PATIENT' as const, subjectId: patientId } : null,
+    ].filter(Boolean) as Array<{ subjectType: 'DOCTOR' | 'PATIENT'; subjectId: string }>) {
+      logs.push(
+        await this.runDeletionStep(`consents:${consentSubject.subjectType.toLowerCase()}`, async () => {
+          const consents = Number(
+            await this.prisma.$executeRaw`
+              DELETE FROM "consents"."Consent"
+              WHERE "subjectType" = CAST(${consentSubject.subjectType} AS "consents"."SubjectType")
+                AND "subjectId" = ${consentSubject.subjectId}
+            `,
+          );
+          const deletionTasks = Number(
+            await this.prisma.$executeRaw`
+              DELETE FROM "consents"."DeletionTask"
+              WHERE "deletionRequestId" IN (
+                SELECT "id" FROM "consents"."DataDeletionRequest"
+                WHERE "subjectType" = CAST(${consentSubject.subjectType} AS "consents"."SubjectType")
+                  AND "subjectId" = ${consentSubject.subjectId}
+              )
+            `,
+          );
+          const deletionRequests = Number(
+            await this.prisma.$executeRaw`
+              DELETE FROM "consents"."DataDeletionRequest"
+              WHERE "subjectType" = CAST(${consentSubject.subjectType} AS "consents"."SubjectType")
+                AND "subjectId" = ${consentSubject.subjectId}
+            `,
+          );
+          return { consents, deletionTasks, deletionRequests };
+        }),
+      );
     }
 
     logs.push(
@@ -3882,32 +3893,47 @@ export class AuthService {
     };
   }
 
-  async adminListAccounts(query: { page?: number; limit?: number; role?: string; q?: string }) {
+  async adminListAccounts(query: { page?: number; limit?: number; role?: string; q?: string; includeInsights?: boolean }) {
     const page = Math.max(1, Number(query.page ?? 1));
     const limit = Math.min(Math.max(Number(query.limit ?? 20), 1), 100);
     const skip = (page - 1) * limit;
     const role = query.role?.toUpperCase()?.trim() || '';
     const q = query.q?.trim() || '';
+    const normalizedRole = Object.values(AccountRole).includes(role as AccountRole)
+      ? role as AccountRole
+      : null;
+    const includePatientRole = normalizedRole === AccountRole.PATIENT;
+    const filters: Prisma.AccountWhereInput[] = [{ deletedAt: null }];
 
-    const where: Prisma.AccountWhereInput = {
-      deletedAt: null,
-    };
-
-    if (role) {
-      if (Object.values(AccountRole).includes(role as AccountRole)) {
-        where.role = role as AccountRole;
+    if (normalizedRole) {
+      if (includePatientRole) {
+        filters.push({
+          OR: [
+            { role: AccountRole.PATIENT },
+            { roleProfiles: { some: { role: AccountRole.PATIENT } } },
+          ],
+        });
+      } else {
+        filters.push({ role: normalizedRole });
       }
     }
 
     if (q) {
-      where.OR = [
-        { email: { contains: q, mode: 'insensitive' } },
-        { phoneNumber: { contains: q } },
-        { id: { equals: q } },
-        { doctorId: { equals: q } },
-        { subjectId: { equals: q } },
-      ];
+      filters.push({
+        OR: [
+          { email: { contains: q, mode: 'insensitive' } },
+          { phoneNumber: { contains: q } },
+          { id: { equals: q } },
+          { doctorId: { equals: q } },
+          { subjectId: { equals: q } },
+          ...(includePatientRole
+            ? [{ roleProfiles: { some: { role: AccountRole.PATIENT, subjectId: { equals: q } } } } as Prisma.AccountWhereInput]
+            : []),
+        ],
+      });
     }
+
+    const where: Prisma.AccountWhereInput = filters.length === 1 ? filters[0] : { AND: filters };
 
     const [items, total] = await this.prisma.$transaction([
       this.prisma.account.findMany({
@@ -3923,20 +3949,133 @@ export class AuthService {
           status: true,
           subjectId: true,
           doctorId: true,
+          onboardingStatus: true,
           createdAt: true,
           updatedAt: true,
           deletedAt: true,
+          ...(includePatientRole
+            ? {
+                roleProfiles: {
+                  where: { role: AccountRole.PATIENT },
+                  select: {
+                    subjectId: true,
+                    onboardingStatus: true,
+                  },
+                },
+              }
+            : {}),
         },
       }),
       this.prisma.account.count({ where }),
     ]);
 
+    const normalizedItems = items.map((item) => {
+      if (!includePatientRole) {
+        return item;
+      }
+      const patientProfile = 'roleProfiles' in item && Array.isArray(item.roleProfiles) ? item.roleProfiles[0] : null;
+      return {
+        ...item,
+        role: AccountRole.PATIENT,
+        subjectId: patientProfile?.subjectId ?? (item.role === AccountRole.PATIENT ? item.subjectId : null),
+        onboardingStatus:
+          patientProfile?.onboardingStatus ?? (item.role === AccountRole.PATIENT ? item.onboardingStatus : null),
+      };
+    });
+
+    const shouldIncludeInsights = Boolean(query.includeInsights);
+    const patientInsights =
+      shouldIncludeInsights && normalizedRole === AccountRole.PATIENT
+        ? await this.fetchAdminPatientKpis(normalizedItems.map((item) => ({
+            accountId: item.id,
+            patientId: item.subjectId,
+          })))
+        : new Map<string, PatientAdminKpis>();
+    const loginInsights =
+      shouldIncludeInsights && normalizedRole === AccountRole.PATIENT
+        ? await this.getLoginInsights(normalizedItems.map((item) => item.id), AccountRole.PATIENT)
+        : new Map<string, AccountLoginInsights>();
+
     return {
-      items,
+      items: normalizedItems.map((item) => ({
+        ...item,
+        ...(patientInsights.has(item.id) ? patientInsights.get(item.id) : {}),
+        ...(loginInsights.has(item.id) ? loginInsights.get(item.id) : {}),
+      })),
       page,
       limit,
       total,
     };
+  }
+
+  private getAnalyticsInternalBaseUrl() {
+    return (
+      this.config.get<string>('ANALYTICS_INTERNAL_BASE_URL') ??
+      this.config.get<string>('ANALYTICS_BASE_URL') ??
+      'http://analytics-service:3015/analyticsms'
+    );
+  }
+
+  private async fetchAdminPatientKpis(patients: Array<{ accountId: string; patientId?: string | null }>) {
+    const cleaned = patients
+      .map((item) => ({
+        accountId: item.accountId.trim(),
+        patientId: item.patientId?.trim() || null,
+      }))
+      .filter((item) => item.accountId)
+      .slice(0, 200);
+    if (!cleaned.length) {
+      return new Map<string, PatientAdminKpis>();
+    }
+
+    try {
+      const response = await fetch(
+        `${this.getAnalyticsInternalBaseUrl().replace(/\/$/, '')}/analytics/admin/reports/patients/kpis`,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-role': 'SYSTEM',
+          },
+          body: JSON.stringify({
+            accountIds: cleaned.map((item) => item.accountId),
+            patients: cleaned,
+          }),
+        },
+      );
+      if (!response.ok) {
+        return new Map<string, PatientAdminKpis>();
+      }
+      const data = (await response.json()) as { items?: PatientAdminKpis[] };
+      return new Map((data.items ?? []).map((item) => [item.accountId, item]));
+    } catch {
+      return new Map<string, PatientAdminKpis>();
+    }
+  }
+
+  private async getLoginInsights(accountIds: string[], role: AccountRole) {
+    const cleaned = accountIds.filter(Boolean).slice(0, 200);
+    if (!cleaned.length) {
+      return new Map<string, AccountLoginInsights>();
+    }
+
+    const rows = await this.prisma.loginHistory.groupBy({
+      by: ['accountId'],
+      where: {
+        accountId: { in: cleaned },
+        role,
+      },
+      _count: { _all: true },
+      _max: { createdAt: true },
+    });
+
+    return new Map(rows.map((row) => [
+      row.accountId,
+      {
+        loginCount: row._count._all,
+        lastLoginAt: row._max.createdAt?.toISOString() ?? null,
+      },
+    ]));
   }
 
   async adminGetAccount(id: string) {
@@ -4048,12 +4187,14 @@ export class AuthService {
   private async publishUserRegisteredEvent(
     account: Account,
     profile?: { firstName?: string; lastName?: string; companyName?: string; taxId?: string },
+    roleOverride?: AccountRole,
   ) {
+    const eventRole = roleOverride ?? account.role;
     if (
-      account.role !== AccountRole.PATIENT &&
-      account.role !== AccountRole.DOCTOR &&
-      account.role !== AccountRole.CLINIC &&
-      account.role !== AccountRole.EMPLOYER
+      eventRole !== AccountRole.PATIENT &&
+      eventRole !== AccountRole.DOCTOR &&
+      eventRole !== AccountRole.CLINIC &&
+      eventRole !== AccountRole.EMPLOYER
     ) {
       return;
     }
@@ -4065,7 +4206,7 @@ export class AuthService {
 
     const payload = {
       authUserId: account.id,
-      role: account.role,
+      role: eventRole,
       doctorId: account.doctorId ?? undefined,
       employerId: account.employerId ?? undefined,
       email: account.email,
@@ -4450,7 +4591,7 @@ export class AuthService {
   }
 
   private async resolveRecoveryName(account: Account) {
-    if (account.role === AccountRole.PATIENT) {
+    if (await this.accountHasRole(account, AccountRole.PATIENT)) {
       return this.resolvePatientName(account.id);
     }
     if (account.role === AccountRole.DOCTOR) {
@@ -4712,6 +4853,9 @@ export class AuthService {
       select: { role: true },
     });
     const roles = new Set<AccountRole>([account.role, ...profiles.map((p) => p.role)]);
+    if (roles.has(AccountRole.MEMBER) && roles.size > 1) {
+      roles.delete(AccountRole.MEMBER);
+    }
     return Array.from(roles);
   }
 
@@ -4753,6 +4897,92 @@ export class AuthService {
     });
   }
 
+  private async getRoleProfile(accountId: string, role: AccountRole) {
+    return this.prisma.accountRoleProfile.findUnique({
+      where: { accountId_role: { accountId, role } },
+    });
+  }
+
+  private async accountHasRole(account: Account, role: AccountRole) {
+    if (account.role === role) {
+      return true;
+    }
+    return Boolean(await this.getRoleProfile(account.id, role));
+  }
+
+  private async provisionPatientAccessForAccount(
+    account: Account,
+    options: { patientId?: string | null; firstName?: string; lastName?: string } = {},
+  ) {
+    let patientId = options.patientId?.trim() || null;
+    if (!patientId) {
+      const profile = await this.getRoleProfile(account.id, AccountRole.PATIENT);
+      patientId = profile?.subjectId?.trim() || null;
+    }
+    if (!patientId && account.role === AccountRole.PATIENT) {
+      patientId = account.subjectId?.trim() || null;
+    }
+    if (!patientId) {
+      const firstName = options.firstName?.trim();
+      const lastName = options.lastName?.trim();
+      patientId =
+        firstName && lastName
+          ? await this.linkOrCreatePatientForAccount(account, firstName, lastName)
+          : await this.resolvePatientIdForSession(account);
+    }
+
+    await this.prisma.accountRoleProfile.upsert({
+      where: {
+        accountId_role: {
+          accountId: account.id,
+          role: AccountRole.PATIENT,
+        },
+      },
+      update: {
+        subjectId: patientId,
+        onboardingStatus: OnboardingStatus.COMPLETE,
+      },
+      create: {
+        accountId: account.id,
+        role: AccountRole.PATIENT,
+        subjectId: patientId,
+        onboardingStatus: OnboardingStatus.COMPLETE,
+      },
+    });
+
+    const productAccess = await this.ensureProductAccess(
+      account.id,
+      ProductCode.PATIENT_PORTAL,
+      'PATIENT' as ProductRole,
+      patientId,
+    );
+
+    return { patientId, productAccess };
+  }
+
+  private resolveSessionRoleForProductAccess(account: Account, productAccess: ProductAccessContext): AccountRole {
+    if (productAccess.product === ProductCode.PATIENT_PORTAL && productAccess.role === ('PATIENT' as ProductRole)) {
+      return AccountRole.PATIENT;
+    }
+    if (productAccess.product === ProductCode.MEUDOC_PRO) {
+      if (productAccess.role === ProductRole.DOCTOR) return AccountRole.DOCTOR;
+      if (productAccess.role === ProductRole.MEDICAL_ENTITY) return AccountRole.CLINIC;
+    }
+    if (productAccess.product === ProductCode.MEUDOC_EMPLOYER) {
+      if (
+        productAccess.role === ProductRole.EMPLOYER_ADMIN ||
+        productAccess.role === ProductRole.EMPLOYER_BILLING
+      ) {
+        return AccountRole.EMPLOYER;
+      }
+    }
+    if (productAccess.product === ProductCode.MEUDOC_ADMIN) {
+      if (productAccess.role === ProductRole.ADMIN) return AccountRole.ADMIN;
+      if (productAccess.role === ProductRole.COMERCIAL) return AccountRole.COMERCIAL;
+    }
+    return account.role;
+  }
+
   private async ensureLegacyProductAccess(account: Account) {
     if (account.role === AccountRole.DOCTOR && account.doctorId) {
       await this.ensureProductAccess(account.id, ProductCode.MEUDOC_PRO, ProductRole.DOCTOR, account.doctorId);
@@ -4782,6 +5012,10 @@ export class AuthService {
   ) {
     if (sessionSubjectId) {
       return sessionSubjectId;
+    }
+    const patientProfile = await this.getRoleProfile(account.id, AccountRole.PATIENT);
+    if (patientProfile?.subjectId) {
+      return patientProfile.subjectId;
     }
     if (account.role === AccountRole.PATIENT && account.subjectId) {
       return account.subjectId;

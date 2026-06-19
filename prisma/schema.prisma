@@ -27,6 +27,7 @@ enum ProductCode {
 }
 
 enum ProductRole {
+  PATIENT
   DOCTOR
   RESEARCHER
   STUDENT
@@ -83,6 +84,11 @@ enum InviteStatus {
   ACCEPTED
   REVOKED
   EXPIRED
+}
+
+enum TrialDurationUnit {
+  DAY
+  MONTH
 }
 
 enum CollaboratorStatus {
@@ -423,6 +429,8 @@ model DoctorOnboardingInvite {
   tokenHash         String       @unique
   status            InviteStatus @default(PENDING)
   preferredPlanCode String?
+  trialDurationValue Int?
+  trialDurationUnit TrialDurationUnit?
   expiresAt         DateTime
   createdAt         DateTime     @default(now())
   updatedAt         DateTime     @updatedAt
@@ -430,6 +438,15 @@ model DoctorOnboardingInvite {
   @@index([email])
   @@index([doctorId, status])
   @@index([createdByUserId])
+}
+
+model DoctorOnboardingSettings {
+  id                      String            @id @default("default")
+  inviteTrialDurationValue Int              @default(1)
+  inviteTrialDurationUnit  TrialDurationUnit @default(MONTH)
+  updatedByUserId         String?
+  createdAt               DateTime          @default(now())
+  updatedAt               DateTime          @updatedAt
 }
 
 model DoctorReferral {

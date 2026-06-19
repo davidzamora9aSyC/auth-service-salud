@@ -147,6 +147,9 @@
       RABBITMQ_QUEUE_IMAGES: doctors.q.images
       RABBITMQ_EXCHANGE_REVIEWS: reviews.events
       RABBITMQ_QUEUE_REVIEWS: doctors.q.reviews
+      SUBSCRIPTIONS_BASE_URL: http://subscriptions-service:3013/subscriptionsms
+      SUBSCRIPTIONS_INTERNAL_API_KEY: ""
+      ANALYTICS_BASE_URL: http://analytics-service:3015/analyticsms
     ports:
       - "3009:3009"
     depends_on:

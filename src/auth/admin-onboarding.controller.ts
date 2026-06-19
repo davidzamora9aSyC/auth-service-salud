@@ -3,10 +3,19 @@ import { AdminOnboardingService } from './admin-onboarding.service';
 import { CreateDoctorOnboardingInviteDto } from './dto/create-doctor-onboarding-invite.dto';
 import { CreatePublicDoctorDto } from './dto/create-public-doctor.dto';
 import { AdminListDoctorOnboardingInvitesDto } from './dto/admin-list-doctor-onboarding-invites.dto';
+import { UpdateDoctorOnboardingSettingsDto } from './dto/update-doctor-onboarding-settings.dto';
 
 const assertStaffRole = (role?: string) => {
   const normalizedRole = role?.toUpperCase();
   if (normalizedRole !== 'ADMIN' && normalizedRole !== 'SYSTEM' && normalizedRole !== 'COMERCIAL') {
+    throw new UnauthorizedException('No autorizado');
+  }
+  return normalizedRole!;
+};
+
+const assertAdminRole = (role?: string) => {
+  const normalizedRole = role?.toUpperCase();
+  if (normalizedRole !== 'ADMIN' && normalizedRole !== 'SYSTEM') {
     throw new UnauthorizedException('No autorizado');
   }
   return normalizedRole!;
@@ -24,6 +33,22 @@ export class AdminOnboardingController {
   ) {
     assertStaffRole(role);
     return this.onboarding.listInvites(query, { role: role!.toUpperCase(), authUserId });
+  }
+
+  @Get('admin/doctor-onboarding/settings')
+  getSettings(@Headers('x-role') role?: string) {
+    assertStaffRole(role);
+    return this.onboarding.getSettings();
+  }
+
+  @Post('admin/doctor-onboarding/settings')
+  updateSettings(
+    @Body() dto: UpdateDoctorOnboardingSettingsDto,
+    @Headers('x-role') role?: string,
+    @Headers('x-auth-user-id') authUserId?: string,
+  ) {
+    assertAdminRole(role);
+    return this.onboarding.updateSettings(dto, authUserId);
   }
 
   @Post('admin/doctor-onboarding/invites')
@@ -70,5 +95,17 @@ export class AdminOnboardingController {
       throw new UnauthorizedException('Token requerido');
     }
     return this.onboarding.getPreferredPlanByDoctor(subjectId);
+  }
+
+  @Get('internal/doctor-onboarding/doctors/:doctorId/prefill-plan')
+  getInternalPreferredPlan(
+    @Param('doctorId') doctorId: string,
+    @Headers('x-api-key') apiKey?: string,
+  ) {
+    const expected = process.env.AUTH_INTERNAL_API_KEY;
+    if (expected && apiKey !== expected) {
+      throw new UnauthorizedException('No autorizado');
+    }
+    return this.onboarding.getPreferredPlanByDoctor(doctorId);
   }
 }

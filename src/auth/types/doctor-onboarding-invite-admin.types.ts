@@ -14,6 +14,8 @@ export type DoctorOnboardingInviteAdminItem = {
   lastName: string | null;
   status: string;
   preferredPlanCode: string | null;
+  trialDurationValue: number | null;
+  trialDurationUnit: 'DAY' | 'MONTH' | null;
   expiresAt: string;
   createdAt: string;
   updatedAt: string;
@@ -26,4 +28,3 @@ export type DoctorOnboardingInviteAdminListResponse = {
   limit: number;
   total: number;
 };
-
