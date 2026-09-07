@@ -1,4 +1,4 @@
-import { IsBoolean, IsInt, IsOptional, IsString, Max, Min } from 'class-validator';
+import { IsBoolean, IsInt, IsISO8601, IsOptional, IsString, Max, Min } from 'class-validator';
 
 export class AdminListAccountsDto {
   @IsOptional()
@@ -23,4 +23,12 @@ export class AdminListAccountsDto {
   @IsOptional()
   @IsBoolean()
   includeInsights?: boolean;
+
+  @IsOptional()
+  @IsISO8601()
+  from?: string;
+
+  @IsOptional()
+  @IsISO8601()
+  to?: string;
 }

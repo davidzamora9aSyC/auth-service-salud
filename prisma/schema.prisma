@@ -51,6 +51,12 @@ enum DoctorReferralStatus {
   DUPLICATE
 }
 
+enum ReferralType {
+  DOCTOR
+  PATIENT
+  COMPANY
+}
+
 enum ProductAccessStatus {
   ACTIVE
   PENDING
@@ -453,21 +459,60 @@ model DoctorReferral {
   id                 String               @id @default(uuid())
   salesRepId         String
   salesRep           Account              @relation("DoctorReferralSalesRep", fields: [salesRepId], references: [id], onDelete: Restrict)
+  referralType       ReferralType         @default(DOCTOR)
   fullName           String
   phoneNumber        String
   email              String?
-  status               DoctorReferralStatus @default(NEW)
-  statusNote           String?
+  companyName        String?
+  taxId              String?
+  status             DoctorReferralStatus @default(NEW)
+  statusNote         String?
   subscriptionPlanCode String?
-  doctorId             String?              @unique
-  onboardingInviteId   String?
+  doctorId           String?              @unique
+  patientId          String?
+  employerId         String?
+  onboardingInviteId String?
   createdAt          DateTime             @default(now())
   updatedAt          DateTime             @updatedAt
 
+  registrationInvite ReferralRegistrationInvite?
+
+  @@index([salesRepId, referralType, status])
   @@index([salesRepId, status])
   @@index([phoneNumber])
+  @@index([email])
   @@index([fullName])
   @@index([createdAt])
+}
+
+model ReferralRegistrationInvite {
+  id                 String       @id @default(uuid())
+  referralId         String?      @unique
+  type               ReferralType
+  email              String
+  phoneNumber        String
+  firstName          String
+  lastName           String
+  companyName        String?
+  taxId              String?
+  tokenHash          String       @unique
+  status             InviteStatus @default(PENDING)
+  expiresAt          DateTime
+  createdByUserId    String?
+  acceptedAuthUserId String?
+  acceptedSubjectId  String?
+  lastSentAt         DateTime?
+  lastSentChannel    String?
+  sentCount          Int          @default(0)
+  createdAt          DateTime     @default(now())
+  updatedAt          DateTime     @updatedAt
+
+  referral           DoctorReferral? @relation(fields: [referralId], references: [id], onDelete: Cascade)
+
+  @@index([type, status])
+  @@index([email])
+  @@index([phoneNumber])
+  @@index([createdByUserId])
 }
 
 model RefreshToken {
@@ -485,17 +530,20 @@ model RefreshToken {
 }
 
 model TwoFactorChallenge {
-  id          String                   @id
-  account     Account                  @relation(fields: [accountId], references: [id], onDelete: Cascade)
-  accountId   String
-  sessionRole AccountRole?
-  method      TwoFactorMethod
-  purpose     TwoFactorChallengePurpose @default(LOGIN)
-  codeHash    String?
-  destination String?
-  expiresAt   DateTime
-  resolved    Boolean                  @default(false)
-  createdAt   DateTime                 @default(now())
+  id                String                   @id
+  account           Account                  @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  accountId         String
+  sessionRole       AccountRole?
+  activeProduct     ProductCode?
+  activeProductRole ProductRole?
+  productSubjectId  String?
+  method            TwoFactorMethod
+  purpose           TwoFactorChallengePurpose @default(LOGIN)
+  codeHash          String?
+  destination       String?
+  expiresAt         DateTime
+  resolved          Boolean                  @default(false)
+  createdAt         DateTime                 @default(now())
 }
 
 model PasswordRecovery {
@@ -539,6 +587,10 @@ model OAuthAuthorizationCode {
   clientId            String
   account             Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
   accountId           String
+  sessionRole         AccountRole?
+  activeProduct       ProductCode?
+  activeProductRole   ProductRole?
+  productSubjectId    String?
   redirectUri         String
   scope               String
   codeChallenge       String

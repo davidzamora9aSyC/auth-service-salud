@@ -19,6 +19,16 @@ type FinalizeFounderParams = {
   authUserId: string;
 };
 
+type DisableAccountAccessParams = {
+  authUserId: string;
+  employerId?: string;
+};
+
+type GetAccountDeletionImpactParams = {
+  authUserId: string;
+  employerId?: string;
+};
+
 @Injectable()
 export class EmployersHttpClient {
   private readonly logger = new Logger(EmployersHttpClient.name);
@@ -42,6 +52,73 @@ export class EmployersHttpClient {
 
   async rollbackFounder(employerId: string): Promise<{ ok: boolean }> {
     return this.postJson('/employers/internal/founder/rollback', { employerId });
+  }
+
+  async disableAccountAccess(
+    params: DisableAccountAccessParams,
+  ): Promise<{
+    ok: boolean;
+    foundersDisabled: number;
+    membersDisabled: number;
+    affiliatesDisabled: number;
+    archivedEmployers: number;
+  }> {
+    return this.postJson('/employers/internal/account-access/disable', params);
+  }
+
+  async getAccountDeletionImpact(
+    params: GetAccountDeletionImpactParams,
+  ): Promise<{
+    items: Array<{
+      employerId: string;
+      displayName: string;
+      taxId: string | null;
+      isFounder: boolean;
+      activeAdminCount: number;
+      activeAffiliateCount: number;
+      wouldArchiveCompany: boolean;
+    }>;
+  }> {
+    return this.postJson('/employers/internal/account-access/impact', params);
+  }
+
+  async listAdminCompanies(params: {
+    page?: number;
+    limit?: number;
+    q?: string;
+  }): Promise<{
+    items: Array<{
+      id: string;
+      displayName: string;
+      taxId: string | null;
+      email: string | null;
+      phoneNumber: string | null;
+      founderAuthUserId: string | null;
+      onboardingStep: string;
+      createdAt: string;
+      updatedAt: string;
+      activeAdminCount: number;
+      activeAffiliateCount: number;
+      archived: boolean;
+    }>;
+    page: number;
+    limit: number;
+    total: number;
+  }> {
+    return this.postJson('/employers/internal/admin/companies/search', params);
+  }
+
+  async archiveCompany(employerId: string): Promise<{
+    ok: boolean;
+    employerId: string;
+    foundersDisabled: number;
+    membersDisabled: number;
+    affiliatesDisabled: number;
+    invitesRevoked: number;
+    employeeInvitesRevoked: number;
+    affectedAuthUserIds: string[];
+  }> {
+    return this.postJson('/employers/internal/admin/companies/archive', { employerId });
   }
 
   private async postJson<T>(path: string, body: unknown): Promise<T> {

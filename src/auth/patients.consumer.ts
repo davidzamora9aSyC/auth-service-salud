@@ -1,9 +1,6 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Channel, Connection, ConsumeMessage, connect } from 'amqplib';
-import { PrismaService } from '../prisma/prisma.service';
-import { NotificationsService } from '../notifications/notifications.service';
-import { AccountRole, OnboardingStatus } from '@prisma/client';
 import { AccountLinkCleanupService } from './account-link-cleanup.service';
 
 const queueAssertOptions = (queue: string) => ({
@@ -38,8 +35,8 @@ const assertQueueForConsume = async (
 };
 
 @Injectable()
-export class DoctorsConsumer implements OnModuleInit, OnModuleDestroy {
-  private readonly logger = new Logger(DoctorsConsumer.name);
+export class PatientsConsumer implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(PatientsConsumer.name);
   private connection: Connection | null = null;
   private channel: Channel | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -48,8 +45,6 @@ export class DoctorsConsumer implements OnModuleInit, OnModuleDestroy {
 
   constructor(
     private readonly config: ConfigService,
-    private readonly prisma: PrismaService,
-    private readonly notifications: NotificationsService,
     private readonly accountLinkCleanup: AccountLinkCleanupService,
   ) {}
 
@@ -60,16 +55,12 @@ export class DoctorsConsumer implements OnModuleInit, OnModuleDestroy {
   private async connectWithRetry() {
     const url = this.config.get<string>('RABBITMQ_URL');
     if (!url) {
-      this.logger.warn('RABBITMQ_URL no configurado, consumer deshabilitado');
+      this.logger.warn('RABBITMQ_URL no configurado, consumer de pacientes deshabilitado');
       return;
     }
 
-    const queue =
-      this.config.get<string>('RABBITMQ_QUEUE_AUTH_DOCTORS') ??
-      'auth.q.doctors';
-    const exchange =
-      this.config.get<string>('RABBITMQ_EXCHANGE_DOCTORS') ??
-      'doctors.events';
+    const queue = 'auth.q.patients';
+    const exchange = 'patients.events';
 
     try {
       this.connection = await connect(url);
@@ -97,10 +88,7 @@ export class DoctorsConsumer implements OnModuleInit, OnModuleDestroy {
       });
       await this.channel.assertExchange(exchange, 'topic', { durable: true });
       await assertQueueForConsume(this.connection, this.channel, queue);
-      await this.channel.bindQueue(queue, exchange, 'doctors.profile_completed');
-      await this.channel.bindQueue(queue, exchange, 'doctors.onboarding_completed');
-      await this.channel.bindQueue(queue, exchange, 'doctors.phone_updated');
-      await this.channel.bindQueue(queue, exchange, 'doctors.deleted');
+      await this.channel.bindQueue(queue, exchange, 'patients.deleted');
       await this.channel.prefetch(5);
       await this.channel.consume(queue, (msg) => this.handleMessage(msg), {
         noAck: false,
@@ -114,7 +102,6 @@ export class DoctorsConsumer implements OnModuleInit, OnModuleDestroy {
       );
       this.scheduleReconnect();
     }
-  
   }
 
   private scheduleReconnect() {
@@ -148,114 +135,27 @@ export class DoctorsConsumer implements OnModuleInit, OnModuleDestroy {
         data?: Record<string, unknown>;
       };
 
-      if (
-        payload.type !== 'DoctorProfileCompleted' &&
-        payload.type !== 'DoctorOnboardingCompleted' &&
-        payload.type !== 'DoctorPhoneUpdated' &&
-        payload.type !== 'DoctorDeleted'
-      ) {
+      if (payload.type !== 'PatientDeleted') {
         this.channel.ack(msg);
         return;
       }
 
-      const authUserId = String(payload.data?.authUserId ?? '');
-      const doctorId = String(payload.data?.doctorId ?? '');
-      if (payload.type === 'DoctorDeleted') {
-        if (!doctorId.trim()) {
-          this.channel.ack(msg);
-          return;
-        }
-        await this.accountLinkCleanup.cleanupDeletedDoctor(doctorId);
-        this.channel.ack(msg);
-        return;
-      }
-      if (payload.type === 'DoctorPhoneUpdated') {
-        const phoneNumber = String(payload.data?.phoneNumber ?? '').trim();
-        if (!authUserId || !phoneNumber) {
-          this.channel.ack(msg);
-          return;
-        }
-        const updated = await this.prisma.account.updateMany({
-          where: {
-            id: authUserId,
-            role: AccountRole.DOCTOR,
-          },
-          data: {
-            phoneNumber,
-          },
-        });
-        if (updated.count === 0) {
-          this.logger.warn(`No se actualizo telefono para ${authUserId}`);
-        }
+      const patientId = String(payload.data?.patientId ?? '').trim();
+      const authUserId = String(payload.data?.authUserId ?? '').trim();
+      if (!patientId && !authUserId) {
         this.channel.ack(msg);
         return;
       }
 
-      if (!authUserId || !doctorId) {
-        this.channel.ack(msg);
-        return;
-      }
-
-      const updated = await this.prisma.account.updateMany({
-        where: {
-          id: authUserId,
-          role: AccountRole.DOCTOR,
-          doctorId,
-        },
-        data: { onboardingStatus: OnboardingStatus.COMPLETE },
+      await this.accountLinkCleanup.cleanupDeletedPatient({
+        patientId: patientId || null,
+        authUserId: authUserId || null,
       });
-
-      if (updated.count === 0) {
-        this.logger.warn(`No se actualizo onboarding para ${authUserId}`);
-      }
-
-      const account = await this.prisma.account.findFirst({
-        where: {
-          id: authUserId,
-          role: AccountRole.DOCTOR,
-        },
-        select: {
-          email: true,
-        },
-      });
-
-      const destinationEmail = account?.email?.trim().toLowerCase();
-      if (destinationEmail) {
-        try {
-          const name =
-            (await this.fetchDoctorNameByAuthUserId(authUserId)) ?? 'Especialista';
-          await this.notifications.sendDoctorOnboardingWelcomeEmail({
-            email: destinationEmail,
-            name,
-          });
-        } catch (error) {
-          this.logger.warn(
-            `No se pudo enviar bienvenida por correo a ${destinationEmail}: ${error instanceof Error ? error.message : error}`,
-          );
-        }
-      }
 
       this.channel.ack(msg);
     } catch (error) {
-      this.logger.error('Error procesando evento', error as Error);
+      this.logger.error('Error procesando evento de pacientes', error as Error);
       this.channel.ack(msg);
-    }
-  }
-
-  private async fetchDoctorNameByAuthUserId(authUserId: string) {
-    const base =
-      this.config.get<string>('DOCTORS_INTERNAL_BASE_URL') ??
-      'http://doctors-service:3009/doctorsms';
-    try {
-      const response = await fetch(
-        `${base.replace(/\/$/, '')}/doctors/me?authUserId=${encodeURIComponent(authUserId)}`,
-        { headers: { 'x-role': 'SYSTEM' } },
-      );
-      if (!response.ok) return null;
-      const data = (await response.json()) as { fullName?: string | null };
-      return data.fullName?.trim() || null;
-    } catch {
-      return null;
     }
   }
 }

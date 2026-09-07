@@ -8,6 +8,7 @@ import { RegisterCollaboratorDto } from './dto/register-collaborator.dto';
 import { CreateEmployerInviteAccountDto } from './dto/create-employer-invite-account.dto';
 import { CreatePatientInviteAccountDto } from './dto/create-patient-invite-account.dto';
 import { EmailExistsDto } from './dto/email-exists.dto';
+import { AccountContactExistsDto } from './dto/account-contact-exists.dto';
 import { LinkPatientAffiliateInviteDto } from './dto/link-patient-affiliate-invite.dto';
 import { GrantEmployerAccessDto } from './dto/grant-employer-access.dto';
 import { VerifyTwoFactorDto } from './dto/verify-two-factor.dto';
@@ -311,6 +312,15 @@ export class AuthController {
   ) {
     this.assertInternalServiceToken(internalToken);
     return this.authService.accountExistsByEmail(dto.email);
+  }
+
+  @Post('internal/accounts/contact-exists')
+  accountContactExists(
+    @Body() dto: AccountContactExistsDto,
+    @Headers('x-internal-service-token') internalToken?: string,
+  ) {
+    this.assertInternalServiceToken(internalToken);
+    return this.authService.accountExistsByContact(dto);
   }
 
   @Post('internal/patient/link-affiliate-invite')

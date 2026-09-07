@@ -10,6 +10,7 @@ import {
   AccountRole,
   DoctorReferralStatus,
   Prisma,
+  ReferralType,
 } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateDoctorReferralDto } from './dto/create-doctor-referral.dto';
@@ -73,17 +74,29 @@ export class DoctorReferralsService {
     const fullName = dto.fullName.trim();
     const phoneNumber = this.normalizePhoneNumber(dto.phoneNumber);
     const email = dto.email?.trim().toLowerCase() || null;
+    const referralType = dto.referralType ?? ReferralType.DOCTOR;
+    const companyName = dto.companyName?.trim() || null;
+    const taxId = dto.taxId?.trim() || null;
     const status = dto.status ?? DoctorReferralStatus.NEW;
     const statusNote = dto.statusNote?.trim() || null;
+
+    this.assertReferralShape({
+      referralType,
+      companyName,
+      taxId,
+    });
 
     await this.assertNoDuplicateReferral(phoneNumber, email);
 
     const referral = await this.prisma.doctorReferral.create({
       data: {
         salesRepId: actor.authUserId,
+        referralType,
         fullName,
         phoneNumber,
         email,
+        companyName,
+        taxId,
         status,
         statusNote,
       },
@@ -245,13 +258,20 @@ export class DoctorReferralsService {
     if (query.status) {
       where.status = query.status;
     }
+    if (query.referralType) {
+      where.referralType = query.referralType;
+    }
     if (q) {
       where.OR = [
         { fullName: { contains: q, mode: 'insensitive' } },
         { phoneNumber: { contains: q } },
         { email: { contains: q, mode: 'insensitive' } },
+        { companyName: { contains: q, mode: 'insensitive' } },
+        { taxId: { contains: q, mode: 'insensitive' } },
         { id: { equals: q } },
         { doctorId: { equals: q } },
+        { patientId: { equals: q } },
+        { employerId: { equals: q } },
       ];
     }
 
@@ -276,10 +296,29 @@ export class DoctorReferralsService {
 
   private async applyReferralUpdate(referralId: string, dto: UpdateDoctorReferralDto) {
     const existing = await this.findReferralOrThrow(referralId);
+    const nextReferralType = dto.referralType ?? existing.referralType;
+    const nextCompanyName =
+      dto.companyName === null ? null : dto.companyName !== undefined ? dto.companyName.trim() : existing.companyName;
+    const nextTaxId =
+      dto.taxId === null ? null : dto.taxId !== undefined ? dto.taxId.trim() : existing.taxId;
 
     const nextPhone = dto.phoneNumber ? this.normalizePhoneNumber(dto.phoneNumber) : undefined;
     const nextEmail =
       dto.email === null ? null : dto.email !== undefined ? dto.email.trim().toLowerCase() : undefined;
+
+    this.assertReferralShape({
+      referralType: nextReferralType,
+      companyName: nextCompanyName,
+      taxId: nextTaxId,
+    });
+
+    if (
+      dto.referralType &&
+      dto.referralType !== existing.referralType &&
+      (existing.doctorId || existing.patientId || existing.employerId || existing.onboardingInviteId || existing.registrationInvite)
+    ) {
+      throw new BadRequestException('No puedes cambiar el tipo de un referido que ya tiene cuenta o invitacion asociada');
+    }
 
     if (nextPhone && nextPhone !== existing.phoneNumber) {
       await this.assertNoDuplicateReferral(nextPhone, nextEmail ?? existing.email, referralId);
@@ -304,9 +343,12 @@ export class DoctorReferralsService {
     const updated = await this.prisma.doctorReferral.update({
       where: { id: referralId },
       data: {
+        referralType: dto.referralType,
         fullName: dto.fullName?.trim() || undefined,
         phoneNumber: nextPhone,
         email: nextEmail,
+        companyName: dto.companyName === null ? null : dto.companyName?.trim() || undefined,
+        taxId: dto.taxId === null ? null : dto.taxId?.trim() || undefined,
         status: dto.status,
         statusNote: dto.statusNote === null ? null : dto.statusNote?.trim() || undefined,
         salesRepId: dto.salesRepId,
@@ -399,6 +441,11 @@ export class DoctorReferralsService {
           email: true,
         },
       },
+      registrationInvite: {
+        select: {
+          id: true,
+        },
+      },
     } satisfies Prisma.DoctorReferralInclude;
   }
 
@@ -409,17 +456,36 @@ export class DoctorReferralsService {
       id: referral.id,
       salesRepId: referral.salesRepId,
       salesRepEmail: referral.salesRep.email,
+      referralType: referral.referralType,
       fullName: referral.fullName,
       phoneNumber: referral.phoneNumber,
       email: referral.email,
+      companyName: referral.companyName,
+      taxId: referral.taxId,
       status: referral.status,
       statusNote: referral.statusNote,
       subscriptionPlanCode: referral.subscriptionPlanCode,
       doctorId: referral.doctorId,
+      patientId: referral.patientId,
+      employerId: referral.employerId,
       onboardingInviteId: referral.onboardingInviteId,
+      registrationInviteId: referral.registrationInvite?.id ?? null,
       createdAt: referral.createdAt.toISOString(),
       updatedAt: referral.updatedAt.toISOString(),
     };
+  }
+
+  private assertReferralShape(input: {
+    referralType: ReferralType;
+    companyName: string | null;
+    taxId: string | null;
+  }) {
+    if (input.referralType !== ReferralType.COMPANY) {
+      return;
+    }
+    if (!input.companyName || !input.taxId) {
+      throw new BadRequestException('Los referidos de empresa requieren nombre de empresa y NIT');
+    }
   }
 
   private async fetchAppointmentCount(doctorId: string) {

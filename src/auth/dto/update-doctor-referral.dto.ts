@@ -1,7 +1,11 @@
-import { IsEmail, IsEnum, IsOptional, IsString, Matches, MaxLength } from 'class-validator';
-import { DoctorReferralStatus } from '@prisma/client';
+import { IsEmail, IsEnum, IsOptional, IsString, Matches, MaxLength, MinLength, ValidateIf } from 'class-validator';
+import { DoctorReferralStatus, ReferralType } from '@prisma/client';
 
 export class UpdateDoctorReferralDto {
+  @IsOptional()
+  @IsEnum(ReferralType)
+  referralType?: ReferralType;
+
   @IsOptional()
   @IsString()
   @MaxLength(160)
@@ -17,6 +21,18 @@ export class UpdateDoctorReferralDto {
   @IsOptional()
   @IsEmail()
   email?: string | null;
+
+  @ValidateIf((o: UpdateDoctorReferralDto) => o.referralType === ReferralType.COMPANY || o.companyName !== undefined)
+  @IsString()
+  @MinLength(2)
+  @MaxLength(160)
+  companyName?: string | null;
+
+  @ValidateIf((o: UpdateDoctorReferralDto) => o.referralType === ReferralType.COMPANY || o.taxId !== undefined)
+  @IsString()
+  @MinLength(5)
+  @MaxLength(80)
+  taxId?: string | null;
 
   @IsOptional()
   @IsEnum(DoctorReferralStatus)

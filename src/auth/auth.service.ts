@@ -9,6 +9,8 @@ import {
 } from '@nestjs/common';
 import {
   Account,
+  AccountProductAccess,
+  AccountRoleProfile,
   AccountDeletionAuditStatus,
   AccountDeletionChannel,
   AccountVerificationChannel,
@@ -22,6 +24,7 @@ import {
   ProductAccessStatus,
   ProductCode,
   ProductRole,
+  ReferralType,
   TwoFactorChallengePurpose,
   TwoFactorMethod,
 } from '@prisma/client';
@@ -64,6 +67,8 @@ import { LinkPatientAffiliateInviteDto } from './dto/link-patient-affiliate-invi
 import { GrantEmployerAccessDto } from './dto/grant-employer-access.dto';
 import { RegisterMeuredDto } from './dto/register-meured.dto';
 import { SelectProductAccessDto } from './dto/select-product-access.dto';
+import { RegistrationPrefillService } from './registration-prefill.service';
+import { ReferralRegistrationInvitesService } from './referral-registration-invites.service';
 
 type PatientAdminKpis = {
   accountId: string;
@@ -80,10 +85,21 @@ type AccountLoginInsights = {
   lastLoginAt: string | null;
 };
 
+type EmployerAdminSummary = {
+  employerId: string;
+  displayName: string | null;
+  totalCareRequests: number;
+  approvedCareRequests: number;
+  appointmentCount: number;
+  hasFirstPatientAppointment: boolean;
+};
+
 type RequestMeta = {
   ip?: string;
   forwardedFor?: string;
   userAgent?: string;
+  requesterId?: string | null;
+  requesterRole?: string | null;
 };
 
 type DeletionOperationLog = {
@@ -93,12 +109,43 @@ type DeletionOperationLog = {
   error?: string;
 };
 
+type AccountDeletionGrant = {
+  product: ProductCode;
+  role: ProductRole;
+  subjectId: string | null;
+  source: 'product-access' | 'role-profile' | 'legacy-account';
+};
+
 type ProductAccessContext = {
   id: string;
   product: ProductCode;
   role: ProductRole;
   subjectId?: string | null;
   status: ProductAccessStatus;
+};
+
+type ResolvedPatientPortalSession = {
+  patientId: string;
+  productAccess: ProductAccessContext;
+};
+
+type AuthRegistrationSessionContext = {
+  patientId?: string | null;
+  productAccess?: ProductAccessContext | null;
+};
+
+type SessionProductAccessInput = {
+  sessionRole?: AccountRole;
+  productAccess?: ProductAccessContext | null;
+  activeProduct?: ProductCode | null;
+  activeProductRole?: ProductRole | null;
+  productSubjectId?: string | null;
+};
+
+type LoginProductIntent = {
+  accountRole: AccountRole;
+  product: ProductCode;
+  productRoles: ProductRole[];
 };
 
 @Injectable()
@@ -145,6 +192,8 @@ export class AuthService {
     private readonly rabbitmq: RabbitmqService,
     private readonly adminOnboarding: AdminOnboardingService,
     private readonly employersHttp: EmployersHttpClient,
+    private readonly registrationPrefill: RegistrationPrefillService,
+    private readonly referralRegistrationInvites: ReferralRegistrationInvitesService,
   ) {
     const inlinePrivateKey = this.config.get<string>('JWT_PRIVATE_KEY');
     if (inlinePrivateKey?.trim()) {
@@ -267,6 +316,7 @@ export class AuthService {
       throw new BadRequestException('Use el flujo de registro de MeuRed');
     }
       const inviteToken = dto.inviteToken?.trim();
+      const referralInviteToken = dto.referralInviteToken?.trim();
       if (inviteToken && dto.role === AccountRole.EMPLOYER) {
         throw new BadRequestException(
           'Para unirte a una empresa existente usa el enlace de invitacion del portal empresa',
@@ -274,6 +324,9 @@ export class AuthService {
       }
       if (inviteToken && dto.role !== AccountRole.DOCTOR) {
         throw new BadRequestException('inviteToken solo aplica para registro de medicos');
+      }
+      if (referralInviteToken && dto.role !== AccountRole.PATIENT && dto.role !== AccountRole.EMPLOYER) {
+        throw new BadRequestException('referralInviteToken solo aplica para registro de pacientes o empresas');
       }
       const normalizedEmail = dto.email.trim().toLowerCase();
       const normalizedPhone = this.normalizePhoneNumber(dto.phoneNumber);
@@ -287,6 +340,17 @@ export class AuthService {
           }
         }
       }
+      const referralInvite =
+        referralInviteToken && (dto.role === AccountRole.PATIENT || dto.role === AccountRole.EMPLOYER)
+          ? await this.referralRegistrationInvites.resolveInviteForRegister({
+              token: referralInviteToken,
+              role: dto.role === AccountRole.PATIENT ? ReferralType.PATIENT : ReferralType.COMPANY,
+              email: normalizedEmail,
+              phoneNumber: normalizedPhone,
+              companyName: dto.companyName,
+              taxId: dto.taxId,
+            })
+          : null;
       const isAdminInvite = Boolean(invite);
     const firstName = dto.firstName?.trim() || undefined;
     const lastName = dto.lastName?.trim() || undefined;
@@ -299,7 +363,17 @@ export class AuthService {
       if (!passwordOk) {
         throw new ConflictException('El email ya esta registrado');
       }
-      return this.addRoleToAccount(existing, dto, firstName, lastName, inviteToken, invite?.doctorId, isAdminInvite);
+      return this.addRoleToAccount(
+        existing,
+        dto,
+        firstName,
+        lastName,
+        inviteToken,
+        invite?.doctorId,
+        isAdminInvite,
+        referralInviteToken,
+        referralInvite?.type ?? null,
+      );
     }
     const existingPhone = await this.prisma.account.findUnique({
       where: { phoneNumber: normalizedPhone },
@@ -409,14 +483,39 @@ export class AuthService {
         throw error;
       }
     }
-      await this.publishUserRegisteredEvent(account, {
-        firstName,
-        lastName,
-        companyName: dto.companyName,
-        taxId: dto.taxId,
-      }, dto.role);
+      await this.publishUserRegisteredEvent(
+        account,
+        {
+          firstName,
+          lastName,
+          companyName: dto.companyName,
+          taxId: dto.taxId,
+        },
+        dto.role,
+        dto.role === AccountRole.PATIENT && sessionProductAccess
+          ? {
+              patientId: sessionProductAccess.subjectId,
+              productAccess: sessionProductAccess,
+            }
+          : undefined,
+      );
       if (inviteToken && invite) {
         await this.adminOnboarding.markInviteAccepted(inviteToken, account.id);
+      }
+      if (referralInviteToken && referralInvite) {
+        const acceptedSubjectId =
+          dto.role === AccountRole.PATIENT
+            ? sessionProductAccess?.subjectId
+            : dto.role === AccountRole.EMPLOYER
+              ? employerId
+              : null;
+        if (acceptedSubjectId) {
+          await this.referralRegistrationInvites.markInviteAccepted(
+            referralInviteToken,
+            account.id,
+            acceptedSubjectId,
+          );
+        }
       }
     await this.ensureLegacyProductAccess(account);
     await this.recordIdentityReuse(account, normalizedEmail, normalizedPhone);
@@ -513,9 +612,16 @@ export class AuthService {
     if (account.twoFactorEnabled) {
       return this.buildTwoFactorRequiredResponse(account, {
         sessionRole: account.role,
+        productAccess,
         availableProductAccess,
       });
     }
+
+    await this.registrationPrefill.ensureMeuredProfile(account.id, {
+      firstName: dto.firstName,
+      lastName: dto.lastName,
+      productRole: dto.role,
+    });
 
     const tokens = await this.issueTokens(account, {
       sessionRole: account.role,
@@ -536,6 +642,8 @@ export class AuthService {
     inviteToken?: string,
     inviteDoctorId?: string | null,
     isAdminInvite?: boolean,
+    referralInviteToken?: string,
+    referralInviteType?: ReferralType | null,
   ) {
     if (account.status !== AccountStatus.ACTIVE) {
       throw new UnauthorizedException('Account disabled');
@@ -649,6 +757,13 @@ export class AuthService {
           companyName: dto.companyName,
           taxId: dto.taxId,
         }, dto.role);
+        if (referralInviteToken && referralInviteType === ReferralType.COMPANY) {
+          await this.referralRegistrationInvites.markInviteAccepted(
+            referralInviteToken,
+            account.id,
+            employerId,
+          );
+        }
       } catch (error) {
         await this.employersHttp.rollbackFounder(employerId).catch(() => undefined);
         throw error;
@@ -660,11 +775,30 @@ export class AuthService {
     const updatedAccount = await this.prisma.account.findUniqueOrThrow({
       where: { id: account.id },
     });
+    // Los perfiles de doctor se materializan en doctors-service a partir de este
+    // evento. Sin publicarlo, una cuenta existente que agrega el rol DOCTOR
+    // recibe un JWT válido, pero su doctorId no existe en ese servicio.
+    if (dto.role === AccountRole.DOCTOR) {
+      await this.publishUserRegisteredEvent(updatedAccount, { firstName, lastName }, dto.role);
+    }
+    if (
+      dto.role === AccountRole.PATIENT &&
+      referralInviteToken &&
+      referralInviteType === ReferralType.PATIENT &&
+      sessionProductAccess?.subjectId
+    ) {
+      await this.referralRegistrationInvites.markInviteAccepted(
+        referralInviteToken,
+        updatedAccount.id,
+        sessionProductAccess.subjectId,
+      );
+    }
     const availableRoles = await this.getAvailableRoles(updatedAccount);
     const availableProductAccess = await this.getAvailableProductAccess(updatedAccount.id);
     if (updatedAccount.twoFactorEnabled) {
       return this.buildTwoFactorRequiredResponse(updatedAccount, {
         sessionRole: dto.role,
+        productAccess: sessionProductAccess ?? undefined,
         availableRoles,
         availableProductAccess,
       });
@@ -691,7 +825,10 @@ export class AuthService {
     if (account.status !== AccountStatus.ACTIVE) {
       throw new UnauthorizedException('Account disabled');
     }
-    const sessionRole = await this.resolveSessionRole(account, dto.role);
+    const productLoginContext = dto.role
+      ? await this.resolveProductLoginContext(account, dto.role)
+      : null;
+    const sessionRole = productLoginContext?.sessionRole ?? await this.resolveSessionRole(account, dto.role);
     if (sessionRole === AccountRole.DOCTOR && !account.doctorId) {
       throw new BadRequestException('No hay perfil de doctor para esta cuenta');
     }
@@ -703,14 +840,20 @@ export class AuthService {
         throw new BadRequestException('No hay perfil de empresa para esta cuenta');
       }
     }
+    const sessionProductAccess = productLoginContext?.productAccess ?? null;
     const availableRoles = await this.getAvailableRoles(account);
     if (account.twoFactorEnabled) {
       return this.buildTwoFactorRequiredResponse(account, {
         sessionRole,
+        productAccess: sessionProductAccess ?? undefined,
         availableRoles,
+        availableProductAccess: await this.getAvailableProductAccess(account.id),
       });
     }
-    const tokens = await this.issueTokens(account, { sessionRole });
+    const tokens = await this.issueTokens(account, {
+      sessionRole,
+      productAccess: sessionProductAccess ?? undefined,
+    });
     await this.recordLoginHistory(account, sessionRole, LoginEventSource.PASSWORD, meta);
     const availableProductAccess = await this.getAvailableProductAccess(account.id);
     return {
@@ -766,9 +909,11 @@ export class AuthService {
         ...(dto.accessId ? { id: dto.accessId } : {}),
       },
     });
-    if (!productAccess || productAccess.status === ProductAccessStatus.DISABLED) {
+    if (!productAccess || productAccess.status !== ProductAccessStatus.ACTIVE) {
       throw new BadRequestException('Acceso de producto no disponible');
     }
+
+    await this.assertProductAccessProfile(stored.account, productAccess);
 
     await this.prisma.refreshToken.delete({ where: { tokenHash } });
     const sessionRole = this.resolveSessionRoleForProductAccess(stored.account, productAccess);
@@ -1108,6 +1253,30 @@ export class AuthService {
     return { exists: Boolean(existing && existing.status === AccountStatus.ACTIVE) };
   }
 
+  async accountExistsByContact(input: { email?: string; phoneNumber?: string }) {
+    const normalizedEmail = input.email?.trim().toLowerCase() || null;
+    const normalizedPhone = input.phoneNumber
+      ? this.normalizePhoneNumber(input.phoneNumber)
+      : null;
+
+    if (!normalizedEmail && !normalizedPhone) {
+      throw new BadRequestException('Email or phoneNumber is required');
+    }
+
+    const existing = await this.prisma.account.findFirst({
+      where: {
+        status: AccountStatus.ACTIVE,
+        OR: [
+          normalizedEmail ? { email: normalizedEmail } : undefined,
+          normalizedPhone ? { phoneNumber: normalizedPhone } : undefined,
+        ].filter(Boolean) as Prisma.AccountWhereInput[],
+      },
+      select: { id: true },
+    });
+
+    return { exists: Boolean(existing) };
+  }
+
   /**
    * Vincula perfil paciente a una cuenta ya existente (invitación empleado afiliado validada en employers-service).
    * No pide contraseña: la posesión del token de invitación + email de la invitación es la autorización.
@@ -1425,7 +1594,16 @@ export class AuthService {
       data: { resolved: true },
     });
     const sessionRole = challenge.sessionRole ?? challenge.account.role;
-    const tokens = await this.issueTokens(challenge.account, { sessionRole });
+    const productAccess = await this.resolveSessionProductAccess(challenge.account, {
+      sessionRole,
+      activeProduct: challenge.activeProduct,
+      activeProductRole: challenge.activeProductRole,
+      productSubjectId: challenge.productSubjectId,
+    });
+    const tokens = await this.issueTokens(challenge.account, {
+      sessionRole,
+      productAccess: productAccess ?? undefined,
+    });
     await this.recordLoginHistory(
       challenge.account,
       sessionRole,
@@ -1439,24 +1617,20 @@ export class AuthService {
   }
 
   async refresh(refreshToken: string) {
-    const { account, sessionRole, sessionSubjectId, activeProduct, activeProductRole, productSubjectId } =
-      await this.findRefreshToken(refreshToken);
+    const stored = await this.findRefreshToken(refreshToken);
     await this.revokeRefreshToken(refreshToken);
-    const tokens = await this.issueTokens(account, {
-      sessionRole: sessionRole ?? account.role,
-      sessionSubjectId: sessionSubjectId ?? undefined,
-      productAccess:
-        activeProduct && activeProductRole
-          ? {
-              id: '',
-              product: activeProduct,
-              role: activeProductRole,
-              subjectId: productSubjectId,
-              status: ProductAccessStatus.ACTIVE,
-          }
-          : undefined,
+    const productAccess = await this.resolveSessionProductAccess(stored.account, {
+      sessionRole: stored.sessionRole ?? stored.account.role,
+      activeProduct: stored.activeProduct,
+      activeProductRole: stored.activeProductRole,
+      productSubjectId: stored.productSubjectId,
     });
-    const availableProductAccess = await this.getAvailableProductAccess(account.id);
+    const tokens = await this.issueTokens(stored.account, {
+      sessionRole: stored.sessionRole ?? stored.account.role,
+      sessionSubjectId: stored.sessionSubjectId ?? undefined,
+      productAccess: productAccess ?? undefined,
+    });
+    const availableProductAccess = await this.getAvailableProductAccess(stored.account.id);
     return { ...tokens, availableProductAccess };
   }
 
@@ -2040,7 +2214,11 @@ export class AuthService {
     const result = await this.executeAccountDeletion(
       challenge.account,
       challenge.channel,
-      meta,
+      {
+        ...meta,
+        requesterId: authUserId,
+        requesterRole: challenge.account.role,
+      },
     );
 
     if (challenge.account.role === AccountRole.DOCTOR) {
@@ -2079,7 +2257,13 @@ export class AuthService {
     }
     const payload = verify(token, this.publicKey, {
       algorithms: ['RS256'],
-    }) as { sub?: string };
+    }) as {
+      sub?: string;
+      role?: string;
+      activeProduct?: string;
+      activeProductRole?: string;
+      productSubjectId?: string;
+    };
     if (!payload?.sub) {
       throw new UnauthorizedException('Invalid access token');
     }
@@ -2113,6 +2297,11 @@ export class AuthService {
         codeHash,
         clientId: client.clientId,
         accountId: account.id,
+        sessionRole: this.parseAccountRole(payload.role),
+        activeProduct: this.parseProductCode(payload.activeProduct),
+        activeProductRole: this.parseProductRole(payload.activeProductRole),
+        productSubjectId:
+          typeof payload.productSubjectId === 'string' ? payload.productSubjectId : null,
         redirectUri: dto.redirect_uri,
         scope,
         codeChallenge: dto.code_challenge,
@@ -2236,6 +2425,7 @@ export class AuthService {
       }
       let account = existing;
       let sessionProductAccess: ProductAccessContext | null = null;
+      let shouldPublishRegistrationEvent = false;
       if (!account) {
         const salt = randomBytes(24).toString('hex');
         const passwordHash = await argon2.hash(randomBytes(32).toString('hex') + salt, {
@@ -2263,9 +2453,7 @@ export class AuthService {
             onboardingStatus,
           },
         });
-        await this.publishUserRegisteredEvent(account, {
-          companyName: profile.name?.trim() || normalizedEmail.split('@')[0],
-        }, entry.role);
+        shouldPublishRegistrationEvent = entry.role !== AccountRole.PATIENT;
       }
       if (entry.role === AccountRole.PATIENT) {
         const googleProfile = profile as { given_name?: string; family_name?: string };
@@ -2274,6 +2462,29 @@ export class AuthService {
           lastName: googleProfile.family_name?.trim(),
         });
         sessionProductAccess = patientAccess.productAccess;
+        if (!existing) {
+          await this.publishUserRegisteredEvent(
+            account,
+            {
+              firstName: googleProfile.given_name?.trim(),
+              lastName: googleProfile.family_name?.trim(),
+              companyName: profile.name?.trim() || normalizedEmail.split('@')[0],
+            },
+            entry.role,
+            {
+              patientId: patientAccess.patientId,
+              productAccess: patientAccess.productAccess,
+            },
+          );
+        }
+      } else if (shouldPublishRegistrationEvent) {
+        await this.publishUserRegisteredEvent(
+          account,
+          {
+            companyName: profile.name?.trim() || normalizedEmail.split('@')[0],
+          },
+          entry.role,
+        );
       }
 
       const sessionRole =
@@ -2383,6 +2594,7 @@ export class AuthService {
     }
     let account = existing;
     let sessionProductAccess: ProductAccessContext | null = null;
+    let shouldPublishRegistrationEvent = false;
     if (!account) {
       const salt = randomBytes(24).toString('hex');
       const passwordHash = await argon2.hash(randomBytes(32).toString('hex') + salt, {
@@ -2410,13 +2622,32 @@ export class AuthService {
           onboardingStatus,
         },
       });
-      await this.publishUserRegisteredEvent(account, {
-        companyName: normalizedEmail.split('@')[0],
-      }, entry.role);
+      shouldPublishRegistrationEvent = entry.role !== AccountRole.PATIENT;
     }
     if (entry.role === AccountRole.PATIENT) {
       const patientAccess = await this.provisionPatientAccessForAccount(account);
       sessionProductAccess = patientAccess.productAccess;
+      if (!existing) {
+        await this.publishUserRegisteredEvent(
+          account,
+          {
+            companyName: normalizedEmail.split('@')[0],
+          },
+          entry.role,
+          {
+            patientId: patientAccess.patientId,
+            productAccess: patientAccess.productAccess,
+          },
+        );
+      }
+    } else if (shouldPublishRegistrationEvent) {
+      await this.publishUserRegisteredEvent(
+        account,
+        {
+          companyName: normalizedEmail.split('@')[0],
+        },
+        entry.role,
+      );
     }
 
     const sessionRole =
@@ -2650,37 +2881,23 @@ export class AuthService {
     let clinicSessionOnboardingStatus: OnboardingStatus = account.onboardingStatus;
     let employerSessionEmployerId: string | null = null;
     let employerSessionOnboardingStatus: OnboardingStatus = account.onboardingStatus;
-    let accountForSession = account;
+    let emittedRole = sessionRole;
+    let effectiveProductAccess = options?.productAccess ?? null;
     const payload: Record<string, unknown> = {
       sub: account.id,
-      role: sessionRole,
+      role: emittedRole,
     };
-    if (sessionRole === AccountRole.PATIENT) {
-      if (account.role === AccountRole.PATIENT) {
-        accountForSession = await this.ensurePatientSubjectId(account);
-        sessionSubjectId = accountForSession.subjectId ?? null;
-      } else {
-        // Buscar en role profiles si existe un perfil de paciente
-        const patientProfile = await this.prisma.accountRoleProfile.findUnique({
-          where: { accountId_role: { accountId: account.id, role: AccountRole.PATIENT } },
-        });
-        if (patientProfile?.subjectId) {
-          sessionSubjectId = patientProfile.subjectId;
-        } else {
-          sessionSubjectId = await this.resolvePatientIdForSession(account, sessionSubjectId);
-          // Persistir el patientId en el profile para futuras sesiones
-          if (sessionSubjectId && patientProfile) {
-            await this.prisma.accountRoleProfile.update({
-              where: { accountId_role: { accountId: account.id, role: AccountRole.PATIENT } },
-              data: { subjectId: sessionSubjectId },
-            });
-          }
-        }
-      }
-      if (sessionSubjectId) {
-        payload.patientId = sessionSubjectId;
-        payload.subjectId = sessionSubjectId;
-      }
+    if (
+      sessionRole === AccountRole.PATIENT ||
+      this.isPatientPortalProductAccess(effectiveProductAccess)
+    ) {
+      const patientSession = await this.resolvePatientPortalSession(account, effectiveProductAccess);
+      emittedRole = AccountRole.MEMBER;
+      effectiveProductAccess = patientSession.productAccess;
+      sessionSubjectId = patientSession.patientId;
+      payload.role = emittedRole;
+      payload.patientId = patientSession.patientId;
+      payload.subjectId = patientSession.patientId;
       payload.onboardingRequired = false;
     } else if (sessionRole === AccountRole.DOCTOR) {
       const doctorId =
@@ -2765,16 +2982,16 @@ export class AuthService {
     if (options?.scope) {
       payload.scope = options.scope;
     }
-    if (options?.productAccess) {
-      payload.activeProduct = options.productAccess.product;
-      payload.activeProductRole = options.productAccess.role;
-      if (options.productAccess.id) {
-        payload.productAccessId = options.productAccess.id;
+    if (effectiveProductAccess) {
+      payload.activeProduct = effectiveProductAccess.product;
+      payload.activeProductRole = effectiveProductAccess.role;
+      if (effectiveProductAccess.id) {
+        payload.productAccessId = effectiveProductAccess.id;
       }
-      if (options.productAccess.subjectId) {
-        payload.productSubjectId = options.productAccess.subjectId;
+      if (effectiveProductAccess.subjectId) {
+        payload.productSubjectId = effectiveProductAccess.subjectId;
       }
-      payload.productAccessStatus = options.productAccess.status;
+      payload.productAccessStatus = effectiveProductAccess.status;
     }
     const signOptions: SignOptions = {
       algorithm: 'RS256',
@@ -2785,14 +3002,17 @@ export class AuthService {
     const refreshToken = randomBytes(48).toString('hex');
     const refreshTokenHash = this.hashToken(refreshToken);
     const refreshExpiresAt = new Date(Date.now() + this.refreshTtl * 1000);
+    const persistedSessionRole = this.isPatientPortalProductAccess(effectiveProductAccess)
+      ? AccountRole.MEMBER
+      : sessionRole;
     await this.prisma.refreshToken.create({
       data: {
         accountId: account.id,
-        sessionRole,
+        sessionRole: persistedSessionRole,
         sessionSubjectId: sessionSubjectId ?? undefined,
-        activeProduct: options?.productAccess?.product,
-        activeProductRole: options?.productAccess?.role,
-        productSubjectId: options?.productAccess?.subjectId ?? undefined,
+        activeProduct: effectiveProductAccess?.product,
+        activeProductRole: effectiveProductAccess?.role,
+        productSubjectId: effectiveProductAccess?.subjectId ?? undefined,
         tokenHash: refreshTokenHash,
         expiresAt: refreshExpiresAt,
       },
@@ -2806,9 +3026,9 @@ export class AuthService {
         id: account.id,
         email: account.email,
         phoneNumber: account.phoneNumber,
-        role: sessionRole,
+        role: emittedRole,
         subjectId:
-          sessionRole === AccountRole.PATIENT
+          sessionRole === AccountRole.PATIENT || this.isPatientPortalProductAccess(effectiveProductAccess)
             ? sessionSubjectId
             : sessionRole === AccountRole.CLINIC
               ? clinicSessionSubjectId
@@ -2829,9 +3049,9 @@ export class AuthService {
             : sessionRole === AccountRole.EMPLOYER
               ? employerSessionOnboardingStatus
               : account.onboardingStatus,
-        activeProduct: options?.productAccess?.product ?? null,
-        activeProductRole: options?.productAccess?.role ?? null,
-        productSubjectId: options?.productAccess?.subjectId ?? null,
+        activeProduct: effectiveProductAccess?.product ?? null,
+        activeProductRole: effectiveProductAccess?.role ?? null,
+        productSubjectId: effectiveProductAccess?.subjectId ?? null,
       },
     };
   }
@@ -2883,7 +3103,16 @@ export class AuthService {
       data: { consumedAt: new Date() },
     });
 
-    const tokens = await this.issueTokens(stored.account, { scope: stored.scope });
+    const tokens = await this.issueTokens(stored.account, {
+      scope: stored.scope,
+      sessionRole: stored.sessionRole ?? undefined,
+      productAccess: await this.resolveSessionProductAccess(stored.account, {
+        sessionRole: stored.sessionRole ?? stored.account.role,
+        activeProduct: stored.activeProduct,
+        activeProductRole: stored.activeProductRole,
+        productSubjectId: stored.productSubjectId,
+      }),
+    });
     return {
       accessToken: tokens.accessToken,
       refreshToken: tokens.refreshToken,
@@ -3184,11 +3413,96 @@ export class AuthService {
     channel: AccountDeletionChannel,
     meta?: RequestMeta,
   ) {
+    const accountSnapshot = await this.prisma.account.findUnique({
+      where: { id: account.id },
+      include: {
+        roleProfiles: true,
+        productAccesses: true,
+      },
+    });
+    if (!accountSnapshot) {
+      throw new NotFoundException('Cuenta no encontrada');
+    }
+
     const logs: DeletionOperationLog[] = [];
-    const doctorId = account.doctorId ?? (account.role === AccountRole.DOCTOR ? account.subjectId ?? null : null);
-    const patientId = await this.findPatientIdByAuthUserId(account.id);
+    const grants = this.buildAccountDeletionGrants(
+      accountSnapshot,
+      accountSnapshot.roleProfiles,
+      accountSnapshot.productAccesses,
+    );
+    const doctorId = this.resolveDoctorIdForAccountDeletion(
+      accountSnapshot,
+      accountSnapshot.roleProfiles,
+      accountSnapshot.productAccesses,
+    );
+    const patientId = await this.resolvePatientIdForAccountDeletion(
+      accountSnapshot,
+      accountSnapshot.roleProfiles,
+      accountSnapshot.productAccesses,
+    );
+    const clinicId = this.resolveClinicIdForAccountDeletion(
+      accountSnapshot,
+      accountSnapshot.roleProfiles,
+      accountSnapshot.productAccesses,
+    );
+    const employerId = this.resolveEmployerIdForAccountDeletion(
+      accountSnapshot,
+      accountSnapshot.roleProfiles,
+      accountSnapshot.productAccesses,
+    );
+    await this.assertEmployerDeletionAllowed(accountSnapshot.id, employerId, meta);
     const deletedAt = new Date();
-    const identitySnapshot = await this.buildIdentitySnapshot(account, doctorId, patientId);
+    const identitySnapshot = await this.buildIdentitySnapshot(accountSnapshot, doctorId, patientId);
+
+    if (grants.some((grant) => grant.product === ProductCode.PATIENT_PORTAL && grant.role === ProductRole.PATIENT)) {
+      logs.push(
+        await this.runDeletionStep('product:patient_portal', async () => {
+          if (!patientId) {
+            return { skipped: 1 };
+          }
+          return this.deactivatePatientProductAccess(patientId);
+        }),
+      );
+    }
+
+    if (grants.some((grant) => grant.product === ProductCode.MEUDOC_PRO && grant.role === ProductRole.DOCTOR)) {
+      logs.push(
+        await this.runDeletionStep('product:meudoc_pro:doctor', async () => {
+          if (!doctorId) {
+            return { skipped: 1 };
+          }
+          return this.deactivateDoctorProductAccess(doctorId);
+        }),
+      );
+    }
+
+    if (grants.some((grant) => grant.product === ProductCode.MEUDOC_PRO && grant.role === ProductRole.MEDICAL_ENTITY)) {
+      logs.push(
+        await this.runDeletionStep('product:meudoc_pro:medical_entity', async () => {
+          return this.revokeClinicAccountAccess(accountSnapshot.id, clinicId);
+        }),
+      );
+    }
+
+    if (
+      grants.some((grant) => grant.product === ProductCode.MEUDOC_EMPLOYER)
+      || grants.some((grant) => grant.product === ProductCode.PATIENT_PORTAL && grant.role === ProductRole.PATIENT)
+      || Boolean(employerId)
+    ) {
+      logs.push(
+        await this.runDeletionStep('product:meudoc_employer', async () => {
+          return this.deactivateEmployerProductAccess(accountSnapshot.id, employerId);
+        }),
+      );
+    }
+
+    if (grants.some((grant) => grant.product === ProductCode.MEURED)) {
+      logs.push(
+        await this.runDeletionStep('product:meured', async () => {
+          return this.deactivateMeuredProductAccess(accountSnapshot.id);
+        }),
+      );
+    }
 
     logs.push(
       await this.runDeletionStep('auth', async () => {
@@ -3232,6 +3546,12 @@ export class AuthService {
         const clinicAdmins = Number(
           await this.prisma.$executeRaw`DELETE FROM "ClinicAdmin" WHERE "accountId" = ${account.id}`,
         );
+        const roleProfiles = await this.prisma.accountRoleProfile.deleteMany({
+          where: { accountId: account.id },
+        });
+        const productAccesses = await this.prisma.accountProductAccess.deleteMany({
+          where: { accountId: account.id },
+        });
         const deletedEmail = `deleted+${account.id}+${randomUUID()}@meusalud.local`;
         const accountUpdated = Number(
           await this.prisma.$executeRaw`
@@ -3245,6 +3565,9 @@ export class AuthService {
               "twoFactorEnabled" = FALSE,
               "twoFactorSecret" = NULL,
               "pendingTwoFactorSecret" = NULL,
+              "subjectId" = NULL,
+              "doctorId" = NULL,
+              "employerId" = NULL,
               "deletedAt" = ${deletedAt},
               "updatedAt" = ${deletedAt}
             WHERE "id" = ${account.id}
@@ -3259,598 +3582,10 @@ export class AuthService {
           collaboratorPermissions,
           collaborators,
           clinicAdmins,
+          roleProfiles: roleProfiles.count,
+          productAccesses: productAccesses.count,
           accountUpdated,
         };
-      }),
-    );
-
-    if (patientId) {
-      logs.push(
-        await this.runDeletionStep('users', async () => {
-          const owners = Number(
-            await this.prisma.$executeRaw`DELETE FROM "users"."PatientOwner" WHERE "patientId" = ${patientId}`,
-          );
-          const blocks = Number(
-            await this.prisma.$executeRaw`DELETE FROM "users"."PatientDoctorBlock" WHERE "patientId" = ${patientId}`,
-          );
-          const doctorNotes = Number(
-            await this.prisma.$executeRaw`DELETE FROM "users"."PatientDoctorNote" WHERE "patientId" = ${patientId}`,
-          );
-          const insurers = Number(
-            await this.prisma.$executeRaw`DELETE FROM "users"."PatientInsurer" WHERE "patientId" = ${patientId}`,
-          );
-          const contacts = Number(
-            await this.prisma.$executeRaw`DELETE FROM "users"."PatientContact" WHERE "patientId" = ${patientId}`,
-          );
-          const addresses = Number(
-            await this.prisma.$executeRaw`DELETE FROM "users"."PatientAddress" WHERE "patientId" = ${patientId}`,
-          );
-          const preference = Number(
-            await this.prisma.$executeRaw`DELETE FROM "users"."PatientPreference" WHERE "patientId" = ${patientId}`,
-          );
-          const patientUpdated = Number(
-            await this.prisma.$executeRaw`
-              UPDATE "users"."Patient"
-              SET
-                "ownerPatientId" = NULL,
-                "gender" = NULL,
-                "birthDate" = NULL,
-                "documentType" = NULL,
-                "documentNumber" = NULL,
-                "patientType" = CAST('NONE' AS "users"."PatientType"),
-                "insuranceName" = NULL,
-                "insuranceCard" = NULL,
-                "dataController" = NULL,
-                "birthCity" = NULL,
-                "birthProvince" = NULL,
-                "nationalityCountryId" = NULL,
-                "religion" = NULL,
-                "maritalStatusId" = NULL,
-                "educationId" = NULL,
-                "notes" = NULL,
-                "allergies" = NULL,
-                "medication" = NULL,
-                "medicalHistory" = NULL,
-                "otherInfo" = NULL,
-                "profileImageId" = NULL,
-                "isDependent" = FALSE,
-                "updatedAt" = ${deletedAt}
-              WHERE "id" = ${patientId}
-            `,
-          );
-          return {
-            owners,
-            blocks,
-            doctorNotes,
-            insurers,
-            contacts,
-            addresses,
-            preference,
-            patientUpdated,
-          };
-        }),
-      );
-    }
-
-    if (doctorId) {
-      logs.push(
-        await this.runDeletionStep('users-doctor-links', async () => {
-          const owners = Number(
-            await this.prisma.$executeRaw`DELETE FROM "users"."PatientOwner" WHERE "doctorId" = ${doctorId}`,
-          );
-          const blocks = Number(
-            await this.prisma.$executeRaw`DELETE FROM "users"."PatientDoctorBlock" WHERE "doctorId" = ${doctorId}`,
-          );
-          const doctorNotes = Number(
-            await this.prisma.$executeRaw`DELETE FROM "users"."PatientDoctorNote" WHERE "doctorId" = ${doctorId}`,
-          );
-          return { owners, blocks, doctorNotes };
-        }),
-      );
-
-      logs.push(
-        await this.runDeletionStep('doctors', async () => {
-          const specialties = Number(
-            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorSpecialty" WHERE "doctorId" = ${doctorId}`,
-          );
-          const diseases = Number(
-            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorDisease" WHERE "doctorId" = ${doctorId}`,
-          );
-          const locationPaymentMethods = Number(
-            await this.prisma.$executeRaw`
-              DELETE FROM "doctors"."DoctorLocationPaymentMethod"
-              WHERE "locationId" IN (
-                SELECT "id" FROM "doctors"."DoctorLocation" WHERE "doctorId" = ${doctorId}
-              )
-            `,
-          );
-          const locationNews = Number(
-            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorLocationNews" WHERE "doctorId" = ${doctorId}`,
-          );
-          const locations = Number(
-            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorLocation" WHERE "doctorId" = ${doctorId}`,
-          );
-          const preference = Number(
-            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorPreference" WHERE "doctorId" = ${doctorId}`,
-          );
-          const media = Number(
-            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorMedia" WHERE "doctorId" = ${doctorId}`,
-          );
-          const experienceItems = Number(
-            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorExperienceItem" WHERE "doctorId" = ${doctorId}`,
-          );
-          const languages = Number(
-            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorLanguage" WHERE "doctorId" = ${doctorId}`,
-          );
-          const certificates = Number(
-            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorCertificate" WHERE "doctorId" = ${doctorId}`,
-          );
-          const socialLinks = Number(
-            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorSocialLinks" WHERE "doctorId" = ${doctorId}`,
-          );
-          const bookingInfo = Number(
-            await this.prisma.$executeRaw`DELETE FROM "doctors"."DoctorBookingInfo" WHERE "doctorId" = ${doctorId}`,
-          );
-          const doctorUpdated = Number(
-            await this.prisma.$executeRaw`
-              UPDATE "doctors"."Doctor"
-              SET
-                "email" = NULL,
-                "phoneNumber" = NULL,
-                "documentNumber" = NULL,
-                "legalDocumentType" = NULL,
-                "licenseNumbers" = CAST('{}' AS TEXT[]),
-                "birthCity" = NULL,
-                "birthProvince" = NULL,
-                "nationality" = NULL,
-                "bio" = NULL,
-                "profileImageId" = NULL,
-                "gender" = NULL,
-                "rethusVerified" = FALSE,
-                "status" = CAST('INACTIVE' AS "doctors"."DoctorStatus"),
-                "reviewsCount" = 0,
-                "reviewsAverage" = 0,
-                "updatedAt" = ${deletedAt}
-              WHERE "id" = ${doctorId}
-            `,
-          );
-          return {
-            specialties,
-            diseases,
-            locationPaymentMethods,
-            locationNews,
-            locations,
-            preference,
-            media,
-            experienceItems,
-            languages,
-            certificates,
-            socialLinks,
-            bookingInfo,
-            doctorUpdated,
-          };
-        }),
-      );
-
-      logs.push(
-        await this.runDeletionStep('services', async () => {
-          const preferences = Number(
-            await this.prisma.$executeRaw`DELETE FROM "services"."ServiceColumnsPreference" WHERE "doctorId" = ${doctorId}`,
-          );
-          const services = Number(
-            await this.prisma.$executeRaw`DELETE FROM "services"."Service" WHERE "doctorId" = ${doctorId}`,
-          );
-          return { preferences, services };
-        }),
-      );
-
-      logs.push(
-        await this.runDeletionStep('availability', async () => {
-          const timeOff = Number(
-            await this.prisma.$executeRaw`DELETE FROM "availability"."TimeOff" WHERE "doctorId" = ${doctorId}`,
-          );
-          const holidayOverrides = Number(
-            await this.prisma.$executeRaw`DELETE FROM "availability"."HolidayOverride" WHERE "doctorId" = ${doctorId}`,
-          );
-          const rules = Number(
-            await this.prisma.$executeRaw`DELETE FROM "availability"."WorkingHoursRule" WHERE "doctorId" = ${doctorId}`,
-          );
-          const policies = Number(
-            await this.prisma.$executeRaw`DELETE FROM "availability"."BookingPolicy" WHERE "doctorId" = ${doctorId}`,
-          );
-          const agendas = Number(
-            await this.prisma.$executeRaw`DELETE FROM "availability"."Agenda" WHERE "doctorId" = ${doctorId}`,
-          );
-          return { timeOff, holidayOverrides, rules, policies, agendas };
-        }),
-      );
-
-      logs.push(
-        await this.runDeletionStep('payments', async () => {
-          const payments = Number(
-            await this.prisma.$executeRaw`DELETE FROM "payments"."Payment" WHERE "doctorId" = ${doctorId}`,
-          );
-          return { payments };
-        }),
-      );
-
-      logs.push(
-        await this.runDeletionStep('subscriptions', async () => {
-          const subscriptions = Number(
-            await this.prisma.$executeRaw`DELETE FROM "subscriptions"."Subscription" WHERE "doctorId" = ${doctorId}`,
-          );
-          return { subscriptions };
-        }),
-      );
-
-      logs.push(
-        await this.runDeletionStep('templates', async () => {
-          const templates = Number(
-            await this.prisma.$executeRaw`DELETE FROM "templates"."Template" WHERE "doctorId" = ${doctorId}`,
-          );
-          return { templates };
-        }),
-      );
-    }
-
-    logs.push(
-      await this.runDeletionStep('appointments', async () => {
-        const episodeDocuments = doctorId
-          ? Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "appointments"."EpisodeDocument"
-                WHERE ${patientId ? Prisma.sql`"patientId" = ${patientId} OR ` : Prisma.empty}
-                  "doctorId" = ${doctorId}
-              `,
-            )
-          : patientId
-            ? Number(
-                await this.prisma.$executeRaw`DELETE FROM "appointments"."EpisodeDocument" WHERE "patientId" = ${patientId}`,
-              )
-            : 0;
-        const episodeAttachments = doctorId
-          ? Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "appointments"."EpisodeAttachment"
-                WHERE ${patientId ? Prisma.sql`"patientId" = ${patientId} OR ` : Prisma.empty}
-                  "doctorId" = ${doctorId}
-              `,
-            )
-          : patientId
-            ? Number(
-                await this.prisma.$executeRaw`DELETE FROM "appointments"."EpisodeAttachment" WHERE "patientId" = ${patientId}`,
-              )
-            : 0;
-        const episodes = doctorId
-          ? Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "appointments"."Episode"
-                WHERE ${patientId ? Prisma.sql`"patientId" = ${patientId} OR ` : Prisma.empty}
-                  "doctorId" = ${doctorId}
-              `,
-            )
-          : patientId
-            ? Number(
-                await this.prisma.$executeRaw`DELETE FROM "appointments"."Episode" WHERE "patientId" = ${patientId}`,
-              )
-            : 0;
-        const patientAttachments = doctorId
-          ? Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "appointments"."PatientAttachment"
-                WHERE ${patientId ? Prisma.sql`"patientId" = ${patientId} OR ` : Prisma.empty}
-                  "doctorId" = ${doctorId}
-              `,
-            )
-          : patientId
-            ? Number(
-                await this.prisma.$executeRaw`DELETE FROM "appointments"."PatientAttachment" WHERE "patientId" = ${patientId}`,
-              )
-            : 0;
-        const appointments = doctorId
-          ? Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "appointments"."Appointment"
-                WHERE ${patientId ? Prisma.sql`"patientId" = ${patientId} OR ` : Prisma.empty}
-                  "doctorId" = ${doctorId}
-              `,
-            )
-          : patientId
-            ? Number(
-                await this.prisma.$executeRaw`DELETE FROM "appointments"."Appointment" WHERE "patientId" = ${patientId}`,
-              )
-            : 0;
-        const series = doctorId
-          ? Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "appointments"."AppointmentSeries"
-                WHERE ${patientId ? Prisma.sql`"patientId" = ${patientId} OR ` : Prisma.empty}
-                  "doctorId" = ${doctorId}
-              `,
-            )
-          : patientId
-            ? Number(
-                await this.prisma.$executeRaw`DELETE FROM "appointments"."AppointmentSeries" WHERE "patientId" = ${patientId}`,
-              )
-            : 0;
-        return {
-          episodeDocuments,
-          episodeAttachments,
-          episodes,
-          patientAttachments,
-          appointments,
-          series,
-        };
-      }),
-    );
-
-    logs.push(
-      await this.runDeletionStep('analytics', async () => {
-        const dimOwnership = doctorId || patientId
-          ? Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "analytics"."DimDoctorPatientOwnership"
-                WHERE ${doctorId ? Prisma.sql`"doctorId" = ${doctorId}` : Prisma.sql`FALSE`}
-                  ${patientId ? Prisma.sql` OR "patientId" = ${patientId}` : Prisma.empty}
-              `,
-            )
-          : 0;
-        const factAppointments = doctorId || patientId
-          ? Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "analytics"."FactAppointment"
-                WHERE ${doctorId ? Prisma.sql`"doctorId" = ${doctorId}` : Prisma.sql`FALSE`}
-                  ${patientId ? Prisma.sql` OR "patientId" = ${patientId}` : Prisma.empty}
-              `,
-            )
-          : 0;
-        const factPayments = doctorId || patientId
-          ? Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "analytics"."FactPaymentTransaction"
-                WHERE ${doctorId ? Prisma.sql`"doctorId" = ${doctorId}` : Prisma.sql`FALSE`}
-                  ${patientId ? Prisma.sql` OR "patientId" = ${patientId}` : Prisma.empty}
-              `,
-            )
-          : 0;
-        const factReviews = doctorId || patientId
-          ? Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "analytics"."FactReview"
-                WHERE ${doctorId ? Prisma.sql`"doctorId" = ${doctorId}` : Prisma.sql`FALSE`}
-                  ${patientId ? Prisma.sql` OR "patientId" = ${patientId}` : Prisma.empty}
-              `,
-            )
-          : 0;
-        const feedback = doctorId || patientId
-          ? Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "analytics"."FactBookingFeedback"
-                WHERE ${doctorId ? Prisma.sql`"doctorId" = ${doctorId}` : Prisma.sql`FALSE`}
-                  ${patientId ? Prisma.sql` OR "patientId" = ${patientId}` : Prisma.empty}
-              `,
-            )
-          : 0;
-        const dimServices = doctorId
-          ? Number(
-              await this.prisma.$executeRaw`DELETE FROM "analytics"."DimService" WHERE "doctorId" = ${doctorId}`,
-            )
-          : 0;
-        const presence = doctorId
-          ? Number(
-              await this.prisma.$executeRaw`DELETE FROM "analytics"."AggDoctorPresenceDaily" WHERE "doctorId" = ${doctorId}`,
-            )
-          : 0;
-        const series = doctorId
-          ? Number(
-              await this.prisma.$executeRaw`DELETE FROM "analytics"."AggSeries" WHERE "doctorId" = ${doctorId}`,
-            )
-          : 0;
-        const messageMetrics = doctorId
-          ? Number(
-              await this.prisma.$executeRaw`DELETE FROM "analytics"."DoctorMessageMetric" WHERE "doctorId" = ${doctorId}`,
-            )
-          : 0;
-        const conversationStatus = doctorId || patientId
-          ? Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "analytics"."ConversationMessageStatus"
-                WHERE ${doctorId ? Prisma.sql`"doctorId" = ${doctorId}` : Prisma.sql`FALSE`}
-                  ${patientId ? Prisma.sql` OR "patientId" = ${patientId}` : Prisma.empty}
-              `,
-            )
-          : 0;
-        const dimDoctor = doctorId
-          ? Number(
-              await this.prisma.$executeRaw`DELETE FROM "analytics"."DimDoctor" WHERE "doctorId" = ${doctorId}`,
-            )
-          : 0;
-        return {
-          dimOwnership,
-          factAppointments,
-          factPayments,
-          factReviews,
-          feedback,
-          dimServices,
-          presence,
-          series,
-          messageMetrics,
-          conversationStatus,
-          dimDoctor,
-        };
-      }),
-    );
-
-    logs.push(
-      await this.runDeletionStep('reminders', async () => {
-        const reminders = doctorId || patientId
-          ? Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "reminders"."Reminder"
-                WHERE ${doctorId ? Prisma.sql`"doctorId" = ${doctorId}` : Prisma.sql`FALSE`}
-                  ${patientId ? Prisma.sql` OR "patientId" = ${patientId}` : Prisma.empty}
-              `,
-            )
-          : 0;
-        return { reminders };
-      }),
-    );
-
-    logs.push(
-      await this.runDeletionStep('messages', async () => {
-        const blocks = doctorId || patientId
-          ? Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "messages"."MessageBlock"
-                WHERE ${doctorId ? Prisma.sql`"doctorId" = ${doctorId}` : Prisma.sql`FALSE`}
-                  ${patientId ? Prisma.sql` OR "patientId" = ${patientId}` : Prisma.empty}
-              `,
-            )
-          : 0;
-        const conversations = doctorId || patientId
-          ? Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "messages"."Conversation"
-                WHERE ${doctorId ? Prisma.sql`"doctorId" = ${doctorId}` : Prisma.sql`FALSE`}
-                  ${patientId ? Prisma.sql` OR "patientId" = ${patientId}` : Prisma.empty}
-              `,
-            )
-          : 0;
-        return { blocks, conversations };
-      }),
-    );
-
-    logs.push(
-      await this.runDeletionStep('reviews', async () => {
-        const reviews = doctorId || patientId
-          ? Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "reviews"."Review"
-                WHERE ${doctorId ? Prisma.sql`"doctorId" = ${doctorId}` : Prisma.sql`FALSE`}
-                  ${patientId ? Prisma.sql` OR "patientId" = ${patientId}` : Prisma.empty}
-              `,
-            )
-          : 0;
-        return { reviews };
-      }),
-    );
-
-    logs.push(
-      await this.runDeletionStep('clinics', async () => {
-        const memberships = doctorId
-          ? Number(
-              await this.prisma.$executeRaw`DELETE FROM "ClinicDoctorMembership" WHERE "doctorId" = ${doctorId}`,
-            )
-          : 0;
-        const invites = doctorId
-          ? Number(
-              await this.prisma.$executeRaw`DELETE FROM "ClinicDoctorInvite" WHERE "doctorId" = ${doctorId}`,
-            )
-          : 0;
-        const agendaAssignments = doctorId
-          ? Number(
-              await this.prisma.$executeRaw`DELETE FROM "ClinicAgendaAssignment" WHERE "doctorId" = ${doctorId}`,
-            )
-          : 0;
-        const agendaSlots = doctorId
-          ? Number(
-              await this.prisma.$executeRaw`
-                UPDATE "ClinicLocationAgendaSlot"
-                SET "assignedDoctorId" = NULL, "assignedAgendaId" = NULL, "status" = CAST('OPEN' AS "ClinicAgendaSlotStatus")
-                WHERE "assignedDoctorId" = ${doctorId}
-              `,
-            )
-          : 0;
-        return { memberships, invites, agendaAssignments, agendaSlots };
-      }),
-    );
-
-    for (const consentSubject of [
-      doctorId ? { subjectType: 'DOCTOR' as const, subjectId: doctorId } : null,
-      patientId ? { subjectType: 'PATIENT' as const, subjectId: patientId } : null,
-    ].filter(Boolean) as Array<{ subjectType: 'DOCTOR' | 'PATIENT'; subjectId: string }>) {
-      logs.push(
-        await this.runDeletionStep(`consents:${consentSubject.subjectType.toLowerCase()}`, async () => {
-          const consents = Number(
-            await this.prisma.$executeRaw`
-              DELETE FROM "consents"."Consent"
-              WHERE "subjectType" = CAST(${consentSubject.subjectType} AS "consents"."SubjectType")
-                AND "subjectId" = ${consentSubject.subjectId}
-            `,
-          );
-          const deletionTasks = Number(
-            await this.prisma.$executeRaw`
-              DELETE FROM "consents"."DeletionTask"
-              WHERE "deletionRequestId" IN (
-                SELECT "id" FROM "consents"."DataDeletionRequest"
-                WHERE "subjectType" = CAST(${consentSubject.subjectType} AS "consents"."SubjectType")
-                  AND "subjectId" = ${consentSubject.subjectId}
-              )
-            `,
-          );
-          const deletionRequests = Number(
-            await this.prisma.$executeRaw`
-              DELETE FROM "consents"."DataDeletionRequest"
-              WHERE "subjectType" = CAST(${consentSubject.subjectType} AS "consents"."SubjectType")
-                AND "subjectId" = ${consentSubject.subjectId}
-            `,
-          );
-          return { consents, deletionTasks, deletionRequests };
-        }),
-      );
-    }
-
-    logs.push(
-      await this.runDeletionStep('images', async () => {
-        const doctorImages = doctorId
-          ? Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "images"."ImageAsset"
-                WHERE "ownerType" = CAST('DOCTOR' AS "images"."OwnerType")
-                  AND "ownerId" = ${doctorId}
-              `,
-            )
-          : 0;
-        const patientImages = patientId
-          ? Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "images"."ImageAsset"
-                WHERE "ownerType" = CAST('PATIENT' AS "images"."OwnerType")
-                  AND "ownerId" = ${patientId}
-              `,
-            )
-          : 0;
-        return { doctorImages, patientImages };
-      }),
-    );
-
-    logs.push(
-      await this.runDeletionStep('communication', async () => {
-        const normalizedEmail = account.email.toLowerCase();
-        const notificationByEmail = Number(
-          await this.prisma.$executeRaw`
-            DELETE FROM "notification"."notification_log"
-            WHERE lower("destination") = ${normalizedEmail}
-              OR lower("normalizedDestination") = ${normalizedEmail}
-          `,
-        );
-        const outboxByPhone = account.phoneNumber
-          ? Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "notification"."message_outbox"
-                WHERE "to_e164" = ${account.phoneNumber}
-              `,
-            )
-          : 0;
-        const leadsByPhone = account.phoneNumber
-          ? Number(
-              await this.prisma.$executeRaw`
-                DELETE FROM "notification"."lead_capture"
-                WHERE "phone" = ${account.phoneNumber}
-              `,
-            )
-          : 0;
-        return { notificationByEmail, outboxByPhone, leadsByPhone };
       }),
     );
 
@@ -3879,6 +3614,9 @@ export class AuthService {
         deletedAt,
         detailsJson: {
           identity: identitySnapshot,
+          clinicId,
+          employerId,
+          grants,
           logs,
         },
         error,
@@ -3893,7 +3631,15 @@ export class AuthService {
     };
   }
 
-  async adminListAccounts(query: { page?: number; limit?: number; role?: string; q?: string; includeInsights?: boolean }) {
+  async adminListAccounts(query: {
+    page?: number;
+    limit?: number;
+    role?: string;
+    q?: string;
+    includeInsights?: boolean;
+    from?: string;
+    to?: string;
+  }) {
     const page = Math.max(1, Number(query.page ?? 1));
     const limit = Math.min(Math.max(Number(query.limit ?? 20), 1), 100);
     const skip = (page - 1) * limit;
@@ -3903,6 +3649,7 @@ export class AuthService {
       ? role as AccountRole
       : null;
     const includePatientRole = normalizedRole === AccountRole.PATIENT;
+    const includeEmployerRole = normalizedRole === AccountRole.EMPLOYER;
     const filters: Prisma.AccountWhereInput[] = [{ deletedAt: null }];
 
     if (normalizedRole) {
@@ -3911,6 +3658,22 @@ export class AuthService {
           OR: [
             { role: AccountRole.PATIENT },
             { roleProfiles: { some: { role: AccountRole.PATIENT } } },
+          ],
+        });
+      } else if (includeEmployerRole) {
+        filters.push({
+          OR: [
+            { role: AccountRole.EMPLOYER },
+            { roleProfiles: { some: { role: AccountRole.EMPLOYER } } },
+            {
+              productAccesses: {
+                some: {
+                  product: ProductCode.MEUDOC_EMPLOYER,
+                  role: ProductRole.EMPLOYER_ADMIN,
+                  status: { not: ProductAccessStatus.DISABLED },
+                },
+              },
+            },
           ],
         });
       } else {
@@ -3925,9 +3688,29 @@ export class AuthService {
           { phoneNumber: { contains: q } },
           { id: { equals: q } },
           { doctorId: { equals: q } },
+          { employerId: { equals: q } },
           { subjectId: { equals: q } },
           ...(includePatientRole
             ? [{ roleProfiles: { some: { role: AccountRole.PATIENT, subjectId: { equals: q } } } } as Prisma.AccountWhereInput]
+            : []),
+          ...(includeEmployerRole
+            ? [
+                {
+                  roleProfiles: {
+                    some: { role: AccountRole.EMPLOYER, subjectId: { equals: q } },
+                  },
+                } as Prisma.AccountWhereInput,
+                {
+                  productAccesses: {
+                    some: {
+                      product: ProductCode.MEUDOC_EMPLOYER,
+                      role: ProductRole.EMPLOYER_ADMIN,
+                      subjectId: { equals: q },
+                      status: { not: ProductAccessStatus.DISABLED },
+                    },
+                  },
+                } as Prisma.AccountWhereInput,
+              ]
             : []),
         ],
       });
@@ -3949,21 +3732,33 @@ export class AuthService {
           status: true,
           subjectId: true,
           doctorId: true,
+          employerId: true,
           onboardingStatus: true,
           createdAt: true,
           updatedAt: true,
           deletedAt: true,
-          ...(includePatientRole
-            ? {
-                roleProfiles: {
-                  where: { role: AccountRole.PATIENT },
-                  select: {
-                    subjectId: true,
-                    onboardingStatus: true,
-                  },
-                },
-              }
-            : {}),
+          roleProfiles: {
+            select: {
+              id: true,
+              role: true,
+              subjectId: true,
+              doctorId: true,
+              onboardingStatus: true,
+              createdAt: true,
+              updatedAt: true,
+            },
+          },
+          productAccesses: {
+            select: {
+              id: true,
+              product: true,
+              role: true,
+              subjectId: true,
+              status: true,
+              createdAt: true,
+              updatedAt: true,
+            },
+          },
         },
       }),
       this.prisma.account.count({ where }),
@@ -3971,9 +3766,33 @@ export class AuthService {
 
     const normalizedItems = items.map((item) => {
       if (!includePatientRole) {
-        return item;
+        if (!includeEmployerRole) {
+          return item;
+        }
+        const employerProfile =
+          item.roleProfiles.find((profile) => profile.role === AccountRole.EMPLOYER) ?? null;
+        const employerProductAccess =
+          item.productAccesses.find(
+            (access) =>
+              access.product === ProductCode.MEUDOC_EMPLOYER
+              && access.role === ProductRole.EMPLOYER_ADMIN
+              && access.status !== ProductAccessStatus.DISABLED,
+          ) ?? null;
+        return {
+          ...item,
+          role: AccountRole.EMPLOYER,
+          subjectId:
+            item.employerId
+            ?? employerProductAccess?.subjectId
+            ?? employerProfile?.subjectId
+            ?? (item.role === AccountRole.EMPLOYER ? item.subjectId : null),
+          onboardingStatus:
+            employerProfile?.onboardingStatus
+            ?? (item.role === AccountRole.EMPLOYER ? item.onboardingStatus : null),
+        };
       }
-      const patientProfile = 'roleProfiles' in item && Array.isArray(item.roleProfiles) ? item.roleProfiles[0] : null;
+      const patientProfile =
+        item.roleProfiles.find((profile) => profile.role === AccountRole.PATIENT) ?? null;
       return {
         ...item,
         role: AccountRole.PATIENT,
@@ -3984,6 +3803,7 @@ export class AuthService {
     });
 
     const shouldIncludeInsights = Boolean(query.includeInsights);
+    const employerInsightsRange = this.resolveEmployerInsightsRange(query.from, query.to);
     const patientInsights =
       shouldIncludeInsights && normalizedRole === AccountRole.PATIENT
         ? await this.fetchAdminPatientKpis(normalizedItems.map((item) => ({
@@ -3992,15 +3812,33 @@ export class AuthService {
           })))
         : new Map<string, PatientAdminKpis>();
     const loginInsights =
-      shouldIncludeInsights && normalizedRole === AccountRole.PATIENT
-        ? await this.getLoginInsights(normalizedItems.map((item) => item.id), AccountRole.PATIENT)
+      shouldIncludeInsights && (normalizedRole === AccountRole.PATIENT || normalizedRole === AccountRole.EMPLOYER)
+        ? await this.getLoginInsights(
+            normalizedItems.map((item) => item.id),
+            normalizedRole === AccountRole.EMPLOYER ? AccountRole.EMPLOYER : AccountRole.PATIENT,
+            normalizedRole === AccountRole.EMPLOYER ? employerInsightsRange : undefined,
+          )
         : new Map<string, AccountLoginInsights>();
+    const employerInsights =
+      shouldIncludeInsights && normalizedRole === AccountRole.EMPLOYER
+        ? await this.fetchEmployerAdminSummaries(
+            normalizedItems.map((item) => ({
+              accountId: item.id,
+              employerId:
+                ('employerId' in item && typeof item.employerId === 'string' ? item.employerId : null)
+                ?? item.subjectId
+                ?? null,
+            })),
+            employerInsightsRange,
+          )
+        : new Map<string, EmployerAdminSummary>();
 
     return {
       items: normalizedItems.map((item) => ({
         ...item,
         ...(patientInsights.has(item.id) ? patientInsights.get(item.id) : {}),
         ...(loginInsights.has(item.id) ? loginInsights.get(item.id) : {}),
+        ...(employerInsights.has(item.id) ? employerInsights.get(item.id) : {}),
       })),
       page,
       limit,
@@ -4053,7 +3891,209 @@ export class AuthService {
     }
   }
 
-  private async getLoginInsights(accountIds: string[], role: AccountRole) {
+  private getCompanyAnalyticsInternalBaseUrl() {
+    return (
+      this.config.get<string>('COMPANYANALYTICS_INTERNAL_BASE_URL') ??
+      'http://company-analytics-service:3053/companyanalyticsms'
+    );
+  }
+
+  private getCompanyCareInternalBaseUrl() {
+    return (
+      this.config.get<string>('COMPANYCARE_INTERNAL_BASE_URL') ??
+      'http://company-care-service:3052/companycarems'
+    );
+  }
+
+  private getEmployersInternalBaseUrl() {
+    return (
+      this.config.get<string>('EMPLOYERS_INTERNAL_BASE_URL') ??
+      this.config.get<string>('EMPLOYERS_BASE_URL') ??
+      'http://employers-service:3041/employersms'
+    );
+  }
+
+  private getInternalServiceHeaders() {
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
+    };
+    const token = this.config.get<string>('INTERNAL_SERVICE_TOKEN') ?? '';
+    if (token) {
+      headers['x-internal-service-token'] = token;
+    }
+    return headers;
+  }
+
+  private resolveEmployerInsightsRange(from?: string, to?: string) {
+    const parsedFrom = from ? new Date(from) : null;
+    const parsedTo = to ? new Date(to) : null;
+    if (
+      parsedFrom &&
+      parsedTo &&
+      Number.isFinite(parsedFrom.getTime()) &&
+      Number.isFinite(parsedTo.getTime()) &&
+      parsedFrom.getTime() <= parsedTo.getTime()
+    ) {
+      return {
+        from: parsedFrom,
+        to: new Date(parsedTo.getTime() + 24 * 60 * 60 * 1000 - 1),
+      };
+    }
+
+    const now = new Date();
+    const defaultFrom = new Date(now.getTime() - 90 * 24 * 60 * 60 * 1000);
+    return { from: defaultFrom, to: now };
+  }
+
+  private async fetchEmployerAdminSummaries(
+    employers: Array<{ accountId: string; employerId?: string | null }>,
+    range: { from: Date; to: Date },
+  ) {
+    const cleaned = employers
+      .map((item) => ({
+        accountId: item.accountId.trim(),
+        employerId: item.employerId?.trim() || null,
+      }))
+      .filter((item) => item.accountId && item.employerId)
+      .slice(0, 200) as Array<{ accountId: string; employerId: string }>;
+    if (!cleaned.length) {
+      return new Map<string, EmployerAdminSummary>();
+    }
+
+    const employerIds = [...new Set(cleaned.map((item) => item.employerId))];
+    const [directory, careSummary, appointmentSummary] = await Promise.all([
+      this.fetchEmployerDirectorySummary(employerIds),
+      this.fetchEmployerCareRequestSummary(employerIds),
+      this.fetchEmployerAppointmentSummary(employerIds, range),
+    ]);
+
+    return new Map(cleaned.map((item) => {
+      const employerInfo = directory.get(item.employerId);
+      const careInfo = careSummary.get(item.employerId);
+      const appointmentInfo = appointmentSummary.get(item.employerId);
+      return [
+        item.accountId,
+        {
+          employerId: item.employerId,
+          displayName: employerInfo?.displayName ?? null,
+          totalCareRequests: careInfo?.totalCareRequests ?? 0,
+          approvedCareRequests: careInfo?.approvedCareRequests ?? 0,
+          appointmentCount: appointmentInfo?.appointmentCount ?? 0,
+          hasFirstPatientAppointment: appointmentInfo?.hasFirstPatientAppointment ?? false,
+        } satisfies EmployerAdminSummary,
+      ];
+    }));
+  }
+
+  private async fetchEmployerDirectorySummary(employerIds: string[]) {
+    if (!employerIds.length) return new Map<string, { displayName: string | null }>();
+    try {
+      const response = await fetch(
+        `${this.getEmployersInternalBaseUrl().replace(/\/$/, '')}/employers/internal/admin/summaries`,
+        {
+          method: 'POST',
+          headers: this.getInternalServiceHeaders(),
+          body: JSON.stringify({ employerIds }),
+        },
+      );
+      if (!response.ok) {
+        return new Map<string, { displayName: string | null }>();
+      }
+      const data = (await response.json()) as {
+        items?: Array<{ employerId?: string; displayName?: string | null }>;
+      };
+      return new Map(
+        (data.items ?? [])
+          .filter((item) => typeof item.employerId === 'string' && item.employerId.trim())
+          .map((item) => [
+            item.employerId!.trim(),
+            { displayName: item.displayName?.trim() || null },
+          ]),
+      );
+    } catch {
+      return new Map<string, { displayName: string | null }>();
+    }
+  }
+
+  private async fetchEmployerCareRequestSummary(employerIds: string[]) {
+    if (!employerIds.length) {
+      return new Map<string, { totalCareRequests: number; approvedCareRequests: number }>();
+    }
+    try {
+      const response = await fetch(
+        `${this.getCompanyCareInternalBaseUrl().replace(/\/$/, '')}/internal/admin/employer-care-requests/summary`,
+        {
+          method: 'POST',
+          headers: this.getInternalServiceHeaders(),
+          body: JSON.stringify({ employerIds }),
+        },
+      );
+      if (!response.ok) {
+        return new Map<string, { totalCareRequests: number; approvedCareRequests: number }>();
+      }
+      const data = (await response.json()) as {
+        items?: Array<{ employerId?: string; totalCareRequests?: number; approvedCareRequests?: number }>;
+      };
+      return new Map(
+        (data.items ?? [])
+          .filter((item) => typeof item.employerId === 'string' && item.employerId.trim())
+          .map((item) => [
+            item.employerId!.trim(),
+            {
+              totalCareRequests: Number(item.totalCareRequests ?? 0),
+              approvedCareRequests: Number(item.approvedCareRequests ?? 0),
+            },
+          ]),
+      );
+    } catch {
+      return new Map<string, { totalCareRequests: number; approvedCareRequests: number }>();
+    }
+  }
+
+  private async fetchEmployerAppointmentSummary(employerIds: string[], range: { from: Date; to: Date }) {
+    if (!employerIds.length) {
+      return new Map<string, { appointmentCount: number; hasFirstPatientAppointment: boolean }>();
+    }
+    try {
+      const response = await fetch(
+        `${this.getCompanyAnalyticsInternalBaseUrl().replace(/\/$/, '')}/internal/admin/employer-appointments/summary`,
+        {
+          method: 'POST',
+          headers: this.getInternalServiceHeaders(),
+          body: JSON.stringify({
+            employerIds,
+            from: range.from.toISOString(),
+            to: range.to.toISOString(),
+          }),
+        },
+      );
+      if (!response.ok) {
+        return new Map<string, { appointmentCount: number; hasFirstPatientAppointment: boolean }>();
+      }
+      const data = (await response.json()) as {
+        items?: Array<{ employerId?: string; appointmentCount?: number; hasFirstPatientAppointment?: boolean }>;
+      };
+      return new Map(
+        (data.items ?? [])
+          .filter((item) => typeof item.employerId === 'string' && item.employerId.trim())
+          .map((item) => [
+            item.employerId!.trim(),
+            {
+              appointmentCount: Number(item.appointmentCount ?? 0),
+              hasFirstPatientAppointment: Boolean(item.hasFirstPatientAppointment),
+            },
+          ]),
+      );
+    } catch {
+      return new Map<string, { appointmentCount: number; hasFirstPatientAppointment: boolean }>();
+    }
+  }
+
+  private async getLoginInsights(
+    accountIds: string[],
+    role: AccountRole,
+    range?: { from: Date; to: Date },
+  ) {
     const cleaned = accountIds.filter(Boolean).slice(0, 200);
     if (!cleaned.length) {
       return new Map<string, AccountLoginInsights>();
@@ -4064,6 +4104,14 @@ export class AuthService {
       where: {
         accountId: { in: cleaned },
         role,
+        ...(range
+          ? {
+              createdAt: {
+                gte: range.from,
+                lte: range.to,
+              },
+            }
+          : {}),
       },
       _count: { _all: true },
       _max: { createdAt: true },
@@ -4094,6 +4142,28 @@ export class AuthService {
         createdAt: true,
         updatedAt: true,
         deletedAt: true,
+        roleProfiles: {
+          select: {
+            id: true,
+            role: true,
+            subjectId: true,
+            doctorId: true,
+            onboardingStatus: true,
+            createdAt: true,
+            updatedAt: true,
+          },
+        },
+        productAccesses: {
+          select: {
+            id: true,
+            product: true,
+            role: true,
+            subjectId: true,
+            status: true,
+            createdAt: true,
+            updatedAt: true,
+          },
+        },
       },
     });
 
@@ -4149,6 +4219,28 @@ export class AuthService {
         createdAt: true,
         updatedAt: true,
         deletedAt: true,
+        roleProfiles: {
+          select: {
+            id: true,
+            role: true,
+            subjectId: true,
+            doctorId: true,
+            onboardingStatus: true,
+            createdAt: true,
+            updatedAt: true,
+          },
+        },
+        productAccesses: {
+          select: {
+            id: true,
+            product: true,
+            role: true,
+            subjectId: true,
+            status: true,
+            createdAt: true,
+            updatedAt: true,
+          },
+        },
       },
     });
 
@@ -4159,6 +4251,7 @@ export class AuthService {
     id: string,
     dto: { confirmEmail: string },
     requesterId: string | null,
+    requesterRole: 'ADMIN' | 'SYSTEM',
     meta?: RequestMeta,
   ) {
     const account = await this.prisma.account.findUnique({ where: { id } });
@@ -4168,16 +4261,85 @@ export class AuthService {
     if (account.deletedAt) {
       throw new BadRequestException('Cuenta eliminada');
     }
-    if (requesterId && account.id === requesterId) {
-      throw new BadRequestException('No puedes eliminar tu propia cuenta');
-    }
-
     const normalizedConfirm = dto.confirmEmail.trim().toLowerCase();
     if (normalizedConfirm !== account.email.toLowerCase()) {
       throw new BadRequestException('El correo no coincide');
     }
 
-    return this.executeAccountDeletion(account, AccountDeletionChannel.EMAIL, meta);
+    return this.executeAccountDeletion(account, AccountDeletionChannel.EMAIL, {
+      ...meta,
+      requesterId,
+      requesterRole,
+    });
+  }
+
+  async adminListEmployerCompanies(query: {
+    page?: number;
+    limit?: number;
+    q?: string;
+  }) {
+    return this.employersHttp.listAdminCompanies(query);
+  }
+
+  async adminArchiveEmployerCompany(employerId: string) {
+    const result = await this.employersHttp.archiveCompany(employerId);
+    const affectedAccountIds = Array.from(new Set(result.affectedAuthUserIds.filter(Boolean)));
+    let accountsUpdated = 0;
+    let productAccessRemoved = 0;
+    let roleProfilesRemoved = 0;
+
+    for (const accountId of affectedAccountIds) {
+      const [productAccesses, roleProfiles, account] = await this.prisma.$transaction([
+        this.prisma.accountProductAccess.deleteMany({
+          where: {
+            accountId,
+            product: ProductCode.MEUDOC_EMPLOYER,
+          },
+        }),
+        this.prisma.accountRoleProfile.deleteMany({
+          where: {
+            accountId,
+            role: AccountRole.EMPLOYER,
+          },
+        }),
+        this.prisma.account.findUnique({
+          where: { id: accountId },
+          include: {
+            roleProfiles: true,
+            productAccesses: true,
+          },
+        }),
+      ]);
+
+      productAccessRemoved += productAccesses.count;
+      roleProfilesRemoved += roleProfiles.count;
+
+      if (!account) {
+        continue;
+      }
+
+      const nextRole = this.resolveFallbackAccountRole(account.roleProfiles, account.productAccesses, account.role);
+      const shouldUpdateLegacyEmployerLink = account.employerId === employerId || account.subjectId === employerId || account.role === AccountRole.EMPLOYER;
+
+      await this.prisma.account.update({
+        where: { id: accountId },
+        data: {
+          ...(shouldUpdateLegacyEmployerLink ? { employerId: null, subjectId: null } : {}),
+          role: nextRole,
+        },
+      });
+      accountsUpdated += 1;
+    }
+
+    return {
+      ...result,
+      authCleanup: {
+        affectedAccounts: affectedAccountIds.length,
+        accountsUpdated,
+        productAccessRemoved,
+        roleProfilesRemoved,
+      },
+    };
   }
 
   private hashToken(token: string) {
@@ -4188,6 +4350,7 @@ export class AuthService {
     account: Account,
     profile?: { firstName?: string; lastName?: string; companyName?: string; taxId?: string },
     roleOverride?: AccountRole,
+    registrationContext?: AuthRegistrationSessionContext,
   ) {
     const eventRole = roleOverride ?? account.role;
     if (
@@ -4203,10 +4366,17 @@ export class AuthService {
     const lastName = profile?.lastName?.trim();
     const companyName = profile?.companyName?.trim();
     const taxId = profile?.taxId?.trim();
+    const productAccess = registrationContext?.productAccess ?? null;
+    const patientId =
+      registrationContext?.patientId?.trim() ||
+      productAccess?.subjectId?.trim() ||
+      undefined;
+    const isPatientRegistration = eventRole === AccountRole.PATIENT;
 
     const payload = {
       authUserId: account.id,
-      role: eventRole,
+      role: isPatientRegistration ? AccountRole.MEMBER : eventRole,
+      effectiveRole: isPatientRegistration ? 'PATIENT' : undefined,
       doctorId: account.doctorId ?? undefined,
       employerId: account.employerId ?? undefined,
       email: account.email,
@@ -4215,6 +4385,15 @@ export class AuthService {
       lastName: lastName || undefined,
       companyName: companyName || undefined,
       taxId: taxId || undefined,
+      patientId,
+      productSubjectId: patientId,
+      activeProduct: isPatientRegistration
+        ? (productAccess?.product ?? ProductCode.PATIENT_PORTAL)
+        : undefined,
+      activeProductRole: isPatientRegistration
+        ? (productAccess?.role ?? ('PATIENT' as ProductRole))
+        : undefined,
+      productAccessStatus: productAccess?.status,
     };
 
     this.logger.log(
@@ -4420,12 +4599,8 @@ export class AuthService {
       .join(' ');
   }
 
-  private async findPatientIdByAuthUserId(authUserId: string) {
-    const patientId = await this.tryFindPatientIdByAuthUserId(authUserId);
-    if (!patientId) {
-      throw new ServiceUnavailableException('No se pudo validar el perfil de paciente');
-    }
-    return patientId;
+  private async findPatientIdByAuthUserId(authUserId: string): Promise<string | null> {
+    return this.tryFindPatientIdByAuthUserId(authUserId);
   }
 
   private async tryFindPatientIdByAuthUserId(authUserId: string): Promise<string | null> {
@@ -4448,6 +4623,380 @@ export class AuthService {
       this.logger.warn(`No se pudo consultar paciente por authUserId: ${message}`);
       return null;
     }
+  }
+
+  private buildAccountDeletionGrants(
+    account: Account,
+    roleProfiles: AccountRoleProfile[],
+    productAccesses: AccountProductAccess[],
+  ): AccountDeletionGrant[] {
+    const grants: AccountDeletionGrant[] = productAccesses.map((access) => ({
+      product: access.product,
+      role: access.role,
+      subjectId: access.subjectId?.trim() || null,
+      source: 'product-access',
+    }));
+
+    const hasGrant = (product: ProductCode, role: ProductRole) =>
+      grants.some((grant) => grant.product === product && grant.role === role);
+
+    for (const profile of roleProfiles) {
+      const mapped = this.mapRoleProfileToDeletionGrant(account, profile);
+      if (!mapped || hasGrant(mapped.product, mapped.role)) {
+        continue;
+      }
+      grants.push(mapped);
+    }
+
+    const legacyGrants = this.mapLegacyAccountToDeletionGrants(account);
+    for (const grant of legacyGrants) {
+      if (!hasGrant(grant.product, grant.role)) {
+        grants.push(grant);
+      }
+    }
+
+    return grants;
+  }
+
+  private mapRoleProfileToDeletionGrant(
+    account: Account,
+    profile: AccountRoleProfile,
+  ): AccountDeletionGrant | null {
+    switch (profile.role) {
+      case AccountRole.PATIENT:
+        return {
+          product: ProductCode.PATIENT_PORTAL,
+          role: ProductRole.PATIENT,
+          subjectId: profile.subjectId?.trim() || null,
+          source: 'role-profile',
+        };
+      case AccountRole.DOCTOR:
+        return {
+          product: ProductCode.MEUDOC_PRO,
+          role: ProductRole.DOCTOR,
+          subjectId: profile.doctorId?.trim() || profile.subjectId?.trim() || account.doctorId?.trim() || null,
+          source: 'role-profile',
+        };
+      case AccountRole.CLINIC:
+        return {
+          product: ProductCode.MEUDOC_PRO,
+          role: ProductRole.MEDICAL_ENTITY,
+          subjectId: profile.subjectId?.trim() || null,
+          source: 'role-profile',
+        };
+      case AccountRole.EMPLOYER:
+        return {
+          product: ProductCode.MEUDOC_EMPLOYER,
+          role: ProductRole.EMPLOYER_ADMIN,
+          subjectId: profile.subjectId?.trim() || account.employerId?.trim() || null,
+          source: 'role-profile',
+        };
+      case AccountRole.ADMIN:
+        return {
+          product: ProductCode.MEUDOC_ADMIN,
+          role: ProductRole.ADMIN,
+          subjectId: profile.subjectId?.trim() || null,
+          source: 'role-profile',
+        };
+      case AccountRole.COMERCIAL:
+        return {
+          product: ProductCode.MEUDOC_ADMIN,
+          role: ProductRole.COMERCIAL,
+          subjectId: profile.subjectId?.trim() || null,
+          source: 'role-profile',
+        };
+      default:
+        return null;
+    }
+  }
+
+  private mapLegacyAccountToDeletionGrants(account: Account): AccountDeletionGrant[] {
+    const grants: AccountDeletionGrant[] = [];
+    if (account.doctorId?.trim()) {
+      grants.push({
+        product: ProductCode.MEUDOC_PRO,
+        role: ProductRole.DOCTOR,
+        subjectId: account.doctorId.trim(),
+        source: 'legacy-account',
+      });
+    }
+    if (account.employerId?.trim()) {
+      grants.push({
+        product: ProductCode.MEUDOC_EMPLOYER,
+        role: ProductRole.EMPLOYER_ADMIN,
+        subjectId: account.employerId.trim(),
+        source: 'legacy-account',
+      });
+    }
+    if (account.role === AccountRole.CLINIC && account.subjectId?.trim()) {
+      grants.push({
+        product: ProductCode.MEUDOC_PRO,
+        role: ProductRole.MEDICAL_ENTITY,
+        subjectId: account.subjectId.trim(),
+        source: 'legacy-account',
+      });
+    }
+    if (account.role === AccountRole.PATIENT) {
+      grants.push({
+        product: ProductCode.PATIENT_PORTAL,
+        role: ProductRole.PATIENT,
+        subjectId: account.subjectId?.trim() || null,
+        source: 'legacy-account',
+      });
+    }
+    return grants;
+  }
+
+  private resolveDoctorIdForAccountDeletion(
+    account: Account,
+    roleProfiles: AccountRoleProfile[],
+    productAccesses: AccountProductAccess[],
+  ): string | null {
+    const roleProfile = roleProfiles.find((item) => item.role === AccountRole.DOCTOR);
+    const roleDoctorId = roleProfile?.doctorId?.trim() || roleProfile?.subjectId?.trim() || null;
+    if (this.isUuid(roleDoctorId)) {
+      return roleDoctorId;
+    }
+
+    const productDoctorId =
+      productAccesses.find(
+        (item) => item.product === ProductCode.MEUDOC_PRO && item.role === ProductRole.DOCTOR,
+      )?.subjectId?.trim() || null;
+    if (this.isUuid(productDoctorId)) {
+      return productDoctorId;
+    }
+
+    if (this.isUuid(account.doctorId)) {
+      return account.doctorId!.trim();
+    }
+
+    const accountSubjectId = account.role === AccountRole.DOCTOR ? account.subjectId?.trim() || null : null;
+    return this.isUuid(accountSubjectId) ? accountSubjectId : null;
+  }
+
+  private resolveClinicIdForAccountDeletion(
+    account: Account,
+    roleProfiles: AccountRoleProfile[],
+    productAccesses: AccountProductAccess[],
+  ): string | null {
+    const roleClinicId =
+      roleProfiles.find((item) => item.role === AccountRole.CLINIC)?.subjectId?.trim() || null;
+    if (this.isUuid(roleClinicId)) {
+      return roleClinicId;
+    }
+
+    const productClinicId =
+      productAccesses.find(
+        (item) => item.product === ProductCode.MEUDOC_PRO && item.role === ProductRole.MEDICAL_ENTITY,
+      )?.subjectId?.trim() || null;
+    if (this.isUuid(productClinicId)) {
+      return productClinicId;
+    }
+
+    const accountSubjectId = account.role === AccountRole.CLINIC ? account.subjectId?.trim() || null : null;
+    return this.isUuid(accountSubjectId) ? accountSubjectId : null;
+  }
+
+  private resolveEmployerIdForAccountDeletion(
+    account: Account,
+    roleProfiles: AccountRoleProfile[],
+    productAccesses: AccountProductAccess[],
+  ): string | null {
+    const roleEmployerId =
+      roleProfiles.find((item) => item.role === AccountRole.EMPLOYER)?.subjectId?.trim() || null;
+    if (this.isUuid(roleEmployerId)) {
+      return roleEmployerId;
+    }
+
+    const productEmployerId =
+      productAccesses.find((item) => item.product === ProductCode.MEUDOC_EMPLOYER)?.subjectId?.trim() || null;
+    if (this.isUuid(productEmployerId)) {
+      return productEmployerId;
+    }
+
+    if (this.isUuid(account.employerId)) {
+      return account.employerId!.trim();
+    }
+
+    const accountSubjectId = account.role === AccountRole.EMPLOYER ? account.subjectId?.trim() || null : null;
+    return this.isUuid(accountSubjectId) ? accountSubjectId : null;
+  }
+
+  private async resolvePatientIdForAccountDeletion(
+    account: Account,
+    roleProfiles: AccountRoleProfile[],
+    productAccesses: AccountProductAccess[],
+  ): Promise<string | null> {
+    const patientProfile = roleProfiles.find((item) => item.role === AccountRole.PATIENT) ?? null;
+    const profileSubjectId = patientProfile?.subjectId?.trim() || null;
+    if (this.isUuid(profileSubjectId)) {
+      return profileSubjectId;
+    }
+
+    const patientPortalAccess =
+      productAccesses.find(
+        (item) => item.product === ProductCode.PATIENT_PORTAL && item.role === ProductRole.PATIENT,
+      ) ?? null;
+    const accessSubjectId = patientPortalAccess?.subjectId?.trim() || null;
+    if (this.isUuid(accessSubjectId)) {
+      return accessSubjectId;
+    }
+
+    const accountSubjectId = account.role === AccountRole.PATIENT ? account.subjectId?.trim() || null : null;
+    if (this.isUuid(accountSubjectId)) {
+      return accountSubjectId;
+    }
+
+    const linkedPatientId = await this.tryFindPatientIdByAuthUserId(account.id);
+    if (!linkedPatientId && (account.role === AccountRole.PATIENT || patientProfile || patientPortalAccess)) {
+      this.logger.warn(`No se encontro patientId vinculado para eliminar la cuenta ${account.id}`);
+    }
+    return linkedPatientId;
+  }
+
+  private async deactivatePatientProductAccess(patientId: string): Promise<Record<string, number>> {
+    const response = await fetch(`${this.usersBaseUrl.replace(/\/$/, '')}/patients/${encodeURIComponent(patientId)}`, {
+      method: 'PUT',
+      headers: {
+        'content-type': 'application/json',
+        'x-role': 'SYSTEM',
+      },
+      body: JSON.stringify({ status: 'INACTIVE' }),
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new ServiceUnavailableException(
+        `No se pudo desactivar paciente (status ${response.status}): ${body}`,
+      );
+    }
+
+    return { patientInactivated: 1 };
+  }
+
+  private async deactivateDoctorProductAccess(doctorId: string): Promise<Record<string, number>> {
+    const response = await fetch(
+      `${this.doctorsBaseUrl.replace(/\/$/, '')}/internal/doctors/${encodeURIComponent(doctorId)}/deactivate-legacy`,
+      {
+        method: 'POST',
+        headers: {
+          'x-role': 'SYSTEM',
+        },
+      },
+    );
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new ServiceUnavailableException(
+        `No se pudo desactivar doctor (status ${response.status}): ${body}`,
+      );
+    }
+
+    return { doctorInactivated: 1 };
+  }
+
+  private async revokeClinicAccountAccess(
+    accountId: string,
+    clinicId: string | null,
+  ): Promise<Record<string, number>> {
+    const deleted = clinicId
+      ? await this.prisma.clinicAdmin.deleteMany({
+          where: {
+            accountId,
+            clinicId,
+          },
+        })
+      : await this.prisma.clinicAdmin.deleteMany({ where: { accountId } });
+    return { clinicAdminsRemoved: deleted.count };
+  }
+
+  private async deactivateEmployerProductAccess(
+    authUserId: string,
+    employerId: string | null,
+  ): Promise<Record<string, number>> {
+    const result = await this.employersHttp.disableAccountAccess({
+      authUserId,
+      employerId: employerId ?? undefined,
+    });
+    return {
+      foundersDisabled: result.foundersDisabled,
+      membersDisabled: result.membersDisabled,
+      affiliatesDisabled: result.affiliatesDisabled,
+      archivedEmployers: result.archivedEmployers,
+    };
+  }
+
+  private async assertEmployerDeletionAllowed(
+    accountId: string,
+    employerId: string | null,
+    meta?: RequestMeta,
+  ) {
+    const requesterId = meta?.requesterId?.trim() || null;
+    const requesterRole = meta?.requesterRole?.trim().toUpperCase() || null;
+    if (!requesterId || requesterId !== accountId) {
+      return;
+    }
+    if (requesterRole === 'ADMIN' || requesterRole === 'SYSTEM') {
+      return;
+    }
+
+    const impact = await this.employersHttp.getAccountDeletionImpact({
+      authUserId: accountId,
+      employerId: employerId ?? undefined,
+    });
+    if (impact.items.some((item) => item.wouldArchiveCompany)) {
+      throw new BadRequestException(
+        'No puedes eliminar tu cuenta porque eres el ultimo fundador o administrador activo de una empresa',
+      );
+    }
+  }
+
+  private resolveFallbackAccountRole(
+    roleProfiles: AccountRoleProfile[],
+    productAccesses: AccountProductAccess[],
+    currentRole: AccountRole,
+  ) {
+    const activeProducts = productAccesses.filter((access) => access.status !== ProductAccessStatus.DISABLED);
+
+    if (roleProfiles.some((profile) => profile.role === AccountRole.ADMIN) || currentRole === AccountRole.ADMIN) {
+      return AccountRole.ADMIN;
+    }
+    if (roleProfiles.some((profile) => profile.role === AccountRole.COMERCIAL) || currentRole === AccountRole.COMERCIAL) {
+      return AccountRole.COMERCIAL;
+    }
+    if (
+      roleProfiles.some((profile) => profile.role === AccountRole.DOCTOR)
+      || activeProducts.some((access) => access.product === ProductCode.MEUDOC_PRO && access.role === ProductRole.DOCTOR)
+    ) {
+      return AccountRole.DOCTOR;
+    }
+    if (
+      roleProfiles.some((profile) => profile.role === AccountRole.CLINIC)
+      || activeProducts.some((access) => access.product === ProductCode.MEUDOC_PRO && access.role === ProductRole.MEDICAL_ENTITY)
+    ) {
+      return AccountRole.CLINIC;
+    }
+    if (
+      roleProfiles.some((profile) => profile.role === AccountRole.PATIENT)
+      || activeProducts.some((access) => access.product === ProductCode.PATIENT_PORTAL && access.role === ProductRole.PATIENT)
+    ) {
+      return AccountRole.PATIENT;
+    }
+    if (activeProducts.some((access) => access.product === ProductCode.MEURED)) {
+      return AccountRole.MEMBER;
+    }
+    return currentRole === AccountRole.EMPLOYER ? AccountRole.MEMBER : currentRole;
+  }
+
+  private async deactivateMeuredProductAccess(authUserId: string): Promise<Record<string, number>> {
+    const result = await this.registrationPrefill.disableMeuredProfile(authUserId);
+    return {
+      membershipsDeleted: result.membershipsDeleted,
+      settingsDeleted: result.settingsDeleted,
+      verificationsDeleted: result.verificationsDeleted,
+      statsDeleted: result.statsDeleted,
+      profilesDeleted: result.profilesDeleted,
+    };
   }
 
   /**
@@ -4486,19 +5035,32 @@ export class AuthService {
   }
 
   private async linkOrCreatePatientForAccount(account: Account, firstName: string, lastName: string) {
+    const existingByAuth = await this.tryFindPatientIdByAuthUserId(account.id);
+    if (existingByAuth) {
+      return existingByAuth;
+    }
+
     const existing = await this.findPatientByContact(account.email, account.phoneNumber ?? undefined);
     if (existing?.patientId) {
-      const existingAuthUserId = existing.authUserId;
-      if (existingAuthUserId) {
-        const linkedAccount = await this.prisma.account.findUnique({ where: { id: existingAuthUserId } });
-        if (linkedAccount && linkedAccount.id !== account.id) {
-          throw new ConflictException('El paciente ya tiene una cuenta vinculada');
+      const existingAuthUserId = existing.authUserId?.trim() || null;
+      if (existingAuthUserId && existingAuthUserId !== account.id) {
+        const linkedAccount = await this.prisma.account.findUnique({
+          where: { id: existingAuthUserId },
+        });
+        if (linkedAccount) {
+          const canReclaimPatient =
+            existing.matchedByEmail ||
+            linkedAccount.email.trim().toLowerCase() === account.email.trim().toLowerCase();
+          if (!canReclaimPatient) {
+            throw new ConflictException('El paciente ya tiene una cuenta vinculada');
+          }
         }
       }
       await this.linkAuthUserToPatient({
         patientId: existing.patientId,
         authUserId: account.id,
-        expectedAuthUserId: existingAuthUserId ?? undefined,
+        expectedAuthUserId:
+          existingAuthUserId && existingAuthUserId !== account.id ? existingAuthUserId : undefined,
         email: account.email,
         phoneNumber: account.phoneNumber ?? undefined,
       });
@@ -4507,22 +5069,37 @@ export class AuthService {
     return this.createPatientForAccount(account, firstName, lastName);
   }
 
-  private async findPatientByContact(email: string, phoneNumber?: string) {
+  private async findPatientByContact(
+    email: string,
+    phoneNumber?: string,
+  ): Promise<{ patientId: string; authUserId: string | null; matchedByEmail: boolean } | null> {
     const base = this.usersBaseUrl.replace(/\/$/, '');
     const headers = { 'x-role': 'SYSTEM' };
     if (phoneNumber) {
       try {
         const response = await fetch(`${base}/patients/search?phone=${encodeURIComponent(phoneNumber)}`, { headers });
         if (response.ok) {
-          const data = (await response.json()) as { items?: Array<{ id: string; authUserId?: string | null; contacts?: Array<{ email?: string | null }> }> };
+          const data = (await response.json()) as {
+            items?: Array<{
+              id: string;
+              authUserId?: string | null;
+              status?: string | null;
+              contacts?: Array<{ email?: string | null }>;
+            }>;
+          };
           const lowerEmail = email.toLowerCase();
-          const emailMatch = data.items?.find((item) =>
+          const activeItems = (data.items ?? []).filter((item) => this.isReusablePatientCandidate(item.status));
+          const emailMatch = activeItems.find((item) =>
             item.contacts?.some((contact) => (contact.email ?? '').toLowerCase() === lowerEmail),
           );
-          const match = emailMatch ?? data.items?.[0];
+          const match = emailMatch ?? activeItems[0];
           if (match?.id) {
             if (emailMatch) {
-              return { patientId: match.id, authUserId: match.authUserId ?? null };
+              return {
+                patientId: match.id,
+                authUserId: match.authUserId ?? null,
+                matchedByEmail: true,
+              };
             }
             // If phone matched but email doesn't, prefer email search below.
           }
@@ -4534,16 +5111,33 @@ export class AuthService {
     try {
       const response = await fetch(`${base}/patients/search?q=${encodeURIComponent(email)}`, { headers });
       if (!response.ok) return null;
-      const data = (await response.json()) as { items?: Array<{ id: string; authUserId?: string | null; contacts?: Array<{ email?: string | null }> }> };
+      const data = (await response.json()) as {
+        items?: Array<{
+          id: string;
+          authUserId?: string | null;
+          status?: string | null;
+          contacts?: Array<{ email?: string | null }>;
+        }>;
+      };
       const lower = email.toLowerCase();
-      const match = data.items?.find((item) =>
+      const activeItems = (data.items ?? []).filter((item) => this.isReusablePatientCandidate(item.status));
+      const emailMatch = activeItems.find((item) =>
         item.contacts?.some((contact) => (contact.email ?? '').toLowerCase() === lower),
-      ) ?? data.items?.[0];
+      );
+      const match = emailMatch ?? activeItems[0];
       if (!match?.id) return null;
-      return { patientId: match.id, authUserId: match.authUserId ?? null };
+      return {
+        patientId: match.id,
+        authUserId: match.authUserId ?? null,
+        matchedByEmail: Boolean(emailMatch),
+      };
     } catch {
       return null;
     }
+  }
+
+  private isReusablePatientCandidate(status?: string | null) {
+    return (status ?? 'ACTIVE').toUpperCase() === 'ACTIVE';
   }
 
   private async linkAuthUserToPatient(input: {
@@ -4708,19 +5302,31 @@ export class AuthService {
     return composed || 'Usuario MeuSalud';
   }
 
-  private async ensurePatientSubjectId(account: Account) {
-    if (account.role !== AccountRole.PATIENT) {
-      return account;
+  private parseAccountRole(role?: string | null): AccountRole | null {
+    if (!role) {
+      return null;
     }
-    if (account.subjectId) {
-      return account;
-    }
+    return Object.values(AccountRole).includes(role as AccountRole)
+      ? (role as AccountRole)
+      : null;
+  }
 
-    const patientId = await this.resolvePatientIdForSession(account);
-    return this.prisma.account.update({
-      where: { id: account.id },
-      data: { subjectId: patientId },
-    });
+  private parseProductCode(product?: string | null): ProductCode | null {
+    if (!product) {
+      return null;
+    }
+    return Object.values(ProductCode).includes(product as ProductCode)
+      ? (product as ProductCode)
+      : null;
+  }
+
+  private parseProductRole(role?: string | null): ProductRole | null {
+    if (!role) {
+      return null;
+    }
+    return Object.values(ProductRole).includes(role as ProductRole)
+      ? (role as ProductRole)
+      : null;
   }
 
   private normalizePhoneNumber(value: string) {
@@ -4768,6 +5374,7 @@ export class AuthService {
     account: Account,
     options?: {
       sessionRole?: AccountRole;
+      productAccess?: ProductAccessContext | null;
       method?: TwoFactorMethod;
       purpose?: TwoFactorChallengePurpose;
       destination?: string | null;
@@ -4778,11 +5385,15 @@ export class AuthService {
     const expiresAt = new Date(Date.now() + this.challengeTtl * 1000);
     const method = options?.method ?? this.resolveTwoFactorMethod(account);
     const code = options?.generateCode ? this.generateRecoveryCode() : null;
+    const productAccess = options?.productAccess ?? null;
     const challenge = await this.prisma.twoFactorChallenge.create({
       data: {
         id,
         accountId: account.id,
         sessionRole: options?.sessionRole,
+        activeProduct: productAccess?.product,
+        activeProductRole: productAccess?.role,
+        productSubjectId: productAccess?.subjectId ?? undefined,
         method,
         purpose: options?.purpose ?? TwoFactorChallengePurpose.LOGIN,
         codeHash: code ? this.hashToken(code) : null,
@@ -4800,13 +5411,20 @@ export class AuthService {
     account: Account,
     options: {
       sessionRole?: AccountRole;
+      productAccess?: ProductAccessContext | null;
       availableRoles?: AccountRole[];
       availableProductAccess?: Awaited<ReturnType<AuthService['getAvailableProductAccess']>>;
     } = {},
   ) {
+    const sessionRole = options.sessionRole ?? account.role;
+    const productAccess = await this.resolveSessionProductAccess(account, {
+      sessionRole,
+      productAccess: options.productAccess,
+    });
     const method = this.resolveTwoFactorMethod(account);
     const challenge = await this.createTwoFactorChallenge(account, {
-      sessionRole: options.sessionRole,
+      sessionRole,
+      productAccess,
       method,
       purpose: TwoFactorChallengePurpose.LOGIN,
       destination: method === TwoFactorMethod.WHATSAPP ? account.phoneNumber : null,
@@ -4845,6 +5463,129 @@ export class AuthService {
       return requestedRole;
     }
     throw new BadRequestException('Rol no permitido para esta cuenta');
+  }
+
+  private getLoginProductIntent(requestedRole: AccountRole): LoginProductIntent | null {
+    if (requestedRole === AccountRole.DOCTOR) {
+      return {
+        accountRole: AccountRole.DOCTOR,
+        product: ProductCode.MEUDOC_PRO,
+        productRoles: [ProductRole.DOCTOR],
+      };
+    }
+    if (requestedRole === AccountRole.PATIENT) {
+      return {
+        accountRole: AccountRole.PATIENT,
+        product: ProductCode.PATIENT_PORTAL,
+        productRoles: [ProductRole.PATIENT],
+      };
+    }
+    if (requestedRole === AccountRole.EMPLOYER) {
+      return {
+        accountRole: AccountRole.EMPLOYER,
+        product: ProductCode.MEUDOC_EMPLOYER,
+        productRoles: [ProductRole.EMPLOYER_ADMIN, ProductRole.EMPLOYER_BILLING],
+      };
+    }
+    return null;
+  }
+
+  private async resolveProductLoginContext(account: Account, requestedRole: AccountRole) {
+    const intent = this.getLoginProductIntent(requestedRole);
+    if (!intent) {
+      return null;
+    }
+
+    const [roleProfile, productAccesses, availableProductAccess] = await Promise.all([
+      this.getRoleProfile(account.id, intent.accountRole),
+      this.prisma.accountProductAccess.findMany({
+        where: {
+          accountId: account.id,
+          product: intent.product,
+          role: { in: intent.productRoles },
+        },
+        orderBy: { createdAt: 'asc' },
+      }),
+      this.getAvailableProductAccess(account.id),
+    ]);
+
+    const activeProductAccess = productAccesses.find(
+      (access) => access.status === ProductAccessStatus.ACTIVE,
+    );
+    if (!roleProfile || !activeProductAccess) {
+      if (productAccesses.length > 0 && !activeProductAccess) {
+        throw new UnauthorizedException('Acceso de producto no activo');
+      }
+      const registrationPrefill = await this.registrationPrefill.build(account);
+      throw new BadRequestException({
+        code: 'PRODUCT_ACCESS_REQUIRED',
+        message: 'Esta cuenta no tiene activo el acceso solicitado',
+        requestedRole,
+        requestedProduct: intent.product,
+        requestedProductRoles: intent.productRoles,
+        availableProductAccess,
+        registrationPrefill,
+      });
+    }
+
+    this.assertProductLoginSubject(account, intent, roleProfile, activeProductAccess);
+    return {
+      sessionRole: requestedRole,
+      productAccess: this.toProductAccessContext(activeProductAccess),
+    };
+  }
+
+  private assertProductLoginSubject(
+    account: Account,
+    intent: LoginProductIntent,
+    roleProfile: {
+      subjectId: string | null;
+      doctorId: string | null;
+    },
+    productAccess: {
+      subjectId: string | null;
+    },
+  ) {
+    const profileSubjectId =
+      intent.accountRole === AccountRole.DOCTOR
+        ? roleProfile.doctorId?.trim() || roleProfile.subjectId?.trim() || account.doctorId?.trim()
+        : roleProfile.subjectId?.trim();
+    const productSubjectId = productAccess.subjectId?.trim();
+    if (!profileSubjectId || !productSubjectId || profileSubjectId !== productSubjectId) {
+      throw new UnauthorizedException('La vinculacion del acceso de producto es inconsistente');
+    }
+  }
+
+  private async assertProductAccessProfile(
+    account: Account,
+    productAccess: {
+      product: ProductCode;
+      role: ProductRole;
+      subjectId: string | null;
+    },
+  ) {
+    const requiredRole =
+      productAccess.product === ProductCode.PATIENT_PORTAL && productAccess.role === ProductRole.PATIENT
+        ? AccountRole.PATIENT
+        : productAccess.product === ProductCode.MEUDOC_PRO && productAccess.role === ProductRole.DOCTOR
+          ? AccountRole.DOCTOR
+          : productAccess.product === ProductCode.MEUDOC_EMPLOYER &&
+              (productAccess.role === ProductRole.EMPLOYER_ADMIN ||
+                productAccess.role === ProductRole.EMPLOYER_BILLING)
+            ? AccountRole.EMPLOYER
+            : null;
+    if (!requiredRole) {
+      return;
+    }
+    const roleProfile = await this.getRoleProfile(account.id, requiredRole);
+    if (!roleProfile) {
+      throw new UnauthorizedException('Perfil de producto no disponible');
+    }
+    const intent = this.getLoginProductIntent(requiredRole);
+    if (!intent) {
+      throw new UnauthorizedException('Perfil de producto no disponible');
+    }
+    this.assertProductLoginSubject(account, intent, roleProfile, productAccess);
   }
 
   private async getAvailableRoles(account: Account): Promise<AccountRole[]> {
@@ -4917,10 +5658,11 @@ export class AuthService {
     let patientId = options.patientId?.trim() || null;
     if (!patientId) {
       const profile = await this.getRoleProfile(account.id, AccountRole.PATIENT);
-      patientId = profile?.subjectId?.trim() || null;
+      const profileSubjectId = profile?.subjectId?.trim() || null;
+      patientId = profileSubjectId && this.isUuid(profileSubjectId) ? profileSubjectId : null;
     }
-    if (!patientId && account.role === AccountRole.PATIENT) {
-      patientId = account.subjectId?.trim() || null;
+    if (!patientId) {
+      patientId = await this.tryFindPatientIdByAuthUserId(account.id);
     }
     if (!patientId) {
       const firstName = options.firstName?.trim();
@@ -4960,9 +5702,152 @@ export class AuthService {
     return { patientId, productAccess };
   }
 
+  private toProductAccessContext(
+    access: {
+      id: string;
+      product: ProductCode;
+      role: ProductRole;
+      subjectId: string | null;
+      status: ProductAccessStatus;
+    },
+    subjectIdHint?: string | null,
+  ): ProductAccessContext {
+    return {
+      id: access.id,
+      product: access.product,
+      role: access.role,
+      subjectId: subjectIdHint?.trim() || access.subjectId,
+      status: access.status,
+    };
+  }
+
+  private assertActiveProductAccessStatus(
+    status: ProductAccessStatus,
+    options?: { allowPending?: boolean },
+  ) {
+    if (status === ProductAccessStatus.DISABLED || status === ProductAccessStatus.SUSPENDED) {
+      throw new UnauthorizedException('Acceso de producto inactivo');
+    }
+    if (status === ProductAccessStatus.PENDING && !options?.allowPending) {
+      throw new UnauthorizedException('Acceso de producto pendiente');
+    }
+  }
+
+  private async loadAccountProductAccess(
+    accountId: string,
+    product: ProductCode,
+    role: ProductRole,
+    options?: { subjectIdHint?: string | null; allowPending?: boolean },
+  ): Promise<ProductAccessContext> {
+    const access = await this.prisma.accountProductAccess.findFirst({
+      where: {
+        accountId,
+        product,
+        role,
+      },
+    });
+    if (!access) {
+      throw new UnauthorizedException('Acceso de producto no disponible');
+    }
+    this.assertActiveProductAccessStatus(access.status, options);
+    return this.toProductAccessContext(access, options?.subjectIdHint);
+  }
+
+  private async resolveSessionProductAccess(
+    account: Account,
+    input: SessionProductAccessInput,
+  ): Promise<ProductAccessContext | null> {
+    if (input.productAccess) {
+      if (input.productAccess.id) {
+        const access = await this.prisma.accountProductAccess.findUnique({
+          where: { id: input.productAccess.id },
+        });
+        if (!access || access.accountId !== account.id) {
+          throw new UnauthorizedException('Acceso de producto no disponible');
+        }
+        this.assertActiveProductAccessStatus(access.status);
+        return this.toProductAccessContext(
+          access,
+          input.productAccess.subjectId ?? input.productSubjectId,
+        );
+      }
+      return this.loadAccountProductAccess(
+        account.id,
+        input.productAccess.product,
+        input.productAccess.role,
+        { subjectIdHint: input.productAccess.subjectId ?? input.productSubjectId },
+      );
+    }
+
+    if (input.activeProduct && input.activeProductRole) {
+      return this.loadAccountProductAccess(
+        account.id,
+        input.activeProduct,
+        input.activeProductRole,
+        { subjectIdHint: input.productSubjectId },
+      );
+    }
+
+    const sessionRole = input.sessionRole ?? account.role;
+    if (sessionRole === AccountRole.PATIENT) {
+      const patientSession = await this.resolvePatientPortalSession(account);
+      return patientSession.productAccess;
+    }
+
+    return null;
+  }
+
+  private isPatientPortalProductAccess(productAccess?: ProductAccessContext | null) {
+    return Boolean(
+      productAccess &&
+      productAccess.product === ProductCode.PATIENT_PORTAL &&
+      productAccess.role === ('PATIENT' as ProductRole),
+    );
+  }
+
+  private async resolvePatientPortalSession(
+    account: Account,
+    productAccess?: ProductAccessContext | null,
+  ): Promise<ResolvedPatientPortalSession> {
+    let resolvedProductAccess = this.isPatientPortalProductAccess(productAccess)
+      ? productAccess!
+      : await this.prisma.accountProductAccess.findFirst({
+          where: {
+            accountId: account.id,
+            product: ProductCode.PATIENT_PORTAL,
+            role: 'PATIENT' as ProductRole,
+          },
+        });
+
+    if (!resolvedProductAccess) {
+      const hasPatientRole = await this.accountHasRole(account, AccountRole.PATIENT);
+      if (!hasPatientRole) {
+        throw new UnauthorizedException('Acceso al portal paciente no disponible');
+      }
+      const provisionedPatientAccess = await this.provisionPatientAccessForAccount(account);
+      resolvedProductAccess = provisionedPatientAccess.productAccess;
+    }
+
+    if (resolvedProductAccess.status !== ProductAccessStatus.ACTIVE) {
+      throw new UnauthorizedException('Acceso al portal paciente no activo');
+    }
+
+    const patientId =
+      resolvedProductAccess.subjectId?.trim() ||
+      (await this.resolvePatientIdForSession(account, productAccess?.subjectId ?? null));
+
+    return {
+      patientId,
+      productAccess: {
+        ...resolvedProductAccess,
+        subjectId: patientId,
+      },
+    };
+  }
+
   private resolveSessionRoleForProductAccess(account: Account, productAccess: ProductAccessContext): AccountRole {
     if (productAccess.product === ProductCode.PATIENT_PORTAL && productAccess.role === ('PATIENT' as ProductRole)) {
-      return AccountRole.PATIENT;
+      return AccountRole.MEMBER;
     }
     if (productAccess.product === ProductCode.MEUDOC_PRO) {
       if (productAccess.role === ProductRole.DOCTOR) return AccountRole.DOCTOR;
@@ -4985,12 +5870,38 @@ export class AuthService {
 
   private async ensureLegacyProductAccess(account: Account) {
     if (account.role === AccountRole.DOCTOR && account.doctorId) {
+      await this.prisma.accountRoleProfile.upsert({
+        where: { accountId_role: { accountId: account.id, role: AccountRole.DOCTOR } },
+        create: {
+          accountId: account.id,
+          role: AccountRole.DOCTOR,
+          subjectId: account.doctorId,
+          doctorId: account.doctorId,
+          onboardingStatus: account.onboardingStatus,
+        },
+        update: {
+          subjectId: account.doctorId,
+          doctorId: account.doctorId,
+        },
+      });
       await this.ensureProductAccess(account.id, ProductCode.MEUDOC_PRO, ProductRole.DOCTOR, account.doctorId);
     }
     if (account.role === AccountRole.CLINIC && account.subjectId) {
       await this.ensureProductAccess(account.id, ProductCode.MEUDOC_PRO, ProductRole.MEDICAL_ENTITY, account.subjectId);
     }
     if (account.role === AccountRole.EMPLOYER && account.employerId) {
+      await this.prisma.accountRoleProfile.upsert({
+        where: { accountId_role: { accountId: account.id, role: AccountRole.EMPLOYER } },
+        create: {
+          accountId: account.id,
+          role: AccountRole.EMPLOYER,
+          subjectId: account.employerId,
+          onboardingStatus: account.onboardingStatus,
+        },
+        update: {
+          subjectId: account.employerId,
+        },
+      });
       await this.ensureProductAccess(
         account.id,
         ProductCode.MEUDOC_EMPLOYER,
@@ -5010,15 +5921,12 @@ export class AuthService {
     account: Account,
     sessionSubjectId?: string | null,
   ) {
-    if (sessionSubjectId) {
+    if (sessionSubjectId && this.isUuid(sessionSubjectId)) {
       return sessionSubjectId;
     }
     const patientProfile = await this.getRoleProfile(account.id, AccountRole.PATIENT);
-    if (patientProfile?.subjectId) {
+    if (patientProfile?.subjectId && this.isUuid(patientProfile.subjectId)) {
       return patientProfile.subjectId;
-    }
-    if (account.role === AccountRole.PATIENT && account.subjectId) {
-      return account.subjectId;
     }
     let patientId = await this.findPatientIdByAuthUserId(account.id);
     if (!patientId) {
@@ -5030,6 +5938,13 @@ export class AuthService {
       );
     }
     return patientId;
+  }
+
+  private isUuid(value?: string | null) {
+    if (!value) return false;
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      value.trim(),
+    );
   }
 
   private async findRefreshToken(refreshToken: string) {

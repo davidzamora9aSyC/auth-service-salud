@@ -1,5 +1,5 @@
 import { IsEnum, IsInt, IsOptional, IsString, IsUUID, Max, Min } from 'class-validator';
-import { DoctorReferralStatus } from '@prisma/client';
+import { DoctorReferralStatus, ReferralType } from '@prisma/client';
 
 export class ListDoctorReferralsDto {
   @IsOptional()
@@ -16,6 +16,10 @@ export class ListDoctorReferralsDto {
   @IsOptional()
   @IsEnum(DoctorReferralStatus)
   status?: DoctorReferralStatus;
+
+  @IsOptional()
+  @IsEnum(ReferralType)
+  referralType?: ReferralType;
 
   @IsOptional()
   @IsString()

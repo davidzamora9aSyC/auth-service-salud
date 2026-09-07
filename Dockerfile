@@ -6,6 +6,7 @@ RUN npm install
 RUN npx prisma generate
 COPY tsconfig*.json ./
 COPY src ./src
+COPY scripts ./scripts
 RUN npm run build
 RUN npm prune --omit=dev
 
@@ -17,4 +18,4 @@ COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/prisma ./prisma
 COPY package*.json ./
 EXPOSE 3000
-CMD ["sh", "-c", "npx prisma migrate deploy && node dist/main.js"]
+CMD ["sh", "-c", "npx prisma migrate deploy && node dist/src/main.js"]

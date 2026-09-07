@@ -7,11 +7,17 @@ type AuthEventPayload = {
   authUserId: string;
   role: string;
   doctorId?: string;
+  referralId?: string;
+  referralType?: string;
   email?: string;
   phoneNumber?: string;
   firstName?: string;
   lastName?: string;
+  companyName?: string;
+  taxId?: string;
   inviteToken?: string;
+  inviteUrl?: string;
+  referralInviteId?: string;
   preferredPlanCode?: string;
 };
 
@@ -133,6 +139,7 @@ export class RabbitmqService implements OnModuleInit, OnModuleDestroy {
     type:
       | 'AuthUserRegistered'
       | 'DoctorOnboardingInviteCreated'
+      | 'ReferralRegistrationInviteCreated'
       | 'EmployerMemberLinked'
       | 'DoctorAccountRegistered';
     routingKey: string;

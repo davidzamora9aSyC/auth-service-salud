@@ -58,7 +58,7 @@ export class AdminAccountsController {
     if (normalizedRole !== 'ADMIN' && normalizedRole !== 'SYSTEM') {
       throw new UnauthorizedException('No autorizado');
     }
-    return this.authService.adminDeleteAccount(id, dto, requesterId ?? null, {
+    return this.authService.adminDeleteAccount(id, dto, requesterId ?? null, normalizedRole as 'ADMIN' | 'SYSTEM', {
       ip: req.ip,
       forwardedFor: req.headers['x-forwarded-for'] as string | undefined,
       userAgent: req.headers['user-agent'],
