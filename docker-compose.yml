@@ -476,6 +476,7 @@ services:
       COMPANYCARE_BASE_URL: http://company-care-service:3052
       COMPANYANALYTICS_BASE_URL: http://company-analytics-service:3053
       WELLNESS_BASE_URL: http://wellness-service:3028
+      AUTOPUBLISHER_BASE_URL: http://autopublisher-service:3054
     ports:
       - "3020:3020"
     depends_on:
@@ -509,7 +510,20 @@ services:
       - company-analytics-service
       - images-service
       - wellness-service
+      - autopublisher-service
       - redis
+
+  autopublisher-service:
+    image: ${DOCKERHUB_USERNAME:-local}/meusalud-autopublisher-service:${IMAGE_TAG:-latest}
+    build:
+      context: ../autopublisher-service
+    env_file:
+      - ../autopublisher-service/.env
+    environment:
+      DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=autopublisher
+      PORT: 3054
+    depends_on:
+      - db
 
   search-service:
     image: ${DOCKERHUB_USERNAME:-local}/meusalud-search-service:${IMAGE_TAG:-latest}
