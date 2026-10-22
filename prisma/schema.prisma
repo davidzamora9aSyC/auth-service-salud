@@ -524,6 +524,9 @@ model RefreshToken {
   activeProduct ProductCode?
   activeProductRole ProductRole?
   productSubjectId String?
+  clinicMembershipId String?
+  clinicMembershipRole String?
+  clinicPermissions String[] @default([])
   tokenHash String   @unique
   expiresAt DateTime
   createdAt DateTime @default(now())

@@ -131,6 +131,7 @@ type ResolvedPatientPortalSession = {
 
 type AuthRegistrationSessionContext = {
   patientId?: string | null;
+  doctorId?: string | null;
   productAccess?: ProductAccessContext | null;
 };
 
@@ -146,6 +147,14 @@ type LoginProductIntent = {
   accountRole: AccountRole;
   product: ProductCode;
   productRoles: ProductRole[];
+};
+
+type ClinicSessionContext = {
+  id: string;
+  clinicId: string;
+  role: string;
+  permissions: string[];
+  locationIds: string[];
 };
 
 @Injectable()
@@ -316,6 +325,7 @@ export class AuthService {
       throw new BadRequestException('Use el flujo de registro de MeuRed');
     }
       const inviteToken = dto.inviteToken?.trim();
+      const clinicSecretaryInviteToken = dto.clinicSecretaryInviteToken?.trim();
       const referralInviteToken = dto.referralInviteToken?.trim();
       if (inviteToken && dto.role === AccountRole.EMPLOYER) {
         throw new BadRequestException(
@@ -324,6 +334,12 @@ export class AuthService {
       }
       if (inviteToken && dto.role !== AccountRole.DOCTOR) {
         throw new BadRequestException('inviteToken solo aplica para registro de medicos');
+      }
+      if (clinicSecretaryInviteToken && dto.role !== AccountRole.CLINIC) {
+        throw new BadRequestException('La invitacion de secretaria solo aplica para acceso de clinica');
+      }
+      if (inviteToken && clinicSecretaryInviteToken) {
+        throw new BadRequestException('Solo puedes usar una invitacion por registro');
       }
       if (referralInviteToken && dto.role !== AccountRole.PATIENT && dto.role !== AccountRole.EMPLOYER) {
         throw new BadRequestException('referralInviteToken solo aplica para registro de pacientes o empresas');
@@ -373,6 +389,7 @@ export class AuthService {
         isAdminInvite,
         referralInviteToken,
         referralInvite?.type ?? null,
+        clinicSecretaryInviteToken,
       );
     }
     const existingPhone = await this.prisma.account.findUnique({
@@ -391,7 +408,7 @@ export class AuthService {
     const accountRole = dto.role === AccountRole.PATIENT ? AccountRole.MEMBER : dto.role;
     const onboardingStatus =
       dto.role === AccountRole.DOCTOR ||
-      dto.role === AccountRole.CLINIC ||
+      (dto.role === AccountRole.CLINIC && !clinicSecretaryInviteToken) ||
       dto.role === AccountRole.EMPLOYER
         ? OnboardingStatus.PENDING
         : OnboardingStatus.COMPLETE;
@@ -445,6 +462,27 @@ export class AuthService {
       throw error;
     }
 
+    // Keep clinic identity in the role-profile/product-access pair even when
+    // CLINIC is the account's original role. Account fields are legacy only.
+    if (dto.role === AccountRole.CLINIC) {
+      await this.prisma.accountRoleProfile.create({
+        data: {
+          accountId: account.id,
+          role: AccountRole.CLINIC,
+          subjectId: dto.subjectId ?? null,
+          onboardingStatus: clinicSecretaryInviteToken
+            ? OnboardingStatus.COMPLETE
+            : OnboardingStatus.PENDING,
+        },
+      });
+      await this.ensureProductAccess(
+        account.id,
+        ProductCode.MEUDOC_PRO,
+        ProductRole.MEDICAL_ENTITY,
+        dto.subjectId ?? null,
+      );
+    }
+
     if (dto.role === AccountRole.EMPLOYER && employerId) {
       try {
         await this.ensureLegacyProductAccess(account);
@@ -458,15 +496,35 @@ export class AuthService {
         throw error;
       }
     }
-      if (account.role === AccountRole.DOCTOR && inviteToken && !isAdminInvite) {
+    let sessionProductAccess: ProductAccessContext | null = null;
+      if (dto.role === AccountRole.DOCTOR && doctorId && inviteToken && !isAdminInvite) {
         try {
-          await this.completeClinicDoctorInviteRegistration(account, inviteToken);
+          await this.prisma.accountRoleProfile.create({
+            data: {
+              accountId: account.id,
+              role: AccountRole.DOCTOR,
+              doctorId,
+              subjectId: doctorId,
+              onboardingStatus,
+            },
+          });
+          sessionProductAccess = this.toProductAccessContext(
+            await this.ensureProductAccess(account.id, ProductCode.MEUDOC_PRO, ProductRole.DOCTOR, doctorId),
+          );
+          await this.completeClinicDoctorInviteRegistration(account, inviteToken, doctorId);
         } catch (error) {
           await this.prisma.account.delete({ where: { id: account.id } }).catch(() => undefined);
           throw error;
         }
       }
-    let sessionProductAccess: ProductAccessContext | null = null;
+      if (dto.role === AccountRole.CLINIC && clinicSecretaryInviteToken) {
+        try {
+          await this.completeClinicSecretaryInviteRegistration(account, clinicSecretaryInviteToken);
+        } catch (error) {
+          await this.prisma.account.delete({ where: { id: account.id } }).catch(() => undefined);
+          throw error;
+        }
+      }
     if (dto.role === AccountRole.PATIENT) {
       if (!firstName || !lastName) {
         await this.prisma.account.delete({ where: { id: account.id } });
@@ -497,7 +555,9 @@ export class AuthService {
               patientId: sessionProductAccess.subjectId,
               productAccess: sessionProductAccess,
             }
-          : undefined,
+          : dto.role === AccountRole.DOCTOR && inviteToken && !isAdminInvite
+            ? { doctorId }
+            : undefined,
       );
       if (inviteToken && invite) {
         await this.adminOnboarding.markInviteAccepted(inviteToken, account.id);
@@ -517,7 +577,9 @@ export class AuthService {
           );
         }
       }
-    await this.ensureLegacyProductAccess(account);
+    if (!(dto.role === AccountRole.DOCTOR && inviteToken && !isAdminInvite)) {
+      await this.ensureLegacyProductAccess(account);
+    }
     await this.recordIdentityReuse(account, normalizedEmail, normalizedPhone);
     const tokens = await this.issueTokens(account, {
       sessionRole: dto.role,
@@ -644,23 +706,34 @@ export class AuthService {
     isAdminInvite?: boolean,
     referralInviteToken?: string,
     referralInviteType?: ReferralType | null,
+    clinicSecretaryInviteToken?: string,
   ) {
     if (account.status !== AccountStatus.ACTIVE) {
       throw new UnauthorizedException('Account disabled');
     }
     // Verificar que el rol no esté ya registrado
-    const isPrimaryRole = account.role === dto.role;
-    if (isPrimaryRole) {
+    const isClinicDoctorInvite = dto.role === AccountRole.DOCTOR && Boolean(inviteToken) && !isAdminInvite;
+    const isPrimaryRole = !isClinicDoctorInvite && account.role === dto.role;
+    const isSecretaryClinicInvite =
+      dto.role === AccountRole.CLINIC && Boolean(clinicSecretaryInviteToken);
+    if (isPrimaryRole && !isSecretaryClinicInvite) {
       throw new ConflictException('Ya tienes una cuenta con este rol');
     }
     const existingProfile = await this.prisma.accountRoleProfile.findUnique({
       where: { accountId_role: { accountId: account.id, role: dto.role } },
     });
-    if (existingProfile) {
+    if (existingProfile && !isSecretaryClinicInvite) {
       throw new ConflictException('Ya tienes una cuenta con este rol');
+    }
+    if (isClinicDoctorInvite) {
+      const existingDoctorAccess = await this.prisma.accountProductAccess.findUnique({
+        where: { accountId_product_role: { accountId: account.id, product: ProductCode.MEUDOC_PRO, role: ProductRole.DOCTOR } },
+      });
+      if (existingDoctorAccess) throw new ConflictException('Ya tienes una cuenta con este rol');
     }
 
     let sessionProductAccess: ProductAccessContext | null = null;
+    let registrationDoctorId: string | undefined;
     if (dto.role === AccountRole.PATIENT) {
       if (!firstName || !lastName) {
         throw new BadRequestException('Nombre y apellido son requeridos');
@@ -675,6 +748,7 @@ export class AuthService {
         throw new BadRequestException('Invitacion invalida');
       }
       const doctorId = inviteDoctorId ?? randomUUID();
+      registrationDoctorId = doctorId;
       await this.prisma.accountRoleProfile.create({
         data: {
           accountId: account.id,
@@ -692,18 +766,27 @@ export class AuthService {
         account = { ...account, doctorId };
       }
       if (inviteToken && !isAdminInvite) {
-        await this.completeClinicDoctorInviteRegistration({ ...account }, inviteToken);
+        await this.completeClinicDoctorInviteRegistration(account, inviteToken, doctorId);
       }
-      await this.ensureProductAccess(account.id, ProductCode.MEUDOC_PRO, ProductRole.DOCTOR, doctorId);
+      sessionProductAccess = this.toProductAccessContext(
+        await this.ensureProductAccess(account.id, ProductCode.MEUDOC_PRO, ProductRole.DOCTOR, doctorId),
+      );
     } else if (dto.role === AccountRole.CLINIC) {
-      await this.prisma.accountRoleProfile.create({
-        data: {
-          accountId: account.id,
-          role: AccountRole.CLINIC,
-          onboardingStatus: OnboardingStatus.PENDING,
-        },
-      });
+      if (!existingProfile) {
+        await this.prisma.accountRoleProfile.create({
+          data: {
+            accountId: account.id,
+            role: AccountRole.CLINIC,
+            onboardingStatus: clinicSecretaryInviteToken
+              ? OnboardingStatus.COMPLETE
+              : OnboardingStatus.PENDING,
+          },
+        });
+      }
       await this.ensureProductAccess(account.id, ProductCode.MEUDOC_PRO, ProductRole.MEDICAL_ENTITY, null);
+      if (clinicSecretaryInviteToken) {
+        await this.completeClinicSecretaryInviteRegistration(account, clinicSecretaryInviteToken);
+      }
     } else if (dto.role === AccountRole.EMPLOYER) {
       if (!dto.companyName?.trim() || !dto.taxId?.trim()) {
         throw new BadRequestException(
@@ -779,7 +862,7 @@ export class AuthService {
     // evento. Sin publicarlo, una cuenta existente que agrega el rol DOCTOR
     // recibe un JWT válido, pero su doctorId no existe en ese servicio.
     if (dto.role === AccountRole.DOCTOR) {
-      await this.publishUserRegisteredEvent(updatedAccount, { firstName, lastName }, dto.role);
+      await this.publishUserRegisteredEvent(updatedAccount, { firstName, lastName }, dto.role, { doctorId: registrationDoctorId });
     }
     if (
       dto.role === AccountRole.PATIENT &&
@@ -829,8 +912,11 @@ export class AuthService {
       ? await this.resolveProductLoginContext(account, dto.role)
       : null;
     const sessionRole = productLoginContext?.sessionRole ?? await this.resolveSessionRole(account, dto.role);
-    if (sessionRole === AccountRole.DOCTOR && !account.doctorId) {
-      throw new BadRequestException('No hay perfil de doctor para esta cuenta');
+    if (sessionRole === AccountRole.DOCTOR && !productLoginContext?.productAccess.subjectId) {
+      const doctorProfile = await this.getRoleProfile(account.id, AccountRole.DOCTOR);
+      if (!doctorProfile?.doctorId && !doctorProfile?.subjectId && !account.doctorId) {
+        throw new BadRequestException('No hay perfil de doctor para esta cuenta');
+      }
     }
     if (sessionRole === AccountRole.EMPLOYER && !account.employerId) {
       const employerProfile = await this.prisma.accountRoleProfile.findUnique({
@@ -927,6 +1013,45 @@ export class AuthService {
       ...tokens,
       availableProductAccess,
     };
+  }
+
+  async listClinicContexts(accountId: string): Promise<ClinicSessionContext[]> {
+    const response = await fetch(
+      `${this.clinicsInternalBaseUrl.replace(/\/$/, '')}/clinics/internal/memberships/${encodeURIComponent(accountId)}`,
+      { headers: { 'x-role': 'SYSTEM' } },
+    );
+    if (!response.ok) {
+      throw new ServiceUnavailableException('No se pudieron consultar las clinicas disponibles');
+    }
+    const payload = (await response.json()) as { memberships?: ClinicSessionContext[] };
+    return Array.isArray(payload.memberships) ? payload.memberships : [];
+  }
+
+  async selectClinicContext(refreshToken: string, membershipId: string) {
+    const tokenHash = this.hashToken(refreshToken);
+    const stored = await this.prisma.refreshToken.findUnique({
+      where: { tokenHash },
+      include: { account: true },
+    });
+    if (!stored || stored.expiresAt < new Date() || stored.account.status !== AccountStatus.ACTIVE) {
+      throw new UnauthorizedException('Sesion invalida o expirada');
+    }
+    const membership = (await this.listClinicContexts(stored.account.id)).find(
+      (item) => item.id === membershipId,
+    );
+    if (!membership) throw new UnauthorizedException('Membresia de clinica no disponible');
+    await this.prisma.refreshToken.delete({ where: { tokenHash } });
+    const productAccess = await this.loadAccountProductAccess(
+      stored.account.id,
+      ProductCode.MEUDOC_PRO,
+      ProductRole.MEDICAL_ENTITY,
+    );
+    return this.issueTokens(stored.account, {
+      sessionRole: AccountRole.CLINIC,
+      sessionSubjectId: membership.clinicId,
+      productAccess: { ...productAccess, subjectId: membership.clinicId },
+      clinicSession: membership,
+    });
   }
 
   async registerCollaborator(dto: RegisterCollaboratorDto) {
@@ -1619,6 +1744,15 @@ export class AuthService {
   async refresh(refreshToken: string) {
     const stored = await this.findRefreshToken(refreshToken);
     await this.revokeRefreshToken(refreshToken);
+    const clinicSession =
+      stored.sessionRole === AccountRole.CLINIC && stored.clinicMembershipId
+        ? (await this.listClinicContexts(stored.account.id)).find(
+            (item) => item.id === stored.clinicMembershipId,
+          ) ?? null
+        : null;
+    if (stored.sessionRole === AccountRole.CLINIC && stored.clinicMembershipId && !clinicSession) {
+      throw new UnauthorizedException('La membresia de clinica ya no esta activa');
+    }
     const productAccess = await this.resolveSessionProductAccess(stored.account, {
       sessionRole: stored.sessionRole ?? stored.account.role,
       activeProduct: stored.activeProduct,
@@ -1629,6 +1763,7 @@ export class AuthService {
       sessionRole: stored.sessionRole ?? stored.account.role,
       sessionSubjectId: stored.sessionSubjectId ?? undefined,
       productAccess: productAccess ?? undefined,
+      clinicSession,
     });
     const availableProductAccess = await this.getAvailableProductAccess(stored.account.id);
     return { ...tokens, availableProductAccess };
@@ -2873,6 +3008,7 @@ export class AuthService {
       sessionRole?: AccountRole;
       sessionSubjectId?: string | null;
       productAccess?: ProductAccessContext | null;
+      clinicSession?: ClinicSessionContext | null;
     },
   ) {
     const sessionRole = options?.sessionRole ?? account.role;
@@ -2900,39 +3036,38 @@ export class AuthService {
       payload.subjectId = patientSession.patientId;
       payload.onboardingRequired = false;
     } else if (sessionRole === AccountRole.DOCTOR) {
+      const doctorProfile = await this.prisma.accountRoleProfile.findUnique({
+        where: { accountId_role: { accountId: account.id, role: AccountRole.DOCTOR } },
+      });
       const doctorId =
+        doctorProfile?.doctorId ?? doctorProfile?.subjectId ?? effectiveProductAccess?.subjectId ??
         account.doctorId ?? (account.role === AccountRole.DOCTOR ? account.subjectId ?? null : null);
       if (doctorId) {
         payload.doctorId = doctorId;
       }
-      // Leer onboardingStatus del profile si el rol principal no es DOCTOR
-      let doctorOnboardingStatus: OnboardingStatus;
-      if (account.role === AccountRole.DOCTOR) {
-        doctorOnboardingStatus = account.onboardingStatus;
-      } else {
-        const doctorProfile = await this.prisma.accountRoleProfile.findUnique({
-          where: { accountId_role: { accountId: account.id, role: AccountRole.DOCTOR } },
-        });
-        doctorOnboardingStatus = doctorProfile?.onboardingStatus ?? OnboardingStatus.PENDING;
-      }
+      const doctorOnboardingStatus = doctorProfile?.onboardingStatus ??
+        (account.role === AccountRole.DOCTOR ? account.onboardingStatus : OnboardingStatus.PENDING);
       payload.onboardingRequired = doctorOnboardingStatus !== OnboardingStatus.COMPLETE;
     } else if (sessionRole === AccountRole.CLINIC) {
-      // Leer subjectId y onboardingStatus del profile si el rol principal no es CLINIC
-      if (account.role === AccountRole.CLINIC) {
-        clinicSessionSubjectId = account.subjectId ?? null;
-        clinicSessionOnboardingStatus = account.onboardingStatus;
-      } else {
-        const clinicProfile = await this.prisma.accountRoleProfile.findUnique({
-          where: { accountId_role: { accountId: account.id, role: AccountRole.CLINIC } },
-        });
-        clinicSessionSubjectId = clinicProfile?.subjectId ?? null;
-        clinicSessionOnboardingStatus = clinicProfile?.onboardingStatus ?? OnboardingStatus.PENDING;
+      const clinicProfile = await this.prisma.accountRoleProfile.findUnique({
+        where: { accountId_role: { accountId: account.id, role: AccountRole.CLINIC } },
+      });
+      if (!clinicProfile) {
+        throw new UnauthorizedException('Perfil de clinica no disponible');
       }
+      clinicSessionSubjectId = options?.clinicSession?.clinicId ?? null;
+      clinicSessionOnboardingStatus = clinicProfile.onboardingStatus;
       if (clinicSessionSubjectId) {
         payload.clinicId = clinicSessionSubjectId;
         payload.subjectId = clinicSessionSubjectId;
       }
       payload.onboardingRequired = clinicSessionOnboardingStatus !== OnboardingStatus.COMPLETE;
+      if (options?.clinicSession) {
+        payload.clinicMembershipId = options.clinicSession.id;
+        payload.clinicMembershipRole = options.clinicSession.role;
+        payload.clinicLocationIds = options.clinicSession.locationIds;
+        payload.permissions = options.clinicSession.permissions;
+      }
       sessionSubjectId = clinicSessionSubjectId;
     } else if (sessionRole === AccountRole.EMPLOYER) {
       if (account.role === AccountRole.EMPLOYER) {
@@ -3013,6 +3148,9 @@ export class AuthService {
         activeProduct: effectiveProductAccess?.product,
         activeProductRole: effectiveProductAccess?.role,
         productSubjectId: effectiveProductAccess?.subjectId ?? undefined,
+        clinicMembershipId: options?.clinicSession?.id,
+        clinicMembershipRole: options?.clinicSession?.role,
+        clinicPermissions: options?.clinicSession?.permissions ?? [],
         tokenHash: refreshTokenHash,
         expiresAt: refreshExpiresAt,
       },
@@ -3161,11 +3299,27 @@ export class AuthService {
     };
   }
 
-  private async completeClinicDoctorInviteRegistration(account: Account, inviteToken: string) {
-    if (account.role !== AccountRole.DOCTOR || !account.doctorId) {
-      throw new BadRequestException('La cuenta no corresponde a un medico');
+  private async completeClinicSecretaryInviteRegistration(account: Account, inviteToken: string) {
+    const url = `${this.clinicsInternalBaseUrl.replace(/\/$/, '')}/clinics/internal/secretaries/invites/${encodeURIComponent(inviteToken)}/complete-registration`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-role': 'SYSTEM',
+        'x-auth-user-id': account.id,
+      },
+      body: JSON.stringify({ authUserId: account.id, email: account.email }),
+    });
+    if (response.ok) return;
+    const body = await response.text();
+    this.logger.error(`No se pudo completar invitacion de secretaria (status ${response.status}): ${body}`);
+    if (response.status === 400 || response.status === 403 || response.status === 404) {
+      throw new BadRequestException(body || 'No se pudo aceptar la invitacion de secretaria');
     }
+    throw new ServiceUnavailableException('No se pudo completar la invitacion de secretaria');
+  }
 
+  private async completeClinicDoctorInviteRegistration(account: Account, inviteToken: string, doctorId: string) {
     const url = `${this.clinicsInternalBaseUrl.replace(/\/$/, '')}/clinics/internal/doctors/invites/${encodeURIComponent(inviteToken)}/complete-registration`;
     const response = await fetch(url, {
       method: 'POST',
@@ -3173,11 +3327,11 @@ export class AuthService {
         'content-type': 'application/json',
         'x-role': 'SYSTEM',
         'x-auth-user-id': account.id,
-        'x-subject-id': account.doctorId,
+        'x-subject-id': doctorId,
       },
       body: JSON.stringify({
         authUserId: account.id,
-        doctorId: account.doctorId,
+        doctorId,
         email: account.email,
       }),
     });
@@ -4377,7 +4531,7 @@ export class AuthService {
       authUserId: account.id,
       role: isPatientRegistration ? AccountRole.MEMBER : eventRole,
       effectiveRole: isPatientRegistration ? 'PATIENT' : undefined,
-      doctorId: account.doctorId ?? undefined,
+      doctorId: registrationContext?.doctorId ?? account.doctorId ?? undefined,
       employerId: account.employerId ?? undefined,
       email: account.email,
       phoneNumber: account.phoneNumber ?? undefined,
@@ -5487,6 +5641,13 @@ export class AuthService {
         productRoles: [ProductRole.EMPLOYER_ADMIN, ProductRole.EMPLOYER_BILLING],
       };
     }
+    if (requestedRole === AccountRole.CLINIC) {
+      return {
+        accountRole: AccountRole.CLINIC,
+        product: ProductCode.MEUDOC_PRO,
+        productRoles: [ProductRole.MEDICAL_ENTITY],
+      };
+    }
     return null;
   }
 
@@ -5494,6 +5655,30 @@ export class AuthService {
     const intent = this.getLoginProductIntent(requestedRole);
     if (!intent) {
       return null;
+    }
+
+    // Clinic staff are granted by clinics-service. On their first clinic
+    // login, materialize only the generic portal entitlement in Auth; the
+    // concrete clinic is selected afterwards from the active memberships.
+    if (intent.accountRole === AccountRole.CLINIC) {
+      const memberships = await this.listClinicContexts(account.id);
+      if (memberships.length > 0) {
+        await this.prisma.accountRoleProfile.upsert({
+          where: { accountId_role: { accountId: account.id, role: AccountRole.CLINIC } },
+          create: {
+            accountId: account.id,
+            role: AccountRole.CLINIC,
+            onboardingStatus: OnboardingStatus.COMPLETE,
+          },
+          update: {},
+        });
+        await this.ensureProductAccess(
+          account.id,
+          ProductCode.MEUDOC_PRO,
+          ProductRole.MEDICAL_ENTITY,
+          null,
+        );
+      }
     }
 
     const [roleProfile, productAccesses, availableProductAccess] = await Promise.all([
@@ -5541,6 +5726,7 @@ export class AuthService {
     roleProfile: {
       subjectId: string | null;
       doctorId: string | null;
+      onboardingStatus: OnboardingStatus;
     },
     productAccess: {
       subjectId: string | null;
@@ -5551,6 +5737,7 @@ export class AuthService {
         ? roleProfile.doctorId?.trim() || roleProfile.subjectId?.trim() || account.doctorId?.trim()
         : roleProfile.subjectId?.trim();
     const productSubjectId = productAccess.subjectId?.trim();
+    if (intent.accountRole === AccountRole.CLINIC) return;
     if (!profileSubjectId || !productSubjectId || profileSubjectId !== productSubjectId) {
       throw new UnauthorizedException('La vinculacion del acceso de producto es inconsistente');
     }
@@ -5569,6 +5756,9 @@ export class AuthService {
         ? AccountRole.PATIENT
         : productAccess.product === ProductCode.MEUDOC_PRO && productAccess.role === ProductRole.DOCTOR
           ? AccountRole.DOCTOR
+          : productAccess.product === ProductCode.MEUDOC_PRO &&
+              productAccess.role === ProductRole.MEDICAL_ENTITY
+            ? AccountRole.CLINIC
           : productAccess.product === ProductCode.MEUDOC_EMPLOYER &&
               (productAccess.role === ProductRole.EMPLOYER_ADMIN ||
                 productAccess.role === ProductRole.EMPLOYER_BILLING)

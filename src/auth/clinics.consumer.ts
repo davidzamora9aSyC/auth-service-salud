@@ -1,7 +1,7 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Channel, Connection, ConsumeMessage, connect } from 'amqplib';
-import { AccountRole, OnboardingStatus } from '@prisma/client';
+import { AccountRole, OnboardingStatus, ProductCode, ProductRole } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 
 const queueAssertOptions = (queue: string) => ({
@@ -153,19 +153,28 @@ export class ClinicsConsumer implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
-      const completed = {
-        onboardingStatus: OnboardingStatus.COMPLETE,
-        subjectId: clinicId,
-      };
+      const completed = { onboardingStatus: OnboardingStatus.COMPLETE };
 
       await this.prisma.$transaction([
         this.prisma.accountRoleProfile.updateMany({
           where: { accountId: authUserId, role: AccountRole.CLINIC },
           data: completed,
         }),
-        this.prisma.account.updateMany({
-          where: { id: authUserId, role: AccountRole.CLINIC },
-          data: completed,
+        this.prisma.accountProductAccess.upsert({
+          where: {
+            accountId_product_role: {
+              accountId: authUserId,
+              product: ProductCode.MEUDOC_PRO,
+              role: ProductRole.MEDICAL_ENTITY,
+            },
+          },
+          create: {
+            accountId: authUserId,
+            product: ProductCode.MEUDOC_PRO,
+            role: ProductRole.MEDICAL_ENTITY,
+            subjectId: null,
+          },
+          update: {},
         }),
       ]);
 

@@ -55,6 +55,8 @@ services:
       - ../clinics-service/.env
     environment:
       DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=auth
+      AUTH_INTERNAL_BASE_URL: http://auth-service:3000/authms
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-dev-internal-employers-token}
       PORT: 3025
       RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
       RABBITMQ_EXCHANGE_AUTH: auth.events
@@ -73,6 +75,9 @@ services:
       - ../communication-service/.env.compose
     environment:
       DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=notification
+      APPOINTMENTS_INTERNAL_BASE_URL: http://appointments-service:3010/appointmentsms
+      CLINICS_INTERNAL_BASE_URL: http://clinics-service:3025/clinicsms
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-dev-internal-employers-token}
       RABBITMQ_QUEUE_AUTH: comms.q.auth
       RABBITMQ_QUEUE_QUESTIONS: comms.q.questions
       RABBITMQ_QUEUE_EMPLOYERS: comms.q.employers
@@ -188,6 +193,7 @@ services:
       SERVICES_SERVICE_URL: http://services-service:3011/servicesms
       AVAILABILITY_SERVICE_URL: http://availability-service:3012/availabilityms
       CLINICS_INTERNAL_BASE_URL: http://clinics-service:3025/clinicsms
+      TEMPLATES_INTERNAL_BASE_URL: http://templates-service:3022/templatesms
       USERS_INTERNAL_BASE_URL: http://users-service:3008/usersms
       IMAGES_INTERNAL_BASE_URL: http://images-service:3019/imagesms
       REMINDERS_INTERNAL_BASE_URL: http://reminders-service:3021/remindersms
@@ -388,6 +394,8 @@ services:
     environment:
       DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=services
       RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
+      CLINICS_INTERNAL_BASE_URL: http://clinics-service:3025/clinicsms
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-dev-internal-employers-token}
     ports:
       - "3011:3011"
     depends_on:
@@ -403,6 +411,8 @@ services:
       DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=availability
       SERVICES_BASE_URL: http://services-service:3011/servicesms
       APPOINTMENTS_BASE_URL: http://appointments-service:3010/appointmentsms
+      CLINICS_INTERNAL_BASE_URL: http://clinics-service:3025/clinicsms
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-dev-internal-employers-token}
       RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
       RABBITMQ_EXCHANGE_AVAILABILITY: availability.events
     ports:
@@ -418,6 +428,8 @@ services:
       - ../templates-service/.env
     environment:
       DATABASE_URL: postgresql://meusalud_auth:meusalud_auth@db:5432/meusalud_auth?schema=templates
+      CLINICS_BASE_URL: http://clinics-service:3025/clinicsms
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-dev-internal-employers-token}
     ports:
       - "3022:3022"
     depends_on:

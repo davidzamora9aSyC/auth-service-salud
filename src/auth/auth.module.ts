@@ -23,6 +23,7 @@ import { ReferralsConsumer } from './referrals.consumer';
 import { EmployersHttpClient } from './employers-http.client';
 import { RegistrationPrefillService } from './registration-prefill.service';
 import { AccountLinkCleanupService } from './account-link-cleanup.service';
+import { ClinicDoctorIdentitiesService } from './clinic-doctor-identities.service';
 
 @Module({
   imports: [PrismaModule, NotificationsModule],
@@ -38,6 +39,7 @@ import { AccountLinkCleanupService } from './account-link-cleanup.service';
   ],
   providers: [
     AuthService,
+    ClinicDoctorIdentitiesService,
     RabbitmqService,
     AccountLinkCleanupService,
     DoctorsConsumer,

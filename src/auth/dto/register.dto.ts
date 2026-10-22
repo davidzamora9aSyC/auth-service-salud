@@ -44,6 +44,10 @@ export class RegisterDto {
 
   @IsOptional()
   @IsString()
+  clinicSecretaryInviteToken?: string;
+
+  @IsOptional()
+  @IsString()
   referralInviteToken?: string;
 
   @ValidateIf(

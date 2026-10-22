@@ -8,6 +8,8 @@ import { RegisterCollaboratorDto } from './dto/register-collaborator.dto';
 import { CreateEmployerInviteAccountDto } from './dto/create-employer-invite-account.dto';
 import { CreatePatientInviteAccountDto } from './dto/create-patient-invite-account.dto';
 import { EmailExistsDto } from './dto/email-exists.dto';
+import { ClinicDoctorIdentitiesDto } from './dto/clinic-doctor-identities.dto';
+import { ClinicDoctorIdentitiesService } from './clinic-doctor-identities.service';
 import { AccountContactExistsDto } from './dto/account-contact-exists.dto';
 import { LinkPatientAffiliateInviteDto } from './dto/link-patient-affiliate-invite.dto';
 import { GrantEmployerAccessDto } from './dto/grant-employer-access.dto';
@@ -30,10 +32,14 @@ import { PhoneChangeVerifyDto } from './dto/phone-change-verify.dto';
 import { PhoneChangeCompleteDto } from './dto/phone-change-complete.dto';
 import { RegisterMeuredDto } from './dto/register-meured.dto';
 import { SelectProductAccessDto } from './dto/select-product-access.dto';
+import { SelectClinicContextDto } from './dto/select-clinic-context.dto';
 
 @Controller('auth')
 export class AuthController {
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly clinicDoctorIdentitiesService: ClinicDoctorIdentitiesService,
+  ) {}
 
   @Post('register')
   register(@Body() dto: RegisterDto) {
@@ -89,6 +95,17 @@ export class AuthController {
   @Post('product-access/select')
   selectProductAccess(@Body() dto: SelectProductAccessDto) {
     return this.authService.selectProductAccess(dto);
+  }
+
+  @Get('clinic-contexts/me')
+  async clinicContextsMe(@Headers('x-auth-user-id') authUserId?: string) {
+    if (!authUserId) throw new UnauthorizedException('Token requerido');
+    return { memberships: await this.authService.listClinicContexts(authUserId) };
+  }
+
+  @Post('clinic-contexts/select')
+  selectClinicContext(@Body() dto: SelectClinicContextDto) {
+    return this.authService.selectClinicContext(dto.refreshToken, dto.membershipId);
   }
 
   @Post('logout')
@@ -312,6 +329,16 @@ export class AuthController {
   ) {
     this.assertInternalServiceToken(internalToken);
     return this.authService.accountExistsByEmail(dto.email);
+  }
+
+  @Post('internal/accounts/clinic-doctor-identities')
+  clinicDoctorIdentities(
+    @Body() dto: ClinicDoctorIdentitiesDto,
+    @Headers('x-internal-service-token') internalToken?: string,
+  ) {
+    const expected = process.env.INTERNAL_SERVICE_TOKEN;
+    if (!expected || internalToken !== expected) throw new UnauthorizedException('No autorizado');
+    return this.clinicDoctorIdentitiesService.find(dto);
   }
 
   @Post('internal/accounts/contact-exists')
