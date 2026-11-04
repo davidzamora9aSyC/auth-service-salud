@@ -242,6 +242,9 @@ services:
       RABBITMQ_URL: amqp://app:app_pass_123@host.docker.internal:5673/
       RABBITMQ_EXCHANGE_MESSAGES: messages.events
       APPOINTMENTS_INTERNAL_BASE_URL: http://appointments-service:3010/appointmentsms
+      CLINICS_INTERNAL_BASE_URL: http://clinics-service:3025/clinicsms
+      AVAILABILITY_INTERNAL_BASE_URL: http://availability-service:3012/availabilityms
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-dev-internal-employers-token}
       USERS_INTERNAL_BASE_URL: http://users-service:3008/usersms
       DOCTORS_INTERNAL_BASE_URL: http://doctors-service:3009/doctorsms
       IMAGES_INTERNAL_BASE_URL: http://images-service:3019/imagesms
